@@ -37,7 +37,8 @@ commits, pulls, and branch changes, applying deltas rather than rebuilding.
 
 Runtime tracing. Any language but Python. Visualization. `path_between`.
 `neighbors` as a shipped surface. Cross-service edges. Historical backfill
-(eagerly indexing the last N commits).
+(eagerly indexing the last N commits). MCP server. Shared/remote graph cache
+(designed in D10, deliberately not built).
 
 `neighbors` exists internally as a graph primitive and comes for free from the
 schema; it is simply not a supported product surface in v1.
@@ -147,13 +148,56 @@ The working tree is the `WORKTREE` pseudo-revision: HEAD's tree overlaid with
 Non-git directories remain supported: file content is hashed with blake2b and
 the same two layers apply, losing only the cross-branch sharing.
 
-### D8 — Distributed as a Claude Code plugin
+### D8 — CLI first; MCP deferred
+
+The primary interface is the CLI, not an MCP server. MCP's real advantage is
+discoverability — the agent sees the tool without being told — but `SKILL.md`
+already provides that, and it loads only when relevant, whereas MCP tool
+definitions occupy context on every request whether used or not.
+
+A CLI also works in any harness, composes with `jq` and shell pipelines, needs
+no server process, and removes the MCP SDK dependency from v1 entirely.
+
+MCP becomes an additive wrapper later, for harnesses without shell access.
+
+### D9 — Distributed as a Claude Code plugin
 
 The repository doubles as its own marketplace, so installation is
-`/plugin marketplace add swalla02/codegraph`. v1 runs the MCP server from the
-cloned plugin root via `uv run --project <plugin root>`, avoiding a release
-pipeline entirely; publishing to PyPI so the command becomes
-`uvx codegraph serve-mcp` is a later polish step.
+`/plugin marketplace add swalla02/codegraph`. The plugin ships `SKILL.md`,
+which teaches the agent to invoke the CLI; no server process is involved.
+
+### D10 — Shared graphs are a build cache, not a sync problem
+
+The graph is a pure function of (repository content, codegraph version):
+identical blob content always yields identical parse output. Nobody therefore
+needs to synchronize correctness — any participant can recompute. Sharing
+exists only to avoid paying for the same computation twice.
+
+That reframing removes the hard parts. Cache entries are content-addressed and
+immutable, so merge conflicts are impossible, and partial or absent sync is
+harmless because a missing entry is simply recomputed locally. The cache key
+includes the codegraph version and effect-catalog hash, so upgrades invalidate
+cleanly.
+
+Publication is open: because entries are immutable, a developer's post-push
+hook can publish just as validly as CI. CI is preferable only for consistency
+(it always runs) and trust (see below).
+
+Two transports, deferred to a later version:
+
+- **Git ref namespace** (`refs/codegraph/cache`) — travels with `git fetch`
+  once the refspec is configured, requiring no infrastructure, but grows every
+  clone over time.
+- **CI artifact storage** — does not bloat the repository, but is no longer
+  "just a fetch."
+
+**Not built in v1.** A single local index is a one-time cost; sharing only pays
+off with a team or a repository large enough for the cold index to hurt.
+Recorded here so the content-addressed storage design stays compatible with it.
+
+Security note for whenever it does get built: a poisoned cache entry could make
+impact analysis quietly lie. Acceptable within a trusted team, and the reason
+CI would eventually be the only trusted publisher.
 
 ## Architecture
 
@@ -296,9 +340,14 @@ kind  = "DB_WRITE"
 ```
 
 A built-in catalog ships with the tool (stdlib, requests/httpx, sqlalchemy,
-psycopg, boto3). `.codegraph/effects.toml` merges over it. That override is
-essential rather than optional: in a real codebase most side effects sit behind
-house abstractions, not behind `requests` directly.
+psycopg, boto3). A project-level `codegraph.toml` at the repository root merges
+over it. That override is essential rather than optional: in a real codebase
+most side effects sit behind house abstractions, not behind `requests` directly.
+
+It lives at the repository root rather than inside `.codegraph/` because it is
+hand-written configuration that should be **committed and shared**, whereas
+`.codegraph/` self-ignores and holds only derived cache. Config is tracked;
+everything derived is ignored.
 
 `GLOBAL_MUTATE` is detected syntactically (`global`/`nonlocal` statements,
 assignment to module-level names from within a function). This is documented as
@@ -382,7 +431,6 @@ codegraph diff [<base>..<head>] [--json]
 codegraph resolve <query>           # fuzzy name -> node ids
 codegraph gc                        # prune blob cache unreachable from retained revisions
 codegraph install-hooks             # optional post-commit/checkout/merge warming
-codegraph serve-mcp                 # stdio MCP server
 ```
 
 `resolve` is a first-class primitive. Nobody types
@@ -407,15 +455,13 @@ skills/codegraph/SKILL.md
 
 Install: `/plugin marketplace add swalla02/codegraph`.
 
-MCP tools: `resolve_symbol`, `impact_of`, `effects_of`, `diff`.
-
-`SKILL.md` determines whether any of this gets used — the MCP tool
-descriptions alone will not earn reach-for. It must encode:
+`SKILL.md` determines whether any of this gets used — a CLI is invisible to an
+agent unless something tells it the tool exists. It must encode:
 
 - **Trigger** — before modifying any function; when asked "what breaks if…",
   "what does this affect", "is this safe to change", "what did this branch
   change".
-- **Workflow** — `resolve_symbol` → `impact_of` → `effects_of` → read only the
+- **Workflow** — `codegraph resolve` → `impact` → `effects` → read only the
   top-ranked hits.
 - **The anti-pattern it displaces** — do not grep for callers; you will miss
   dynamically dispatched ones and have no way to know when you are done.
@@ -424,7 +470,7 @@ descriptions alone will not earn reach-for. It must encode:
 
 ```
 codegraph/
-  cli.py  mcp_server.py  store.py  scanner.py
+  cli.py  store.py  scanner.py
   git.py              # ls-tree, cat-file --batch, status, hash-object
   parse.py            # phase 1, path-independent, blob-keyed
   resolve.py          # phase 2: Resolver interface + AstResolver
@@ -436,8 +482,8 @@ tests/fixtures/
 ```
 
 Python 3.12, `uv`, pytest, ruff, console script `codegraph`. No runtime
-dependencies beyond the stdlib for the core; the MCP SDK is required only by
-`serve-mcp`. Git is invoked as a subprocess — no libgit2 dependency.
+dependencies beyond the stdlib. Git is invoked as a subprocess — no libgit2
+dependency.
 
 ## Error handling
 
@@ -500,10 +546,10 @@ Also:
 | Risk | Mitigation |
 |---|---|
 | `impact_of` over-reports and gets ignored | Ranking, hop cap, summary-first output, LOW tier counted not listed |
-| Effect catalog misses house abstractions | Project-level `effects.toml` override; unresolved/untagged counts in `status` |
+| Effect catalog misses house abstractions | Project-level `codegraph.toml` override; unresolved/untagged counts in `status` |
 | Index goes stale and loses trust | Lazy refresh on every query; incremental ≡ rebuild invariant test; hooks warm only |
 | Branch switching feels expensive | Blob-keyed parse cache; cost guarantee enforced by test |
 | Resolution blast radius on core modules | Bounded by importer set; resolution far cheaper than parsing; measured in perf smoke |
 | Blob cache grows without bound | `codegraph gc` prunes entries unreachable from retained revisions |
 | Dynamic dispatch limits accuracy | LOW-confidence over-approximation rather than omission; `provenance` reserved for later runtime traces |
-| Agents do not adopt the MCP tools | `SKILL.md` encodes trigger, workflow, and displaced anti-pattern; token-budgeted output |
+| Agents do not adopt the CLI | `SKILL.md` encodes trigger, workflow, and displaced anti-pattern; token-budgeted output |
