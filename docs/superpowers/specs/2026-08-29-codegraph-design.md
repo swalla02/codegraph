@@ -164,6 +164,39 @@ Nodes are **symbols**, not files. Stable ID is `path::qualname`, e.g.
 identity — otherwise every upstream edit churns IDs and unchanged code appears
 to have changed. Kinds: `module`, `class`, `function`, `method`.
 
+The path segment stays a real filesystem path (`/`-separated) rather than being
+flattened into the `::` separator, so an ID remains pasteable into an editor.
+Because the path is part of the ID, two same-named classes in different modules
+are simply different nodes; no collision is possible across files.
+
+**Shadowing within a file.** The same qualname can be defined more than once in
+one module — accidental redefinition, but also `@overload` stubs and
+`if TYPE_CHECKING:` / `try: import … except ImportError:` branches. Every
+definition becomes its own node, carrying a `name_binding` field of `live` or
+`shadowed`. The last definition wins the name and keeps the clean ID, matching
+Python's runtime semantics; earlier ones take a `#2`, `#3` suffix in definition
+order.
+
+Shadowed definitions are **not** treated as dead code, because they frequently
+still execute:
+
+```python
+@app.route("/pay")
+def handle(): ...        # name shadowed below, but the framework holds a reference
+
+def handle(): ...
+```
+
+They lose name lookups, but retain any edge that reaches them another way —
+decorator registration, or an alias capturing the earlier binding
+(`handler = process` before `process` is redefined). Shadowing is reported by
+`status` as a warning, since most occurrences are genuine mistakes;
+`@overload` and `TYPE_CHECKING` branches are recognized and excluded from that
+warning.
+
+Nested functions need no special handling: Python's `__qualname__` already
+distinguishes them as `outer.<locals>.inner`.
+
 Edges: `(src, dst, kind, confidence, provenance, callsite_file, callsite_line)`.
 Kinds: `CALLS`, `IMPORTS`, `INHERITS`, `CONTAINS`.
 
@@ -313,11 +346,16 @@ Defaults: 3 hops, ~40 nodes, explicit `truncated: true` in JSON output.
 Materializes the base revision alongside the current graph (no checkout) and
 reports the semantic delta:
 
-- symbols added, removed, or whose span/signature changed;
+- symbols added, removed, or whose **normalized body hash** changed;
 - edges that appeared or disappeared;
 - **effects newly reachable** from changed symbols;
 - aggregate impact of the change set — the union of `impact_of` over every
   changed symbol.
+
+Comparison is deliberately on a hash of each symbol's normalized body, never on
+its line span. Inserting a blank line at the top of a file shifts every span
+below it; comparing spans would report the whole file as changed. Pure line
+movement must produce an empty diff.
 
 Default base is the merge-base with the repository's default branch, making the
 bare `codegraph diff` mean "what does my branch change." The headline output is
@@ -418,6 +456,9 @@ dependencies beyond the stdlib for the core; the MCP SDK is required only by
 - **Concurrent access**: SQLite WAL plus a lock file; a second writer waits
   rather than corrupting.
 - **Ambiguous symbol** in a query: return candidates and a non-zero exit code.
+- **Shadowed definition**: kept as a node with `name_binding = shadowed` and
+  surfaced as a `status` warning, never dropped — it may still execute via a
+  decorator registry or a captured alias.
 
 ## Testing
 
@@ -441,6 +482,11 @@ Also:
   `__init__.py` re-exports, `self` via MRO, inheritance, decorators.
 - **Propagation tests** — SCC cycles, min-confidence, witness-path correctness.
 - **Diff goldens** — added/removed symbols and edges, newly reachable effects.
+- **Span-shift test** — inserting a blank line at the top of a file must produce
+  an empty diff, proving comparison is on body hash rather than span.
+- **Shadowing goldens** — repeated definitions, `@overload`, `TYPE_CHECKING`
+  branches, and a decorator-registered definition that is shadowed by name yet
+  must keep its edges.
 - **Ranking goldens**, so ranking changes appear as reviewable diffs rather
   than silent behavior drift.
 - **Accuracy harness** — labeled call sites with expected targets, reporting
