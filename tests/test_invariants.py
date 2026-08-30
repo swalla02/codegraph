@@ -1,5 +1,6 @@
 # tests/test_invariants.py
 import random
+import subprocess
 
 import pytest
 
@@ -55,7 +56,40 @@ def cold_dump(repo, rev):
     return dump
 
 
-MUTATIONS = ["edit", "add", "delete", "rename", "branch", "switch", "merge"]
+MUTATIONS = ["edit", "add", "delete", "rename", "branch", "switch", "merge", "rebase"]
+
+
+def _local_branches(repo):
+    out = git(repo, "branch", "--format=%(refname:short)")
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _current_branch(repo):
+    return git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+
+
+def _force_commit(repo, name, counter):
+    """Write a uniquely-named marker file and commit it on the checked-out
+    branch. `merge` and `rebase` use this to force real divergence on both
+    sides of the operation rather than hoping earlier mutations happened to
+    land on both branches -- the marker's filename is unique per (mutation
+    kind, counter), so it never collides with another branch's marker and
+    never itself causes a conflict."""
+    (repo / name).write_text(f"MARKER = {counter}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", f"marker {name}")
+
+
+def _attempt(repo, command, abort):
+    """Run a git command that may stop on an unresolved conflict; abort
+    cleanly back to a clean tree on failure rather than letting the walk
+    crash. Returns True if the command landed."""
+    try:
+        git(repo, *command)
+        return True
+    except subprocess.CalledProcessError:
+        git(repo, *abort)
+        return False
 
 
 def apply_mutation(repo, kind, counter):
@@ -79,12 +113,44 @@ def apply_mutation(repo, kind, counter):
     elif kind == "branch":
         git(repo, "checkout", "-q", "-b", f"b{counter}")
     elif kind == "switch":
-        git(repo, "checkout", "-q", "main")
+        # Any local branch but the current one -- not always `main`. A repo
+        # with only one branch so far leaves this a no-op.
+        others = [b for b in _local_branches(repo) if b != _current_branch(repo)]
+        if others:
+            git(repo, "checkout", "-q", random.choice(others))
     elif kind == "merge":
-        current = git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
-        if current != "main":
-            git(repo, "checkout", "-q", "main")
-            git(repo, "merge", "-q", "--no-edit", current)
+        source = _current_branch(repo)
+        others = [b for b in _local_branches(repo) if b != source]
+        if not others:
+            return
+        target = random.choice(others)
+        # Force a commit unique to each side before merging, so this is a
+        # genuine two-parent merge rather than a fast-forward: without it,
+        # whichever side happens to already be an ancestor of the other
+        # (routine once `switch`/`merge` keep returning to the same
+        # branches) makes `git merge` a no-op.
+        _force_commit(repo, f"_merge_src_{counter}.py", counter)
+        git(repo, "checkout", "-q", target)
+        _force_commit(repo, f"_merge_dst_{counter}.py", counter)
+        # -X ours: a real content conflict (e.g. both sides edited a.py) is
+        # resolved deterministically by keeping the checked-out (target)
+        # side. A conflict type -X cannot settle (e.g. modify/delete) is
+        # aborted back to a clean tree rather than left half-resolved.
+        _attempt(repo, ("merge", "-q", "--no-edit", "-X", "ours", source), ("merge", "--abort"))
+    elif kind == "rebase":
+        current = _current_branch(repo)
+        others = [b for b in _local_branches(repo) if b != current]
+        if not others:
+            return
+        onto = random.choice(others)
+        # Same forced-divergence reasoning as `merge`: without a commit
+        # unique to each side, replaying `current` onto `onto` is either a
+        # no-op (already an ancestor) or a plain fast-forward.
+        _force_commit(repo, f"_rebase_src_{counter}.py", counter)
+        git(repo, "checkout", "-q", onto)
+        _force_commit(repo, f"_rebase_onto_{counter}.py", counter)
+        git(repo, "checkout", "-q", current)
+        _attempt(repo, ("rebase", "-q", "-X", "ours", onto), ("rebase", "--abort"))
 
 
 @pytest.mark.parametrize("seed", range(8))
