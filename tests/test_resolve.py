@@ -34,6 +34,24 @@ def test_same_module_call_is_high_confidence(repo, write):
     store.close()
 
 
+def test_module_node_is_materialized_and_owns_module_scope_edges(repo, write):
+    """`path::<module>` is a real edge source (an import-time side effect
+    like `app = create_app()`), so it must have a row in `nodes` — a reverse
+    BFS that joins edges to nodes must not silently drop it.
+    """
+    write("app.py", "def create_app():\n    pass\n\n\napp = create_app()\n", commit="app")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    node = store.connection.execute(
+        "SELECT kind FROM nodes WHERE rev='HEAD' AND id='app.py::<module>'"
+    ).fetchone()
+    assert node is not None
+    assert node["kind"] == "module"
+    module_edges = {(src, dst) for src, dst, _ in edges(store) if src == "app.py::<module>"}
+    assert module_edges == {("app.py::<module>", "app.py::create_app")}
+    store.close()
+
+
 def test_imported_call_is_high_confidence(repo, write):
     write("pay/__init__.py", "", commit="pkg")
     write("pay/service.py", "def charge():\n    pass\n", commit="svc")
@@ -99,6 +117,23 @@ def test_shadowed_definition_does_not_win_name_lookup(repo, write):
     indexer.reconcile("HEAD")
     targets = {dst for src, dst, _ in edges(store) if src == "m.py::caller"}
     assert targets == {"m.py::alpha"}
+    store.close()
+
+
+def test_call_inside_a_shadowed_definition_is_attributed_to_it(repo, write):
+    """A definition shadowed by a later one of the same name still runs (a
+    framework may hold a reference to it, e.g. `@app.route` handlers), so a
+    call made from inside it must originate from the shadowed node, not the
+    live one that happens to share its name.
+    """
+    source = (
+        "def helper():\n    pass\n\n\ndef handle():\n    helper()\n\n\ndef handle():\n    pass\n"
+    )
+    write("m.py", source, commit="m")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = {(src, dst) for src, dst, _ in edges(store) if dst == "m.py::helper"}
+    assert found == {("m.py::handle#1", "m.py::helper")}
     store.close()
 
 

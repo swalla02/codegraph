@@ -57,7 +57,7 @@ def test_worktree_revision_sees_uncommitted_edits(repo, write):
     rows = store.connection.execute(
         "SELECT qualname FROM nodes WHERE rev=?", (WORKTREE,)
     ).fetchall()
-    assert {row["qualname"] for row in rows} == {"alpha", "added"}
+    assert {row["qualname"] for row in rows} == {"alpha", "added", "<module>"}
     store.close()
 
 

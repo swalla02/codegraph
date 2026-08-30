@@ -205,13 +205,24 @@ class _SymbolTable:
 
         self.qualname_index: dict[tuple[str, str], str] = {}
         self.name_index: dict[str, list[str]] = {}
+        # Every node sharing a (path, qualname) — live and shadowed alike —
+        # keyed by their line span, so a ref originating inside a shadowed
+        # definition can be attributed to it rather than to the live one.
+        self.owner_index: dict[tuple[str, str], list[tuple[str, int, int]]] = {}
         class_ids: dict[tuple[str, str], str] = {}
-        rows = connection.execute(
-            "SELECT id, path, qualname, kind FROM nodes WHERE rev=? AND name_binding='live'"
-            " ORDER BY id",
+        all_rows = connection.execute(
+            "SELECT id, path, qualname, kind, line_start, line_end, name_binding FROM nodes"
+            " WHERE rev=? ORDER BY id",
             (rev,),
         ).fetchall()
-        for row in rows:
+        for row in all_rows:
+            key = (row["path"], row["qualname"])
+            self.owner_index.setdefault(key, []).append(
+                (row["id"], row["line_start"], row["line_end"])
+            )
+
+        live_rows = [row for row in all_rows if row["name_binding"] == "live"]
+        for row in live_rows:
             key = (row["path"], row["qualname"])
             self.qualname_index[key] = row["id"]
             self.name_index.setdefault(row["qualname"].rpartition(".")[2], []).append(row["id"])
@@ -219,7 +230,7 @@ class _SymbolTable:
                 class_ids[key] = row["id"]
 
         self.enclosing_class: dict[str, str] = {}
-        for row in rows:
+        for row in live_rows:
             found = _nearest_class(row["path"], row["qualname"], class_ids)
             if found:
                 self.enclosing_class[row["id"]] = found
@@ -304,10 +315,29 @@ def _refs_by_path(store: Store, rev: str, ref_kind: str) -> dict[str, list[Parse
 
 
 def _source_id(ref: ParsedRef, table: _SymbolTable, path: str) -> str:
-    """The node that owns a reference; module scope gets a stable pseudo-id."""
+    """The node that owns a reference; module scope gets a stable pseudo-id.
+
+    A qualname can own more than one node when an earlier definition is
+    shadowed by a later one of the same name — both still execute, so a
+    call made from inside the shadowed body must be attributed to it, not
+    to the live definition that happens to share its name. The ref's `line`
+    (recorded verbatim as `callsite_line` on the edge) picks out which node's
+    span it actually falls inside; a qualname with a single owner keeps the
+    direct-lookup fast path.
+    """
     if ref.from_qualname == MODULE_SCOPE:
         return f"{path}::{MODULE_SCOPE}"
-    return table.qualname_index.get((path, ref.from_qualname), f"{path}::{ref.from_qualname}")
+    candidates = table.owner_index.get((path, ref.from_qualname))
+    if not candidates:
+        return f"{path}::{ref.from_qualname}"
+    if len(candidates) == 1:
+        return candidates[0][0]
+    for node_id, line_start, line_end in candidates:
+        if line_start <= ref.line <= line_end:
+            return node_id
+    # Should not happen (every ref sits inside the definition it came from);
+    # fall back to the live binding rather than dropping the edge.
+    return table.qualname_index.get((path, ref.from_qualname), candidates[-1][0])
 
 
 def resolve_revision(

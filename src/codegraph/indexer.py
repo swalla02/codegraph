@@ -19,7 +19,7 @@ from typing import Protocol
 from codegraph import gitio
 from codegraph.config import Config
 from codegraph.parse import PARSER_VERSION, parse_blob
-from codegraph.resolve import resolve_revision
+from codegraph.resolve import MODULE_SCOPE, resolve_revision
 from codegraph.store import WORKTREE, Store
 
 
@@ -231,7 +231,17 @@ class Indexer:
 
     def _materialize_nodes(self, rev: str, tree: dict[str, str]) -> int:
         """Rebuild Layer 2's `nodes` rows for `rev` from Layer 1, and return
-        the count of non-conditional shadowed definitions found."""
+        the count of non-conditional shadowed definitions found.
+
+        Every path also gets a synthetic module node (`path::<module>`), so
+        that a module-scope call's edge `src` — an import-time side effect
+        like `app = create_app()` — has a real row in `nodes` rather than a
+        dangling id. Its `body_hash` is the path's blob sha: a file-changed
+        signal, not a symbol-changed one, since no per-symbol hash exists at
+        module scope. Its span is a placeholder (`1..1`): the file's true
+        last line isn't available from Layer 1's parsed tables without
+        re-reading blob content, and nothing downstream depends on it yet.
+        """
         connection = self.store.connection
         shadowed = 0
         rows: list[tuple] = []
@@ -255,6 +265,19 @@ class Indexer:
                         node["name_binding"],
                     )
                 )
+            rows.append(
+                (
+                    rev,
+                    f"{path}::{MODULE_SCOPE}",
+                    path,
+                    MODULE_SCOPE,
+                    "module",
+                    1,
+                    1,
+                    sha,
+                    "live",
+                )
+            )
         connection.executemany(
             "INSERT OR REPLACE INTO nodes(rev, id, path, qualname, kind, line_start,"
             " line_end, body_hash, name_binding) VALUES(?,?,?,?,?,?,?,?,?)",
