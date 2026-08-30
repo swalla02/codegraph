@@ -19,5 +19,6 @@ def test_console_script_runs():
         [sys.executable, "-m", "codegraph", "--version"],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert proc.returncode == 0
