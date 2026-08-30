@@ -18,6 +18,9 @@ from typing import Protocol
 
 from codegraph import gitio
 from codegraph.config import Config
+from codegraph.effects.catalog import Catalog
+from codegraph.effects.detect import detect_direct
+from codegraph.effects.propagate import propagate
 from codegraph.parse import PARSER_VERSION, parse_blob
 from codegraph.resolve import MODULE_SCOPE, resolve_revision
 from codegraph.store import WORKTREE, Store
@@ -159,6 +162,13 @@ class Indexer:
             # Phase 2 runs inside the same transaction: a revision is never
             # visible with materialized nodes but stale edges.
             resolved = resolve_revision(self.store, rev, self.config)
+
+            # Effect detection and propagation close out the same
+            # transaction: a revision is never visible with edges but
+            # stale (or missing) effects.
+            catalog = Catalog.load(self.config)
+            detect_direct(self.store, rev, catalog)
+            propagate(self.store, rev)
 
         return IndexStats(
             paths_total=len(tree),

@@ -115,3 +115,34 @@ def test_syntax_error_returns_error_not_exception():
 def test_parse_is_deterministic():
     source = b"class A:\n    def m(self):\n        return other()\n"
     assert parse_blob(source) == parse_blob(source)
+
+
+def test_global_statement_recorded_as_ref():
+    source = b"COUNT = 0\n\n\ndef bump():\n    global COUNT\n    COUNT += 1\n"
+    result = parse_blob(source)
+    ref = next(r for r in result.refs if r.ref_kind == "global")
+    assert ref.from_qualname == "bump"
+    assert ref.raw_name == "COUNT"
+    assert ref.line == 5
+
+
+def test_nonlocal_statement_recorded_as_global_ref():
+    source = (
+        b"def outer():\n"
+        b"    x = 0\n"
+        b"    def inner():\n"
+        b"        nonlocal x\n"
+        b"        x += 1\n"
+        b"    return inner\n"
+    )
+    result = parse_blob(source)
+    ref = next(r for r in result.refs if r.ref_kind == "global")
+    assert ref.from_qualname == "outer.<locals>.inner"
+    assert ref.raw_name == "x"
+
+
+def test_global_statement_with_multiple_names_recorded_separately():
+    source = b"def bump():\n    global A, B\n    A += 1\n    B += 1\n"
+    result = parse_blob(source)
+    names = {r.raw_name for r in result.refs if r.ref_kind == "global"}
+    assert names == {"A", "B"}
