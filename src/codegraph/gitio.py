@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 from collections.abc import Iterable, Iterator
 from pathlib import Path
+from typing import IO
 
 
 class GitError(Exception):
@@ -39,7 +41,16 @@ def ls_tree(root: Path, rev: str) -> dict[str, str]:
 
 
 def cat_file_batch(root: Path, shas: Iterable[str]) -> Iterator[tuple[str, bytes]]:
-    """Stream blob contents through a single `git cat-file --batch` process."""
+    """Stream blob contents through a single `git cat-file --batch` process.
+
+    The requested SHAs are written to the child's stdin from a background
+    thread while this generator reads responses from stdout on the calling
+    thread. Writing the whole batch up front (before reading anything) would
+    deadlock once the batch is large enough to fill the stdin pipe buffer
+    (~64KiB on Linux, roughly 1500+ 41-byte SHA lines): git would block
+    writing accumulated blob output that nobody is reading yet, while this
+    process blocked writing the remaining SHAs that git isn't yet reading.
+    """
     wanted = list(shas)
     if not wanted:
         return
@@ -51,10 +62,20 @@ def cat_file_batch(root: Path, shas: Iterable[str]) -> Iterator[tuple[str, bytes
         stderr=subprocess.PIPE,
     )
     assert proc.stdin and proc.stdout
+
+    def _feed(stdin: IO[bytes]) -> None:
+        try:
+            for sha in wanted:
+                stdin.write((sha + "\n").encode())
+            stdin.flush()
+        except BrokenPipeError:
+            pass  # child exited early; reader loop below observes EOF
+        finally:
+            stdin.close()
+
+    writer = threading.Thread(target=_feed, args=(proc.stdin,), daemon=True)
+    writer.start()
     try:
-        proc.stdin.write(("\n".join(wanted) + "\n").encode())
-        proc.stdin.flush()
-        proc.stdin.close()
         for _ in wanted:
             header = proc.stdout.readline().decode().strip()
             if not header or header.endswith("missing"):
@@ -64,6 +85,7 @@ def cat_file_batch(root: Path, shas: Iterable[str]) -> Iterator[tuple[str, bytes
             proc.stdout.read(1)  # trailing newline
             yield sha, payload
     finally:
+        writer.join()
         proc.stdout.close()
         proc.stdin.close()
         proc.stderr.close()

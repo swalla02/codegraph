@@ -1,3 +1,5 @@
+import subprocess
+
 from codegraph import gitio
 from tests.conftest import git
 
@@ -34,6 +36,37 @@ def test_cat_file_batch_handles_many_blobs(repo, write):
     tree = gitio.ls_tree(repo, "HEAD")
     got = dict(gitio.cat_file_batch(repo, tree.values()))
     assert len(got) == len(tree)
+
+
+def test_cat_file_batch_handles_a_batch_past_the_pipe_buffer(repo, tmp_path):
+    """Regression: writing the whole SHA list before reading any output would
+    deadlock once the batch is large enough to fill the stdin pipe buffer
+    (~64KiB on Linux, roughly 1500+ 41-byte SHA lines). 2500 is comfortably
+    past that threshold. Blobs are written directly to the object database
+    with `hash-object -w --stdin-paths`, bypassing the index/working tree so
+    the fixture stays fast.
+    """
+    n = 2500
+    blob_dir = tmp_path / "blobs"
+    blob_dir.mkdir()
+    paths = [blob_dir / f"f{i}.py" for i in range(n)]
+    for i, path in enumerate(paths):
+        path.write_text(f"def f{i}():\n    return {i}\n")
+    proc = subprocess.run(
+        ["git", "hash-object", "-w", "-t", "blob", "--stdin-paths"],
+        cwd=repo,
+        input="\n".join(str(p) for p in paths) + "\n",
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    shas = proc.stdout.split()
+    assert len(shas) == n
+
+    got = dict(gitio.cat_file_batch(repo, shas))
+
+    assert len(got) == n
+    assert got[shas[0]] == b"def f0():\n    return 0\n"
 
 
 def test_status_paths_reports_dirty_files(repo, write):
