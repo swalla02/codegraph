@@ -19,6 +19,7 @@ from typing import Protocol
 from codegraph import gitio
 from codegraph.config import Config
 from codegraph.parse import PARSER_VERSION, parse_blob
+from codegraph.resolve import resolve_revision
 from codegraph.store import WORKTREE, Store
 
 
@@ -30,6 +31,8 @@ class IndexStats:
     blobs_cached: int = 0
     parse_errors: int = 0
     shadowed: int = 0
+    edges: int = 0
+    unresolved: int = 0
 
 
 class TreeSource(Protocol):
@@ -153,6 +156,10 @@ class Indexer:
                 (rev, "worktree" if rev == WORKTREE else "commit", int(time.time())),
             )
 
+            # Phase 2 runs inside the same transaction: a revision is never
+            # visible with materialized nodes but stale edges.
+            resolved = resolve_revision(self.store, rev, self.config)
+
         return IndexStats(
             paths_total=len(tree),
             paths_dirty=len(dirty) + len(removed),
@@ -160,6 +167,8 @@ class Indexer:
             blobs_cached=cached,
             parse_errors=errors,
             shadowed=shadowed,
+            edges=resolved.edges,
+            unresolved=resolved.unresolved,
         )
 
     def _ensure_parsed(self, shas: set[str]) -> tuple[int, int, int]:

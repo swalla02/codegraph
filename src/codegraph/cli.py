@@ -8,6 +8,7 @@ from pathlib import Path
 
 from codegraph import __version__, gitio
 from codegraph.indexer import FsTreeSource, GitTreeSource, Indexer
+from codegraph.resolve import find_symbol
 from codegraph.store import WORKTREE, Store
 
 
@@ -23,6 +24,7 @@ def open_workspace(root: Path) -> tuple[Store, Indexer]:
 def _print_stats(stats) -> None:
     print(f"paths: {stats.paths_total} ({stats.paths_dirty} dirty)")
     print(f"blobs: {stats.blobs_parsed} parsed, {stats.blobs_cached} cached")
+    print(f"edges: {stats.edges}, unresolved: {stats.unresolved}")
     if stats.parse_errors:
         print(f"parse errors: {stats.parse_errors}")
     if stats.shadowed:
@@ -52,6 +54,23 @@ def _cmd_index(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_resolve(args: argparse.Namespace) -> int:
+    """Fuzzy symbol lookup. Ambiguity is reported, never silently picked."""
+    root = Path(args.path).resolve()
+    store, indexer = open_workspace(root)
+    try:
+        indexer.reconcile(args.rev)
+        matches = find_symbol(store, args.rev, args.query)
+        for row in matches:
+            print(row["id"])
+        if not matches:
+            print(f"no symbol matching {args.query!r}", file=sys.stderr)
+            return 1
+        return 2 if len(matches) > 1 else 0
+    finally:
+        store.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codegraph")
     parser.add_argument("--version", action="version", version=__version__)
@@ -72,6 +91,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Discard the Layer 1 parse cache before reconciling",
     )
     index_parser.set_defaults(handler=_cmd_index)
+
+    resolve_parser = subparsers.add_parser("resolve", help="Resolve a name to node ids")
+    resolve_parser.add_argument("query", help="Node id, qualname, or trailing name")
+    resolve_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    resolve_parser.add_argument("--rev", default=WORKTREE, help="Revision to resolve against")
+    resolve_parser.set_defaults(handler=_cmd_resolve)
 
     return parser
 
