@@ -72,7 +72,15 @@ match = "*.execute"
 kind = "DB_WRITE"
 
 [[effect]]
-match = "psycopg*"
+match = "*.fetchone"
+kind = "DB_READ"
+
+[[effect]]
+match = "*.fetchall"
+kind = "DB_READ"
+
+[[effect]]
+match = "*.fetchmany"
 kind = "DB_READ"
 
 [[effect]]

@@ -56,6 +56,13 @@ class Rule:
     match: str
     kind: str
 
+    def __post_init__(self) -> None:
+        if self.kind not in EFFECT_KINDS:
+            raise ValueError(
+                f"unknown effect kind {self.kind!r} for pattern {self.match!r}; "
+                f"must be one of {EFFECT_KINDS}"
+            )
+
 
 class _Compiled(NamedTuple):
     rule: Rule
