@@ -16,6 +16,7 @@ class _Row(sqlite3.Row):
     def __str__(self) -> str:
         return str(tuple(self))
 
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
@@ -163,9 +164,7 @@ class Store:
         self.connection.commit()
 
     def get_meta(self, key: str) -> str | None:
-        row = self.connection.execute(
-            "SELECT value FROM meta WHERE key=?", (key,)
-        ).fetchone()
+        row = self.connection.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
     def set_meta(self, key: str, value: str) -> None:

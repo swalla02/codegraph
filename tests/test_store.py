@@ -1,7 +1,3 @@
-import sqlite3
-
-import pytest
-
 from codegraph.store import SCHEMA_VERSION, Store
 
 
@@ -21,13 +17,21 @@ def test_schema_version_recorded(tmp_path):
 
 def test_expected_tables_exist(tmp_path):
     store = Store.open(tmp_path)
-    rows = store.connection.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()
+    rows = store.connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     names = {row[0] for row in rows}
     assert {
-        "meta", "blobs", "blob_nodes", "blob_refs", "blob_imports",
-        "revisions", "tree", "nodes", "edges", "effects", "imports", "unresolved",
+        "meta",
+        "blobs",
+        "blob_nodes",
+        "blob_refs",
+        "blob_imports",
+        "revisions",
+        "tree",
+        "nodes",
+        "edges",
+        "effects",
+        "imports",
+        "unresolved",
     } <= names
     store.close()
 
