@@ -121,7 +121,21 @@ def test_status_paths_handles_rename(repo, write):
     write("pkg/b.py", "def beta():\n    return 2\n", commit="add b")
     git(repo, "mv", "pkg/b.py", "pkg/c.py")
     status = gitio.status_paths(repo)
-    assert status == {"pkg/c.py": "R"}
+    assert status == {"pkg/c.py": "R", "pkg/b.py": "D"}
+
+
+def test_status_paths_copy_does_not_delete_source(monkeypatch):
+    """`git status` does not expose copy detection in its porcelain output by
+    default (unlike `git diff -C`), so a real repo cannot be coaxed into
+    emitting a `C` entry reliably. This exercises the parsing branch
+    directly instead, by feeding `status_paths` a canned porcelain -z
+    payload shaped like a copy entry: `C  pkg/c.py` (new path) followed by
+    the NUL-separated old path `pkg/b.py` with no XY prefix.
+    """
+    porcelain = b"C  pkg/c.py\0pkg/b.py\0"
+    monkeypatch.setattr(gitio, "_run", lambda *args, **kwargs: porcelain)
+    status = gitio.status_paths(Path("unused"))
+    assert status == {"pkg/c.py": "C"}
 
 
 def test_hash_object_matches_git(repo):

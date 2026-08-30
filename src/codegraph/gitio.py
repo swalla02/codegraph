@@ -122,8 +122,13 @@ def status_paths(root: Path) -> dict[str, str]:
 
     Uses `--porcelain=v1 -z`: entries are NUL-separated as `XY<space>PATH`.
     A rename/copy entry (X == 'R' or 'C') is followed by a second,
-    NUL-separated field holding the old path with no XY prefix — that field
-    must be consumed and discarded, not treated as its own entry.
+    NUL-separated field holding the old path with no XY prefix.
+
+    For a rename, that old path no longer exists on disk once the move
+    happens, so it is reported back to the caller as a deletion ("D") --
+    an overlay built from this map needs to drop it, not just add the new
+    path. A copy leaves its source in place, so its old path is left out of
+    the map entirely (it is neither changed nor gone).
     """
     out = _run(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
     status: dict[str, str] = {}
@@ -133,7 +138,10 @@ def status_paths(root: Path) -> dict[str, str]:
         field = fields[index]
         code, path = field[:2].strip() or field[:2], field[3:]
         if code.startswith(("R", "C")):
-            index += 1  # rename/copy source follows; skip it
+            index += 1
+            old_path = fields[index]
+            if code.startswith("R") and old_path.endswith(".py"):
+                status[old_path] = "D"
         if path.endswith(".py"):
             status[path] = code
         index += 1

@@ -111,3 +111,21 @@ def test_works_without_git(tmp_path):
     assert stats.paths_total == 1
     assert stats.blobs_parsed == 1
     store.close()
+
+
+def test_staged_rename_drops_old_path_in_worktree(repo, write):
+    """Regression: `gitio.status_paths` used to discard a rename's old path
+    entirely, so a `git mv` staged but not committed left a stale node at
+    the old path in the WORKTREE revision alongside the correct one at the
+    new path.
+    """
+    store, indexer = build(repo)
+    indexer.reconcile(WORKTREE)
+    git(repo, "mv", "a.py", "renamed.py")
+    git(repo, "add", "-A")
+    indexer.reconcile(WORKTREE)
+    rows = store.connection.execute("SELECT path FROM nodes WHERE rev=?", (WORKTREE,)).fetchall()
+    paths = {row["path"] for row in rows}
+    assert "a.py" not in paths
+    assert "renamed.py" in paths
+    store.close()
