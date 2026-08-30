@@ -45,11 +45,19 @@ def cat_file_batch(root: Path, shas: Iterable[str]) -> Iterator[tuple[str, bytes
 
     The requested SHAs are written to the child's stdin from a background
     thread while this generator reads responses from stdout on the calling
-    thread. Writing the whole batch up front (before reading anything) would
-    deadlock once the batch is large enough to fill the stdin pipe buffer
-    (~64KiB on Linux, roughly 1500+ 41-byte SHA lines): git would block
-    writing accumulated blob output that nobody is reading yet, while this
-    process blocked writing the remaining SHAs that git isn't yet reading.
+    thread, so a full consumption of the generator cannot deadlock: writing
+    the whole batch up front (before reading anything) would block once the
+    batch is large enough to fill the stdin pipe buffer (~64KiB on Linux,
+    roughly 1500+ 41-byte SHA lines), since git would then be blocked writing
+    accumulated blob output that nobody is reading yet, while this process
+    was blocked writing the remaining SHAs that git isn't yet reading.
+
+    If the caller instead abandons the generator early (breaks out of the
+    loop, lets it get garbage-collected, calls `.close()`) while git is
+    stalled that way, closing our stdout pipe before joining the writer
+    thread (see the `finally` below) is what unsticks it: git's blocked
+    write raises EPIPE/SIGPIPE and it exits, which in turn unblocks the
+    writer's blocked stdin write with a `BrokenPipeError`.
     """
     wanted = list(shas)
     if not wanted:
@@ -71,7 +79,15 @@ def cat_file_batch(root: Path, shas: Iterable[str]) -> Iterator[tuple[str, bytes
         except BrokenPipeError:
             pass  # child exited early; reader loop below observes EOF
         finally:
-            stdin.close()
+            try:
+                stdin.close()
+            except BrokenPipeError:
+                # A BufferedWriter.close() flushes first, which can itself
+                # raise if the peer is already gone (e.g. the consumer
+                # abandoned the generator and cleanup closed stdout, which
+                # killed git and hence this end of stdin). Nothing left to
+                # report to; the caller only cares that the thread exits.
+                pass
 
     writer = threading.Thread(target=_feed, args=(proc.stdin,), daemon=True)
     writer.start()
@@ -85,8 +101,17 @@ def cat_file_batch(root: Path, shas: Iterable[str]) -> Iterator[tuple[str, bytes
             proc.stdout.read(1)  # trailing newline
             yield sha, payload
     finally:
-        writer.join()
+        # Close stdout FIRST, before joining the writer. If the writer is
+        # blocked writing SHAs to git's stdin (because git itself is
+        # blocked writing to a full, unread stdout pipe -- the deadlock
+        # this function exists to survive), joining the writer here would
+        # wait forever: nothing else would ever close the pipe that has
+        # git stuck. Closing our read end of stdout first delivers
+        # EPIPE/SIGPIPE to git's blocked write, letting git exit and close
+        # its stdin, which unblocks the writer's write() with
+        # BrokenPipeError so the join below returns promptly.
         proc.stdout.close()
+        writer.join()
         proc.stdin.close()
         proc.stderr.close()
         proc.wait()

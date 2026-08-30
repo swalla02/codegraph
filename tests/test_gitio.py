@@ -1,7 +1,34 @@
 import subprocess
+import threading
+from pathlib import Path
 
 from codegraph import gitio
 from tests.conftest import git
+
+
+def _hash_many_blobs(repo: Path, tmp_path: Path, n: int, prefix: str) -> list[str]:
+    """Write `n` small distinct blobs straight into `repo`'s object database.
+
+    Bypasses the working tree/index entirely (`hash-object -w --stdin-paths`
+    from a scratch directory) so building a batch large enough to exceed the
+    OS pipe buffer stays fast.
+    """
+    blob_dir = tmp_path / f"{prefix}-blobs"
+    blob_dir.mkdir()
+    paths = [blob_dir / f"{prefix}{i}.py" for i in range(n)]
+    for i, path in enumerate(paths):
+        path.write_text(f"def {prefix}{i}():\n    return {i}\n")
+    proc = subprocess.run(
+        ["git", "hash-object", "-w", "-t", "blob", "--stdin-paths"],
+        cwd=repo,
+        input="\n".join(str(p) for p in paths) + "\n",
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    shas = proc.stdout.split()
+    assert len(shas) == n
+    return shas
 
 
 def test_is_repo(repo, tmp_path_factory):
@@ -42,31 +69,44 @@ def test_cat_file_batch_handles_a_batch_past_the_pipe_buffer(repo, tmp_path):
     """Regression: writing the whole SHA list before reading any output would
     deadlock once the batch is large enough to fill the stdin pipe buffer
     (~64KiB on Linux, roughly 1500+ 41-byte SHA lines). 2500 is comfortably
-    past that threshold. Blobs are written directly to the object database
-    with `hash-object -w --stdin-paths`, bypassing the index/working tree so
-    the fixture stays fast.
+    past that threshold.
     """
     n = 2500
-    blob_dir = tmp_path / "blobs"
-    blob_dir.mkdir()
-    paths = [blob_dir / f"f{i}.py" for i in range(n)]
-    for i, path in enumerate(paths):
-        path.write_text(f"def f{i}():\n    return {i}\n")
-    proc = subprocess.run(
-        ["git", "hash-object", "-w", "-t", "blob", "--stdin-paths"],
-        cwd=repo,
-        input="\n".join(str(p) for p in paths) + "\n",
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    shas = proc.stdout.split()
-    assert len(shas) == n
+    shas = _hash_many_blobs(repo, tmp_path, n, "f")
 
     got = dict(gitio.cat_file_batch(repo, shas))
 
     assert len(got) == n
     assert got[shas[0]] == b"def f0():\n    return 0\n"
+
+
+def test_cat_file_batch_survives_early_abandonment(repo, tmp_path):
+    """Regression: abandoning the generator before it drains fully must not
+    deadlock. With a batch large enough to fill the pipe buffers in both
+    directions, closing only 3 items in and then closing the generator can
+    catch the writer thread mid-block on a stdin write it will never finish
+    (because git itself is blocked writing to a full, unread stdout pipe).
+    Cleanup must close stdout *before* joining the writer, or the join waits
+    forever for a thread nothing will ever unstick.
+
+    Runs the abandon-early sequence on a background thread and bounds it
+    with `join(timeout=...)`, since there is no pytest-timeout plugin here:
+    a regression should fail the assertion, not hang the suite.
+    """
+    n = 2500
+    shas = _hash_many_blobs(repo, tmp_path, n, "g")
+
+    def _consume_a_few_then_abandon() -> None:
+        gen = gitio.cat_file_batch(repo, shas)
+        for _ in range(3):
+            next(gen)
+        gen.close()
+
+    runner = threading.Thread(target=_consume_a_few_then_abandon, daemon=True)
+    runner.start()
+    runner.join(timeout=15)
+
+    assert not runner.is_alive(), "cat_file_batch cleanup hung on early abandonment"
 
 
 def test_status_paths_reports_dirty_files(repo, write):
