@@ -1,41 +1,57 @@
-"""Effect propagation: `effects(n) = direct(n) UNION union(effects(callees))`
-over the `CALLS` edge closure for one revision.
+"""Effect propagation: for each node, the strongest confidence tier at
+which it can reach an effect-bearing node, over the `CALLS` edge closure
+for one revision.
 
-Strongly connected components of the call graph are condensed with Tarjan's
-algorithm first, so every member of a recursion cycle shares one effect
-union computed once. A naive recursive walk without this recurses forever
-on mutual recursion (`ping` calls `pong` calls `ping` ...) -- that's what
-`test_recursion_cycle_does_not_hang` guards against. Once condensed, the
-component graph is a DAG, so a single memoized post-order walk computes
-every component's effect set in one pass, carrying confidence as the
-minimum along whichever concrete edge/path produced the strongest claim.
+This is the classic widest-path (bottleneck shortest-path) problem: a
+node's confidence for an effect is `max` over every path to a node that has
+that effect directly, of the `min` edge confidence along that path. Rather
+than search per-path, it is solved level-wise: for each confidence tier,
+strongest first (`HIGH`, then `MEDIUM`, then `LOW`), build the subgraph of
+`CALLS` edges at that tier or better, and find every node that can reach an
+effect-bearing node within it via plain reachability -- multi-source BFS on
+the reversed graph, starting from the effect-bearing nodes. The first
+(strongest) tier at which a node reaches an effect wins; a weaker tier
+never overwrites it.
 
-`witness_path` is a separate, on-demand BFS over the (uncondensed) `CALLS`
-graph, used at query time. BFS never revisits a node, so cycles are handled
-for free there and it needs no SCC step of its own. It is confidence-aware:
-`propagate` reports the *best* confidence over every path (the aggregate
-claim "this effect is reachable, at the strongest confidence any path
-supports"), so the witness search is restricted to edges strong enough to
-support that same confidence -- otherwise the printed chain could be a
-weak, unrelated path to a claim it does not actually justify.
+Plain reachability handles cycles for free -- a visited set is all it
+takes -- so mutual recursion (`ping` calls `pong` calls `ping` ...) needs
+no special handling; `test_recursion_cycle_does_not_hang` passes without
+any SCC step. An earlier version of this module condensed strongly
+connected components with Tarjan and unioned effects across each
+component, but that scheme could hand out a confidence no real path
+supported: it merged a component member's direct effect into the whole
+component's set without accounting for the edge confidence needed to
+*reach* that member from elsewhere in the cycle. Concretely: `A --LOW-->
+B`, `B --HIGH--> A`, `B` has a direct HIGH effect -- the old code merged
+B's HIGH straight into the shared `{A, B}` union, reporting HIGH for A even
+though the only way out of A is the LOW edge. Level-wise reachability does
+not have that failure mode, because the tier a node's confidence is
+assigned at is exactly the subgraph a path was found to exist in -- there
+is no condensation step to smuggle a stronger neighbor's confidence past
+the weak edge needed to reach it.
+
+`witness_path` reconstructs that path on demand at query time: a forward
+BFS from the queried node, restricted to `CALLS` edges at the reported
+confidence or better. Because `propagate` only ever assigns a confidence
+for which such a path exists, this BFS is total -- it cannot come back
+empty for a `(node_id, kind, confidence)` triple `propagate` actually
+produced.
 
 This module never queries the effect `Catalog`: it only reads `effects`
-rows Task 10's `detect_direct` already wrote, and `edges`.
+rows `detect_direct` already wrote, and `edges`.
 """
 
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterator
 
 from codegraph.resolve import HIGH, LOW, MEDIUM
 from codegraph.store import Store
 
+#: Strongest first: the order `propagate` walks tiers in, since the first
+#: (strongest) tier at which a node reaches an effect is the one that wins.
+_TIERS = (HIGH, MEDIUM, LOW)
 _RANK = {LOW: 0, MEDIUM: 1, HIGH: 2}
-
-
-def _weaker(a: str, b: str) -> str:
-    return a if _RANK[a] <= _RANK[b] else b
 
 
 def _stronger(a: str, b: str) -> str:
@@ -49,7 +65,7 @@ def propagate(store: Store, rev: str) -> int:
     connection.execute("DELETE FROM effects WHERE rev=? AND direct=0", (rev,))
 
     node_ids = {row["id"] for row in connection.execute("SELECT id FROM nodes WHERE rev=?", (rev,))}
-    calls: dict[str, set[str]] = {node_id: set() for node_id in node_ids}
+
     edge_confidence: dict[tuple[str, str], str] = {}
     for row in connection.execute(
         "SELECT src, dst, confidence FROM edges WHERE rev=? AND kind='CALLS'", (rev,)
@@ -57,65 +73,45 @@ def propagate(store: Store, rev: str) -> int:
         src, dst, confidence = row["src"], row["dst"], row["confidence"]
         if src not in node_ids or dst not in node_ids:
             continue
-        calls[src].add(dst)
         key = (src, dst)
         edge_confidence[key] = _stronger(edge_confidence.get(key, confidence), confidence)
 
+    # reverse_by_tier[tier][dst] = every src with an edge src->dst whose
+    # confidence is at least `tier`. These are nested supersets as the tier
+    # weakens: the HIGH subgraph is a subset of MEDIUM-or-better, which is a
+    # subset of LOW-or-better (everything).
+    reverse_by_tier: dict[str, dict[str, set[str]]] = {tier: {} for tier in _TIERS}
+    for (src, dst), confidence in edge_confidence.items():
+        rank = _RANK[confidence]
+        for tier in _TIERS:
+            if _RANK[tier] <= rank:
+                reverse_by_tier[tier].setdefault(dst, set()).add(src)
+
     direct_by_node: dict[str, dict[str, str]] = {}
+    direct_nodes_by_kind: dict[str, set[str]] = {}
     for row in connection.execute(
         "SELECT node_id, kind, confidence FROM effects WHERE rev=? AND direct=1", (rev,)
     ):
-        bucket = direct_by_node.setdefault(row["node_id"], {})
-        bucket[row["kind"]] = _stronger(
-            bucket.get(row["kind"], row["confidence"]), row["confidence"]
-        )
+        direct_by_node.setdefault(row["node_id"], {})[row["kind"]] = row["confidence"]
+        direct_nodes_by_kind.setdefault(row["kind"], set()).add(row["node_id"])
 
-    components, comp_of = _tarjan_scc(node_ids, calls)
-
-    comp_direct: dict[int, dict[str, str]] = {}
-    for node_id, node_kinds in direct_by_node.items():
-        comp = comp_of.get(node_id)
-        if comp is None:
-            continue
-        bucket = comp_direct.setdefault(comp, {})
-        for kind, confidence in node_kinds.items():
-            bucket[kind] = _stronger(bucket.get(kind, confidence), confidence)
-
-    comp_edges: dict[int, dict[int, str]] = {}
-    for (src, dst), confidence in edge_confidence.items():
-        c_src, c_dst = comp_of[src], comp_of[dst]
-        if c_src == c_dst:
-            continue
-        bucket = comp_edges.setdefault(c_src, {})
-        bucket[c_dst] = _stronger(bucket.get(c_dst, confidence), confidence)
-
-    # The condensation is a DAG (Tarjan guarantees no cycles between
-    # distinct components), so a plain memoized recursion terminates.
-    cache: dict[int, dict[str, str]] = {}
-
-    def comp_effects(comp: int) -> dict[str, str]:
-        if comp in cache:
-            return cache[comp]
-        result = dict(comp_direct.get(comp, {}))
-        for succ, edge_conf in comp_edges.get(comp, {}).items():
-            for kind, confidence in comp_effects(succ).items():
-                propagated = _weaker(edge_conf, confidence)
-                if kind not in result or _RANK[propagated] > _RANK[result[kind]]:
-                    result[kind] = propagated
-        cache[comp] = result
-        return result
+    # node_confidence[node][kind] = the strongest tier at which `node` can
+    # reach some node that carries `kind` directly.
+    node_confidence: dict[str, dict[str, str]] = {}
+    for tier in _TIERS:
+        adjacency = reverse_by_tier[tier]
+        for kind, sources in direct_nodes_by_kind.items():
+            for node_id in _reverse_reachable(sources, adjacency):
+                bucket = node_confidence.setdefault(node_id, {})
+                bucket.setdefault(kind, tier)
 
     rows: list[tuple] = []
-    for comp_index in range(len(components)):
-        effects_here = comp_effects(comp_index)
-        if not effects_here:
-            continue
-        for node_id in components[comp_index]:
-            own_direct = direct_by_node.get(node_id, {})
-            for kind, confidence in effects_here.items():
-                if kind in own_direct:
-                    continue
-                rows.append((rev, node_id, kind, 0, None, None, confidence))
+    for node_id, kinds in node_confidence.items():
+        own_direct = direct_by_node.get(node_id, {})
+        for kind, confidence in kinds.items():
+            if kind in own_direct:
+                continue
+            rows.append((rev, node_id, kind, 0, None, None, confidence))
 
     connection.executemany(
         "INSERT INTO effects(rev, node_id, kind, direct, evidence_path, evidence_line,"
@@ -125,76 +121,32 @@ def propagate(store: Store, rev: str) -> int:
     return len(rows)
 
 
-def _tarjan_scc(
-    nodes: set[str], adjacency: dict[str, set[str]]
-) -> tuple[list[list[str]], dict[str, int]]:
-    """Tarjan's strongly-connected-components algorithm, iterative so a deep
-    call graph can't blow the interpreter's recursion limit."""
-    index_of: dict[str, int] = {}
-    lowlink: dict[str, int] = {}
-    on_stack: set[str] = set()
-    stack: list[str] = []
-    components: list[list[str]] = []
-    counter = 0
-
-    def strongconnect(root: str) -> None:
-        nonlocal counter
-        work: list[tuple[str, Iterator[str]]] = [(root, iter(adjacency.get(root, ())))]
-        index_of[root] = counter
-        lowlink[root] = counter
-        counter += 1
-        stack.append(root)
-        on_stack.add(root)
-
-        while work:
-            v, neighbors = work[-1]
-            advanced = False
-            for w in neighbors:
-                if w not in index_of:
-                    index_of[w] = counter
-                    lowlink[w] = counter
-                    counter += 1
-                    stack.append(w)
-                    on_stack.add(w)
-                    work.append((w, iter(adjacency.get(w, ()))))
-                    advanced = True
-                    break
-                if w in on_stack:
-                    lowlink[v] = min(lowlink[v], index_of[w])
-            if advanced:
-                continue
-
-            work.pop()
-            if work:
-                parent = work[-1][0]
-                lowlink[parent] = min(lowlink[parent], lowlink[v])
-            if lowlink[v] == index_of[v]:
-                component = []
-                while True:
-                    w = stack.pop()
-                    on_stack.discard(w)
-                    component.append(w)
-                    if w == v:
-                        break
-                components.append(component)
-
-    for node in nodes:
-        if node not in index_of:
-            strongconnect(node)
-
-    comp_of = {node_id: i for i, component in enumerate(components) for node_id in component}
-    return components, comp_of
+def _reverse_reachable(sources: set[str], adjacency: dict[str, set[str]]) -> set[str]:
+    """Every node that can reach some node in `sources` via the forward
+    edges `adjacency` encodes in reverse (`adjacency[dst]` is every direct
+    predecessor of `dst`). Multi-source BFS on the reverse graph; a plain
+    visited set makes this correct in the presence of cycles without any
+    extra bookkeeping."""
+    visited = set(sources)
+    queue: deque[str] = deque(sources)
+    while queue:
+        current = queue.popleft()
+        for predecessor in adjacency.get(current, ()):
+            if predecessor not in visited:
+                visited.add(predecessor)
+                queue.append(predecessor)
+    return visited
 
 
 def witness_path(store: Store, rev: str, node_id: str, kind: str, confidence: str) -> list[str]:
     """Fewest-hop chain of node ids from `node_id` to a node whose direct
     effect of `kind` causes it, restricted to `CALLS` edges strong enough
-    to support `confidence` -- the aggregate value `propagate` already
-    computed as the best achievable across every path. Every edge on the
-    chain has confidence >= `confidence`, so the chain's own bottleneck
-    confidence is never weaker than the number printed next to it. `[]` if
-    no such chain exists (should not happen for a `(node_id, kind)` pair
-    `propagate` actually produced this confidence for)."""
+    to support `confidence` -- the value `propagate` already computed as
+    the strongest tier at which `node_id` can reach an effect of this
+    kind. Every edge on the chain has confidence >= `confidence`, so the
+    chain's own bottleneck confidence is never weaker than the number
+    printed next to it. `[]` if no such chain exists (should not happen
+    for a `(node_id, kind, confidence)` triple `propagate` produced)."""
     connection = store.connection
     direct_nodes = {
         row["node_id"]
