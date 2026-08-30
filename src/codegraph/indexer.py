@@ -167,7 +167,7 @@ class Indexer:
             # transaction: a revision is never visible with edges but
             # stale (or missing) effects.
             catalog = Catalog.load(self.config)
-            detect_direct(self.store, rev, catalog)
+            detect_direct(self.store, rev, catalog, self.config)
             propagate(self.store, rev)
 
         return IndexStats(

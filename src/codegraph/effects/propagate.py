@@ -12,7 +12,12 @@ minimum along whichever concrete edge/path produced the strongest claim.
 
 `witness_path` is a separate, on-demand BFS over the (uncondensed) `CALLS`
 graph, used at query time. BFS never revisits a node, so cycles are handled
-for free there and it needs no SCC step of its own.
+for free there and it needs no SCC step of its own. It is confidence-aware:
+`propagate` reports the *best* confidence over every path (the aggregate
+claim "this effect is reachable, at the strongest confidence any path
+supports"), so the witness search is restricted to edges strong enough to
+support that same confidence -- otherwise the printed chain could be a
+weak, unrelated path to a claim it does not actually justify.
 
 This module never queries the effect `Catalog`: it only reads `effects`
 rows Task 10's `detect_direct` already wrote, and `edges`.
@@ -181,9 +186,15 @@ def _tarjan_scc(
     return components, comp_of
 
 
-def witness_path(store: Store, rev: str, node_id: str, kind: str) -> list[str]:
-    """Shortest chain of node ids from `node_id` to a node whose direct
-    effect of `kind` causes it, via `CALLS` edges. `[]` if none exists."""
+def witness_path(store: Store, rev: str, node_id: str, kind: str, confidence: str) -> list[str]:
+    """Fewest-hop chain of node ids from `node_id` to a node whose direct
+    effect of `kind` causes it, restricted to `CALLS` edges strong enough
+    to support `confidence` -- the aggregate value `propagate` already
+    computed as the best achievable across every path. Every edge on the
+    chain has confidence >= `confidence`, so the chain's own bottleneck
+    confidence is never weaker than the number printed next to it. `[]` if
+    no such chain exists (should not happen for a `(node_id, kind)` pair
+    `propagate` actually produced this confidence for)."""
     connection = store.connection
     direct_nodes = {
         row["node_id"]
@@ -195,11 +206,21 @@ def witness_path(store: Store, rev: str, node_id: str, kind: str) -> list[str]:
     if node_id in direct_nodes:
         return [node_id]
 
-    calls: dict[str, list[str]] = {}
+    target_rank = _RANK[confidence]
+    edge_confidence: dict[tuple[str, str], str] = {}
     for row in connection.execute(
-        "SELECT DISTINCT src, dst FROM edges WHERE rev=? AND kind='CALLS'", (rev,)
+        "SELECT src, dst, confidence FROM edges WHERE rev=? AND kind='CALLS'", (rev,)
     ):
-        calls.setdefault(row["src"], []).append(row["dst"])
+        key = (row["src"], row["dst"])
+        edge_confidence[key] = _stronger(
+            edge_confidence.get(key, row["confidence"]), row["confidence"]
+        )
+
+    calls: dict[str, list[str]] = {}
+    for (src, dst), conf in edge_confidence.items():
+        if _RANK[conf] < target_rank:
+            continue
+        calls.setdefault(src, []).append(dst)
 
     visited = {node_id}
     parent: dict[str, str] = {}

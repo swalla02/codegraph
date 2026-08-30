@@ -78,3 +78,36 @@ def test_project_override_tags_house_abstraction(repo, write):
     store = build(repo)
     assert "DB_WRITE" in kinds(effects_report(store, "HEAD", "svc.py::run"))
     store.close()
+
+
+def test_witness_follows_the_path_that_supports_the_reported_confidence(repo, write):
+    """`query` has two outgoing calls: a LOW-confidence ambiguous call
+    (`thing.shared()`, matching both One.shared and Two.shared) that reaches
+    a direct effect through One.shared, and a HIGH-confidence call chain
+    (query -> b -> c) that reaches a direct effect through c. The best
+    achievable confidence is HIGH (via b -> c); the printed chain must be
+    the one that actually supports HIGH, not the shorter LOW one."""
+    write(
+        "one.py",
+        "import requests\n\n\nclass One:\n    def shared(self):\n        requests.get('u')\n",
+        commit="one",
+    )
+    write("two.py", "class Two:\n    def shared(self):\n        pass\n", commit="two")
+    write(
+        "b.py",
+        "import requests\n\n\ndef c():\n    requests.get('u')\n\n\ndef b():\n    c()\n",
+        commit="b",
+    )
+    write(
+        "caller.py",
+        "from b import b\n\n\ndef query(thing):\n    thing.shared()\n    b()\n",
+        commit="caller",
+    )
+    store = build(repo)
+    report = effects_report(store, "HEAD", "caller.py::query")
+    group = next(g for g in report.groups if g.title == "NETWORK")
+    row = group.rows[0]
+    assert row.detail.startswith("NETWORK HIGH via")
+    assert "b.py::c" in row.detail
+    assert "one.py::One.shared" not in row.detail
+    store.close()

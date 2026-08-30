@@ -49,7 +49,7 @@ def effects_report(store: Store, rev: str, node_id: str) -> Report:
     groups: list[Group] = []
     for rank, kind in enumerate(ordered):
         confidence = node_kinds[kind]
-        chain = witness_path(store, rev, node_id, kind)
+        chain = witness_path(store, rev, node_id, kind, confidence)
         cause = chain[-1] if chain else node_id
         location = _evidence_location(store, rev, cause, kind)
         detail = f"{kind} {confidence} via {' -> '.join(chain)}"

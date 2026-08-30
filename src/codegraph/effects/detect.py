@@ -14,22 +14,15 @@ from __future__ import annotations
 
 from codegraph.config import Config
 from codegraph.effects.catalog import Catalog
-from codegraph.resolve import (
-    HIGH,
-    MODULE_SCOPE,
-    absolute_module,
-    module_for_path,
-    package_for_module,
-)
+from codegraph.resolve import HIGH, MODULE_SCOPE, build_import_maps
 from codegraph.store import Store
 
 
-def detect_direct(store: Store, rev: str, catalog: Catalog) -> int:
+def detect_direct(store: Store, rev: str, catalog: Catalog, config: Config) -> int:
     """Tag every ref in `rev` that is a direct effect. Returns rows written."""
     connection = store.connection
-    config = Config.load(store.directory.parent)
-    import_maps = _import_maps(store, rev, config)
-    owner_index = _owner_index(store, rev)
+    import_maps, _imported_modules = build_import_maps(connection, rev, config)
+    owner_index, live_index = _owner_index(store, rev)
 
     rows: list[tuple] = []
     for row in connection.execute(
@@ -45,7 +38,9 @@ def detect_direct(store: Store, rev: str, catalog: Catalog) -> int:
             kind = catalog.match(dotted)
         if kind is None:
             continue
-        node_id = _owning_node(row["path"], row["from_qualname"], row["line"], owner_index)
+        node_id = _owning_node(
+            row["path"], row["from_qualname"], row["line"], owner_index, live_index
+        )
         rows.append((rev, node_id, kind, 1, row["path"], row["line"], HIGH))
 
     connection.execute("DELETE FROM effects WHERE rev=? AND direct=1", (rev,))
@@ -70,53 +65,26 @@ def _expand(raw_name: str, import_map: dict[str, str]) -> str:
     return f"{target}.{rest}" if rest else target
 
 
-def _import_maps(store: Store, rev: str, config: Config) -> dict[str, dict[str, str]]:
-    """Per-path local-alias -> absolute-dotted-module map.
-
-    Mirrors the alias expansion `resolve.py`'s symbol table builds for call
-    resolution, but detection only needs the alias map, not a full resolver.
-    """
-    connection = store.connection
-    paths = [
-        row["path"]
-        for row in connection.execute("SELECT DISTINCT path FROM tree WHERE rev=?", (rev,))
-    ]
-    module_for = {path: module_for_path(path, config.source_roots) for path in paths}
-    maps: dict[str, dict[str, str]] = {path: {} for path in paths}
-
-    rows = connection.execute(
-        "SELECT t.path, i.module, i.level, i.name, i.alias FROM blob_imports i"
-        " JOIN tree t ON t.blob_sha = i.blob_sha WHERE t.rev=? ORDER BY t.path, i.ordinal",
-        (rev,),
-    )
-    for row in rows:
-        path = row["path"]
-        alias_map = maps[path]
-        package = package_for_module(module_for[path], path)
-        module = absolute_module(row["module"], row["level"], package)
-        if row["name"] is None:
-            alias_map[row["alias"] or module] = module
-            if row["alias"] is None:
-                alias_map.setdefault(module.partition(".")[0], module.partition(".")[0])
-        else:
-            target = f"{module}.{row['name']}" if module else row["name"]
-            alias_map[row["alias"] or row["name"]] = target
-    return maps
-
-
-def _owner_index(store: Store, rev: str) -> dict[tuple[str, str], list[tuple[str, int, int]]]:
+def _owner_index(
+    store: Store, rev: str
+) -> tuple[dict[tuple[str, str], list[tuple[str, int, int]]], dict[tuple[str, str], str]]:
     """(path, qualname) -> [(node id, line_start, line_end), ...], including
     shadowed definitions, so a ref inside a shadowed body still attributes
-    to it rather than to the live definition sharing its name."""
+    to it rather than to the live definition sharing its name; and
+    (path, qualname) -> live node id, mirroring `resolve.py`'s
+    `qualname_index` for the same-fallback reason `_owning_node` uses it."""
     index: dict[tuple[str, str], list[tuple[str, int, int]]] = {}
+    live: dict[tuple[str, str], str] = {}
     for row in store.connection.execute(
-        "SELECT id, path, qualname, line_start, line_end FROM nodes WHERE rev=? ORDER BY id",
+        "SELECT id, path, qualname, line_start, line_end, name_binding FROM nodes"
+        " WHERE rev=? ORDER BY id",
         (rev,),
     ):
-        index.setdefault((row["path"], row["qualname"]), []).append(
-            (row["id"], row["line_start"], row["line_end"])
-        )
-    return index
+        key = (row["path"], row["qualname"])
+        index.setdefault(key, []).append((row["id"], row["line_start"], row["line_end"]))
+        if row["name_binding"] == "live":
+            live[key] = row["id"]
+    return index, live
 
 
 def _owning_node(
@@ -124,11 +92,16 @@ def _owning_node(
     from_qualname: str,
     line: int,
     index: dict[tuple[str, str], list[tuple[str, int, int]]],
+    live: dict[tuple[str, str], str],
 ) -> str:
-    """The node that owns a ref; mirrors `resolve.py`'s `_source_id`."""
+    """The node that owns a ref; mirrors `resolve.py`'s `_source_id`,
+    including its fallback to the live binding (not just "the last
+    candidate") when a ref's line falls inside no recorded span -- so
+    detection and resolution attribute the same ref to the same node."""
     if from_qualname == MODULE_SCOPE:
         return f"{path}::{MODULE_SCOPE}"
-    candidates = index.get((path, from_qualname))
+    key = (path, from_qualname)
+    candidates = index.get(key)
     if not candidates:
         return f"{path}::{from_qualname}"
     if len(candidates) == 1:
@@ -136,4 +109,4 @@ def _owning_node(
     for node_id, line_start, line_end in candidates:
         if line_start <= line <= line_end:
             return node_id
-    return candidates[-1][0]
+    return live.get(key, candidates[-1][0])
