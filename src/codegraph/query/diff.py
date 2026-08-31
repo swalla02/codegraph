@@ -170,8 +170,16 @@ def diff_report(store: Store, indexer: Indexer, base: str, head: str, limit: int
         groups.append(Group(title, kept))
         truncated = truncated or was_truncated
 
+    # A newly-added symbol is exactly as "newly reachable" as an edited
+    # one -- Task 12's fix for this same blind spot at module scope. A
+    # brand-new function that calls `requests.post` has no entry in
+    # `base_nodes` at all, so `changed_ids` alone (which only ever
+    # contains ids present in BOTH revisions) can never surface it;
+    # `_effect_kinds(store, resolved_base, node_id)` against a nonexistent
+    # node id is just an empty result set, so folding `added_ids` in here
+    # costs nothing for ids that legitimately have no base side.
     new_effects: set[str] = set()
-    for node_id in changed_ids:
+    for node_id in changed_ids | added_ids:
         new_effects |= _effect_kinds(store, head, node_id) - _effect_kinds(
             store, resolved_base, node_id
         )

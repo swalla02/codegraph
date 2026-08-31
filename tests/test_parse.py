@@ -32,6 +32,49 @@ def test_body_hash_changes_with_body():
     assert one.nodes[0].body_hash != two.nodes[0].body_hash
 
 
+def _class_hash(result):
+    return next(n.body_hash for n in result.nodes if n.qualname == "Beta")
+
+
+def _method_hash(result):
+    return next(n.body_hash for n in result.nodes if n.qualname == "Beta.gamma")
+
+
+def test_class_body_hash_ignores_a_method_body_edit():
+    """B7 regression: a class's body_hash used to include every nested
+    method's body verbatim, so editing one line inside a single method
+    reported BOTH the method AND its class as changed. `_BodyElider`
+    already solved exactly this for module nodes; it just wasn't applied
+    to classes too."""
+    one = parse_blob(b"class Beta:\n    def gamma(self):\n        return 1\n")
+    two = parse_blob(b"class Beta:\n    def gamma(self):\n        return 2\n")
+    assert _class_hash(one) == _class_hash(two)
+    # The method's own body_hash still changes -- only the class's doesn't.
+    assert _method_hash(one) != _method_hash(two)
+
+
+def test_class_body_hash_changes_when_a_method_is_added():
+    one = parse_blob(b"class Beta:\n    def gamma(self):\n        pass\n")
+    two = parse_blob(
+        b"class Beta:\n    def gamma(self):\n        pass\n\n    def delta(self):\n        pass\n"
+    )
+    assert _class_hash(one) != _class_hash(two)
+
+
+def test_class_body_hash_changes_with_bases_and_decorators():
+    plain = parse_blob(b"class Beta:\n    def gamma(self):\n        pass\n")
+    subclassed = parse_blob(b"class Beta(Base):\n    def gamma(self):\n        pass\n")
+    decorated = parse_blob(b"@final\nclass Beta:\n    def gamma(self):\n        pass\n")
+    assert _class_hash(plain) != _class_hash(subclassed)
+    assert _class_hash(plain) != _class_hash(decorated)
+
+
+def test_class_body_hash_ignores_line_position():
+    top = parse_blob(b"class Beta:\n    def gamma(self):\n        pass\n")
+    shifted = parse_blob(b"\n\n\nclass Beta:\n    def gamma(self):\n        pass\n")
+    assert _class_hash(top) == _class_hash(shifted)
+
+
 def test_shadowed_definitions_are_all_retained():
     result = parse_blob(b"def alpha():\n    return 1\n\n\ndef alpha():\n    return 2\n")
     alphas = [n for n in result.nodes if n.qualname == "alpha"]

@@ -26,18 +26,10 @@ from __future__ import annotations
 
 from codegraph.query.rank import fan_in, salience, score
 from codegraph.render import Group, Report, Row, budget
-from codegraph.resolve import HIGH, LOW, MEDIUM
+from codegraph.resolve import CONFIDENCE_RANK, HIGH, LOW, stronger, weaker
 from codegraph.store import Store
 
-_RANK = {LOW: 0, MEDIUM: 1, HIGH: 2}
-
-
-def _stronger(a: str, b: str) -> str:
-    return a if _RANK[a] >= _RANK[b] else b
-
-
-def _weaker(a: str, b: str) -> str:
-    return a if _RANK[a] <= _RANK[b] else b
+_RANK = CONFIDENCE_RANK
 
 
 def _reverse_edges(store: Store, rev: str) -> dict[str, dict[str, str]]:
@@ -48,7 +40,7 @@ def _reverse_edges(store: Store, rev: str) -> dict[str, dict[str, str]]:
         "SELECT src, dst, confidence FROM edges WHERE rev=? AND kind='CALLS'", (rev,)
     ):
         key = (row["src"], row["dst"])
-        edge_confidence[key] = _stronger(
+        edge_confidence[key] = stronger(
             edge_confidence.get(key, row["confidence"]), row["confidence"]
         )
 
@@ -76,7 +68,7 @@ def _walk(
             for src, edge_confidence in reverse.get(current, {}).items():
                 if src in visited:
                     continue
-                candidate = _weaker(path_confidence, edge_confidence)
+                candidate = weaker(path_confidence, edge_confidence)
                 best = next_level.get(src)
                 if best is None or _RANK[candidate] > _RANK[best]:
                     next_level[src] = candidate
@@ -150,11 +142,16 @@ def impact_report(
         else:
             dependent_rows.append(row)
 
+    # `limit` is a TOTAL budget across both groups, not `limit` rows each --
+    # `dependents` gets first claim on it (production callers should never
+    # be crowded out by tests), and whatever's left over budgets `tests`.
     kept, truncated = budget(dependent_rows, limit)
     groups = [Group("dependents", kept)] if kept else []
+    remaining = limit - len(kept)
     if test_rows:
-        kept_tests, tests_truncated = budget(test_rows, limit)
-        groups.append(Group("tests", kept_tests))
+        kept_tests, tests_truncated = budget(test_rows, remaining)
+        if kept_tests:
+            groups.append(Group("tests", kept_tests))
         truncated = truncated or tests_truncated
 
     effects_reachable = sorted(

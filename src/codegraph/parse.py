@@ -173,6 +173,33 @@ def _module_body_hash(tree: ast.Module) -> str:
     return _body_hash(skeleton)
 
 
+def _class_body_hash(node: ast.ClassDef) -> str:
+    """Structural hash of a class def, with every nested method/nested
+    class's OWN body elided -- the same treatment `_module_body_hash`
+    gives a module's top-level statements, applied one level down.
+
+    Without this, a class's `body_hash` covers its methods' bodies too, so
+    editing one line inside a single method changes both that method's own
+    `body_hash` (correctly) AND the class's (incorrectly) -- exactly the
+    line-shift-insensitivity `body_hash` comparison exists to provide, but
+    one level higher, and it matters for the same reason `diff` cares
+    about module-level churn: an editor touching `PaymentService.charge`
+    should not also report `PaymentService` itself as changed.
+
+    `_BodyElider().generic_visit(skeleton)` (not `.visit(skeleton)`) is the
+    deliberate difference from `_module_body_hash`: `generic_visit` walks
+    `skeleton`'s children without ever calling `visit_ClassDef` on
+    `skeleton` itself, so the class's own body list, bases, decorators,
+    and name stay intact -- only a `FunctionDef`/`ClassDef` found AMONG
+    its children (a method, a nested class) gets its body replaced with a
+    single `Pass`. Bases and decorators live in separate AST fields from
+    `body`, so they're hashed as-is regardless.
+    """
+    skeleton = copy.deepcopy(node)
+    _BodyElider().generic_visit(skeleton)
+    return _body_hash(skeleton)
+
+
 class _Collector(ast.NodeVisitor):
     def __init__(self) -> None:
         self.nodes: list[ParsedNode] = []
@@ -220,6 +247,13 @@ class _Collector(ast.NodeVisitor):
     def _visit_def(self, node: ast.AST, kind: str) -> None:
         decorators = _decorator_names(node)
         is_overload = any(d.split(".")[-1] == "overload" for d in decorators)
+        # A class's own body_hash elides its nested defs' bodies (mirroring
+        # _module_body_hash), since each method already carries its own
+        # unelided body_hash -- otherwise editing one line inside a single
+        # method would also change the class's hash. A function/method has
+        # no nested defs to elide out this way: its own body IS the thing
+        # body_hash is comparing.
+        body_hash = _class_body_hash(node) if kind == "class" else _body_hash(node)
         self.nodes.append(
             ParsedNode(
                 ordinal=len(self.nodes),
@@ -227,7 +261,7 @@ class _Collector(ast.NodeVisitor):
                 kind=kind,
                 line_start=node.lineno,
                 line_end=getattr(node, "end_lineno", node.lineno),
-                body_hash=_body_hash(node),
+                body_hash=body_hash,
                 name_binding="live",
                 shadow_index=None,
                 conditional=int(bool(self._conditional_depth) or is_overload),

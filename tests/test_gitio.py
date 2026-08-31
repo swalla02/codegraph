@@ -2,6 +2,8 @@ import subprocess
 import threading
 from pathlib import Path
 
+import pytest
+
 from codegraph import gitio
 from tests.conftest import git
 
@@ -187,3 +189,28 @@ def test_merge_base_and_default_branch(repo, write):
     write("c.py", "def gamma():\n    pass\n", commit="feature work")
     assert gitio.merge_base(repo, "main", "feature") == base
     assert gitio.default_branch(repo) == "main"
+
+
+# -- B9: a `rev` value that happens to start with `-` must be treated as a
+# revision (fails as "not found"), never reinterpreted as a git option.
+# `rev_parse` is the sharpest case: verified against a scratch repo that
+# WITHOUT the `--end-of-options` guard, `git rev-parse --not-a-real-option`
+# doesn't error at all -- rev-parse doesn't recognize the flag, falls back
+# to its "echo unrecognized arguments back verbatim" behavior, and exits 0
+# with the literal string "--not-a-real-option" as if it were a resolved
+# sha. That is a silently wrong answer, not just a confusing one.
+
+
+def test_rev_parse_treats_a_dash_prefixed_value_as_a_revision(repo):
+    with pytest.raises(gitio.GitError):
+        gitio.rev_parse(repo, "--not-a-real-option")
+
+
+def test_ls_tree_treats_a_dash_prefixed_rev_as_a_revision(repo):
+    with pytest.raises(gitio.GitError):
+        gitio.ls_tree(repo, "--not-a-real-option")
+
+
+def test_merge_base_treats_a_dash_prefixed_rev_as_a_revision(repo):
+    with pytest.raises(gitio.GitError):
+        gitio.merge_base(repo, "--not-a-real-option", "HEAD")

@@ -108,6 +108,28 @@ def test_deleted_module_only_file_appears_in_removed(repo, write):
     store.close()
 
 
+def test_new_symbols_effects_are_reported_as_new(repo, write):
+    """B6 regression: `new_effects` used to union `_effect_kinds` over
+    `changed_ids` only, so a brand-new function's effects were invisible
+    -- `changed_ids` by construction only ever contains ids present in
+    BOTH revisions, so a symbol that didn't exist at `base` could never
+    land in it, no matter what it reaches. This is the same blind-spot
+    class Task 12 already fixed once for module scope
+    (`test_module_level_effect_addition_is_changed_and_new_effect`); here
+    it's a whole new function, not an edit to an existing one."""
+    store, indexer = build(repo)
+    base = git(repo, "rev-parse", "HEAD").strip()
+    write(
+        "m.py",
+        "def alpha():\n    return 1\n\n\ndef beta():\n    import requests\n    requests.post('u')\n",
+        commit="add a function with a network call",
+    )
+    report = diff_report(store, indexer, base, "HEAD")
+    assert "m.py::beta" in rows(report, "added")
+    assert "NETWORK" in report.summary["new_effects"]
+    store.close()
+
+
 def test_module_level_effect_addition_is_changed_and_new_effect(repo, write):
     write("m.py", "TIMEOUT = 30\n", commit="m")
     store, indexer = build(repo)

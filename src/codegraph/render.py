@@ -48,11 +48,22 @@ def budget(rows: list[Row], limit: int) -> tuple[list[Row], bool]:
     return kept, was_truncated
 
 
+def _format_summary_value(value: object) -> str:
+    """Render one summary value for the text format. A list (e.g.
+    `effects_reachable: ["DB_WRITE", "PROCESS"]`) is joined with ', ' rather
+    than shown as Python's `repr` (`['DB_WRITE', 'PROCESS']`) -- readable
+    output, not a debugger dump. An empty list reads as 'none' rather than
+    a blank field, so `key: ` never appears with nothing after the colon."""
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) if value else "none"
+    return str(value)
+
+
 def render_text(report: Report) -> str:
     """Render report as human-readable text.
 
     Format:
-    - First line: summary items joined with ' · '
+    - First line: summary items as 'key: value', joined with ' · '
     - Then each group as a heading followed by indented rows
 
     Args:
@@ -63,8 +74,12 @@ def render_text(report: Report) -> str:
     """
     lines = []
 
-    # Summary line: join all values with ' · '
-    summary_items = [str(v) for v in report.summary.values()]
+    # Summary line: 'key: value' pairs joined with ' · ', so every field is
+    # labeled -- unlabeled positional values (`2 · 1 · 1 · 0 · ['DB_WRITE']`)
+    # are meaningless without cross-referencing the producer's source.
+    summary_items = [
+        f"{key}: {_format_summary_value(value)}" for key, value in report.summary.items()
+    ]
     summary_line = " · ".join(summary_items)
     lines.append(summary_line)
 

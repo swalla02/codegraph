@@ -40,7 +40,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
     store, indexer = open_workspace(root)
     try:
-        _print_stats(indexer.reconcile(args.rev))
+        try:
+            stats = indexer.reconcile(args.rev)
+        except gitio.GitError:
+            print(f"revision not found: {args.rev}", file=sys.stderr)
+            return 1
+        _print_stats(stats)
     finally:
         store.close()
     return 0
@@ -53,7 +58,11 @@ def _cmd_index(args: argparse.Namespace) -> int:
         if args.rebuild:
             store.connection.execute("DELETE FROM blobs")
             store.connection.commit()
-        stats = indexer.reconcile(args.rev)
+        try:
+            stats = indexer.reconcile(args.rev)
+        except gitio.GitError:
+            print(f"revision not found: {args.rev}", file=sys.stderr)
+            return 1
         if args.quiet:
             # --quiet suppresses the stats chatter (this is what the
             # warming hooks invoke in the background), but a parse failure
@@ -72,7 +81,11 @@ def _cmd_resolve(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
     store, indexer = open_workspace(root)
     try:
-        indexer.reconcile(args.rev)
+        try:
+            indexer.reconcile(args.rev)
+        except gitio.GitError:
+            print(f"revision not found: {args.rev}", file=sys.stderr)
+            return 1
         matches = find_symbol(store, args.rev, args.query)
         for row in matches:
             print(row["id"])
@@ -89,7 +102,11 @@ def _cmd_effects(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
     store, indexer = open_workspace(root)
     try:
-        indexer.reconcile(args.rev)
+        try:
+            indexer.reconcile(args.rev)
+        except gitio.GitError:
+            print(f"revision not found: {args.rev}", file=sys.stderr)
+            return 1
         matches = find_symbol(store, args.rev, args.symbol)
         if not matches:
             print(f"no symbol matching {args.symbol!r}", file=sys.stderr)
@@ -112,7 +129,20 @@ def _cmd_impact(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
     store, indexer = open_workspace(root)
     try:
-        indexer.reconcile(args.rev)
+        if args.hops < 1:
+            # `--hops 0` (or negative) is not "walk zero hops"; the reverse
+            # BFS never runs and the report comes back with an empty
+            # `dependents` group at exit 0 -- reading exactly as "nothing
+            # depends on this," the confidently-wrong answer the design doc
+            # says is worse than no tool at all. Reject it loudly instead
+            # of returning a report that looks like a real, checked answer.
+            print(f"--hops must be >= 1 (got {args.hops})", file=sys.stderr)
+            return 1
+        try:
+            indexer.reconcile(args.rev)
+        except gitio.GitError:
+            print(f"revision not found: {args.rev}", file=sys.stderr)
+            return 1
         matches = find_symbol(store, args.rev, args.symbol)
         if not matches:
             print(f"no symbol matching {args.symbol!r}", file=sys.stderr)
@@ -127,6 +157,7 @@ def _cmd_impact(args: argparse.Namespace) -> int:
             args.rev,
             matches[0]["id"],
             max_hops=args.hops,
+            limit=args.limit,
             include_low=args.all,
         )
         print(render_json(report) if args.json else render_text(report))
@@ -205,7 +236,12 @@ def _cmd_install_hooks(args: argparse.Namespace) -> int:
     same trust failure as the corruption it avoids.
     """
     root = Path(args.path).resolve()
-    for result in plan_hooks(root):
+    try:
+        results = plan_hooks(root)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    for result in results:
         if result.installed:
             print(result.path)
         else:
@@ -262,6 +298,12 @@ def build_parser() -> argparse.ArgumentParser:
     impact_parser.add_argument(
         "--all", action="store_true", help="Include LOW-confidence dependents"
     )
+    impact_parser.add_argument(
+        "--limit",
+        type=int,
+        default=40,
+        help="Maximum rows to keep, total across dependents and tests (default: 40)",
+    )
     impact_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     impact_parser.set_defaults(handler=_cmd_impact)
 
@@ -309,7 +351,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.handler is None:
         parser.print_help()
         return 0
-    return args.handler(args)
+    try:
+        return args.handler(args)
+    except Exception as exc:  # noqa: BLE001 -- last-resort net, see comment below
+        # Every command that can fail on user input (a bad --rev, a
+        # non-git --path for install-hooks, ...) already has its own
+        # targeted handler above, printing a clear one-line message. This
+        # is the net underneath those: any exception a handler did not
+        # anticipate still gets a one-line stderr message and a nonzero
+        # exit here, never a raw traceback dumped at the user.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 def run() -> None:

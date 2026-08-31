@@ -26,6 +26,28 @@ from codegraph.store import Store
 
 HIGH, MEDIUM, LOW = "HIGH", "MEDIUM", "LOW"
 
+#: Canonical rank for comparing confidence tiers: higher is stronger. This
+#: is the one place the tier order is defined -- `effects/propagate.py`,
+#: `query/impact.py`, and `query/effects.py` all compare confidence tiers
+#: and used to each redefine this table locally, with no guarantee they
+#: agreed: two copies used higher-is-stronger, one used the opposite
+#: polarity with the tiers spelled out as separate string literals rather
+#: than these constants, so renaming a tier would have silently produced a
+#: `KeyError` in whichever copy nobody happened to update. Importing this
+#: one table (and `stronger`/`weaker` below) is the fix.
+CONFIDENCE_RANK: dict[str, int] = {LOW: 0, MEDIUM: 1, HIGH: 2}
+
+
+def stronger(a: str, b: str) -> str:
+    """The more confident of two tiers (ties favor `a`)."""
+    return a if CONFIDENCE_RANK[a] >= CONFIDENCE_RANK[b] else b
+
+
+def weaker(a: str, b: str) -> str:
+    """The less confident of two tiers (ties favor `a`)."""
+    return a if CONFIDENCE_RANK[a] <= CONFIDENCE_RANK[b] else b
+
+
 PROVENANCE = "static"
 
 #: `src` for a reference made at module scope, which owns no node of its own.
@@ -443,11 +465,23 @@ def dependents(store: Store, rev: str, modules: set[str]) -> set[str]:
 
 
 def find_symbol(store: Store, rev: str, query: str) -> list[sqlite3.Row]:
-    """Fuzzy lookup: exact id, then exact qualname, then suffix match."""
+    """Fuzzy lookup: exact id, then exact qualname, then suffix match.
+
+    All three steps compare case-insensitively (`COLLATE NOCASE` for the
+    two exact steps; `LIKE`'s own ASCII case-folding, already the default,
+    for the suffix step), so a query's case can never change which set of
+    symbols comes back -- `resolve charge` and `resolve CHARGE` return the
+    identical result. Before this, steps 1-2 compared with binary `=`
+    while step 3 was already case-insensitive, so a query differing only
+    in case from the real name could fall straight through the (missed)
+    exact steps and land on step 3's dot-anchored suffix pattern -- which
+    can never match a top-level, dot-free qualname at all -- producing a
+    completely different, disjoint match set instead of the same one.
+    """
     columns = "id, path, qualname, kind, line_start, line_end, name_binding"
     for clause, parameters in (
-        ("id=?", (query,)),
-        ("qualname=?", (query,)),
+        ("id=? COLLATE NOCASE", (query,)),
+        ("qualname=? COLLATE NOCASE", (query,)),
         ("qualname LIKE ? ESCAPE '\\'", (f"%.{_escape_like(query)}",)),
     ):
         rows = store.connection.execute(

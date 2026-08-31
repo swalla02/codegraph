@@ -77,18 +77,29 @@ the full set and how confident it is in each edge.
 
 ## Reading the output
 
-- `impact`'s summary has five fields, in order: `symbols`, `modules`,
-  `entry_points`, and `low_confidence_hidden` are all integer counts;
+- Every report's default text output leads with a summary line of
+  `key: value` pairs joined by ` · `, one per summary field, in the order
+  the producer defines them — e.g. `impact`'s reads `symbols: 6 ·
+  modules: 1 · entry_points: 6 · low_confidence_hidden: 0 ·
+  effects_reachable: DB_WRITE, PROCESS`. `symbols`, `modules`,
+  `entry_points`, and `low_confidence_hidden` are integer counts;
   `effects_reachable` is a **list of effect-kind strings**, not a count —
-  e.g. `["DB_WRITE", "PROCESS"]`, or `[]` when the symbol reaches nothing.
-  In `--json` output it is a real JSON array; in the default text output
-  the summary line joins all five fields with ` · `, so
-  `effects_reachable` shows up as Python's list repr, e.g.
-  `6 · 1 · 6 · 0 · ['DB_WRITE', 'PROCESS']`. `low_confidence_hidden` counts
-  `LOW`-confidence dependents that are held back from the `dependents` and
-  `tests` groups by default — the resolver's least certain guesses are
-  real information, but they should not read as confirmed impact. Pass
-  `--all` to include them in the listed rows.
+  in `--json` output it is a real JSON array; in text it is rendered as a
+  comma-separated list (`DB_WRITE, PROCESS`), or `none` when the symbol
+  reaches nothing, never Python's list repr. `low_confidence_hidden`
+  counts `LOW`-confidence dependents that are held back from the
+  `dependents` and `tests` groups by default — the resolver's least
+  certain guesses are real information, but they should not read as
+  confirmed impact. Pass `--all` to include them in the listed rows.
+- `impact --limit N` caps the *total* rows kept across `dependents` and
+  `tests` combined at `N` (default 40) — not `N` each — so the printed
+  report never exceeds its documented budget.
+- `diff`'s summary reads `new_effects: <kind list or none> ·
+  added: N · removed: N · changed: N · base: <sha> · head: <rev>`.
+  `new_effects` covers every symbol newly reachable at `head`, whether it
+  is itself new (`added`) or pre-existing and edited (`changed`) — an
+  effect reachable only through a brand-new function is not invisible
+  just because the function has no `base` counterpart to diff against.
 - Rows under a `tests` group are dependents whose path is under `tests/` or
   whose name starts with `test_`. They are bucketed separately from
   `dependents` on purpose: a change breaking a test is worth knowing, but

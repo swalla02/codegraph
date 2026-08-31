@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from codegraph.effects.propagate import witness_path
 from codegraph.render import Group, Report, Row
+from codegraph.resolve import CONFIDENCE_RANK, stronger
 from codegraph.store import Store
 
 #: Worst-first. DB writes and network calls are the effects a reviewer
@@ -27,7 +28,6 @@ _SEVERITY: tuple[str, ...] = (
     "NONDETERMINISM",
 )
 _SEVERITY_RANK = {kind: rank for rank, kind in enumerate(_SEVERITY)}
-_CONFIDENCE_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 
 
 def effects_report(store: Store, rev: str, node_id: str) -> Report:
@@ -38,12 +38,16 @@ def effects_report(store: Store, rev: str, node_id: str) -> Report:
         "SELECT kind, confidence FROM effects WHERE rev=? AND node_id=?", (rev, node_id)
     ):
         best = node_kinds.get(row["kind"])
-        if best is None or _CONFIDENCE_RANK[row["confidence"]] < _CONFIDENCE_RANK[best]:
-            node_kinds[row["kind"]] = row["confidence"]
+        node_kinds[row["kind"]] = (
+            row["confidence"] if best is None else stronger(best, row["confidence"])
+        )
 
+    # Worst severity first, then strongest confidence first within a
+    # severity -- `CONFIDENCE_RANK` is higher-is-stronger, so this sorts on
+    # its negation to put HIGH ahead of LOW.
     ordered = sorted(
         node_kinds,
-        key=lambda k: (_SEVERITY_RANK.get(k, len(_SEVERITY)), _CONFIDENCE_RANK[node_kinds[k]]),
+        key=lambda k: (_SEVERITY_RANK.get(k, len(_SEVERITY)), -CONFIDENCE_RANK[node_kinds[k]]),
     )
 
     groups: list[Group] = []
