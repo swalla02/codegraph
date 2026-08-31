@@ -88,6 +88,66 @@ def test_bare_call_and_self_call_recorded():
     assert raw == {"helper", "self.step"}
 
 
+def test_calls_on_non_flattenable_receivers_are_still_recorded():
+    """Regression for F2: a call whose receiver isn't a flattenable
+    Name/Attribute chain used to be dropped from `refs` entirely -- no edge
+    and no `unresolved` row, so the loss was invisible. `super().go()`,
+    `PaymentService().charge(x)`, `self.items[0].run()`, `(a or b).fire()`
+    and `d["k"].m()` must all still produce a `call` ref, carrying the
+    attribute name (marked with the synthetic `<attr>.` prefix so it is
+    routed past the HIGH-confidence resolver steps rather than falsely
+    matched as an imported/module-local/self name)."""
+    source = (
+        b"class Base:\n"
+        b"    def go(self):\n        pass\n\n\n"
+        b"class Child(Base):\n"
+        b"    def go(self):\n"
+        b"        super().go()\n"
+        b"        PaymentService().charge(1)\n"
+        b"        self.items[0].run()\n"
+        b"        (a or b).fire()\n"
+        b"        d['k'].m()\n"
+)
+    result = parse_blob(source)
+    raw = {r.raw_name for r in result.refs if r.ref_kind == "call"}
+    assert raw >= {
+        "<attr>.go",
+        "<attr>.charge",
+        "<attr>.run",
+        "<attr>.fire",
+        "<attr>.m",
+    }
+
+
+def test_call_with_no_attribute_at_all_is_recorded_under_a_placeholder():
+    """`handlers[i]()` -- the callable itself isn't even an attribute
+    access, so there is no name at all to key on; it must still be counted,
+    not silently dropped."""
+    source = b"def dispatch(handlers, i):\n    handlers[i]()\n"
+    result = parse_blob(source)
+    raw = {r.raw_name for r in result.refs if r.ref_kind == "call"}
+    assert raw == {"<dynamic>"}
+
+
+def test_open_call_mode_is_captured_in_raw_name():
+    """`open`'s effect kind depends on its mode argument, which the effect
+    catalog (a plain dotted-name matcher) can never see on its own -- the
+    parser is the one place with the call's AST, so it encodes what it
+    learns into the ref's `raw_name` for the catalog to key on."""
+    source = (
+        b"def f(mode):\n"
+        b"    open('a')\n"
+        b"    open('b', 'r')\n"
+        b"    open('c', 'w')\n"
+        b"    open('d', 'ab')\n"
+        b"    open('e', mode='x')\n"
+        b"    open('f', mode)\n"
+    )
+    result = parse_blob(source)
+    raw = [r.raw_name for r in result.refs if r.ref_kind == "call"]
+    assert raw == ["open", "open", "open!write", "open!write", "open!write", "open!ambiguous"]
+
+
 def test_imports_recorded_with_level():
     source = b"import os\nfrom . import sibling\nfrom pay.service import charge as c\n"
     result = parse_blob(source)

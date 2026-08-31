@@ -73,6 +73,67 @@ def test_global_mutation_detected_syntactically(repo, write):
     store.close()
 
 
+def direct_effects(store, path):
+    return {
+        (row["kind"], row["confidence"])
+        for row in store.connection.execute(
+            "SELECT kind, confidence FROM effects WHERE rev='HEAD' AND direct=1"
+            " AND evidence_path=?",
+            (path,),
+        )
+    }
+
+
+def test_write_mode_open_is_an_fs_write(repo, write):
+    """Regression for F3: `open` used to map to FS_READ regardless of mode.
+    A literal write mode must be a genuine FS_WRITE, at HIGH confidence
+    (the mode is a literal, so the evidence really does support it)."""
+    write("m.py", "def save(p):\n    open(p, 'w')\n", commit="m")
+    store = build(repo)
+    assert ("FS_WRITE", "HIGH") in direct_effects(store, "m.py")
+    assert "FS_READ" not in {kind for kind, _ in direct_effects(store, "m.py")}
+    store.close()
+
+
+def test_read_mode_open_stays_fs_read_at_high_confidence(repo, write):
+    write("m.py", "def load(p):\n    open(p)\n    open(p, 'r')\n", commit="m")
+    store = build(repo)
+    assert direct_effects(store, "m.py") == {("FS_READ", "HIGH")}
+    store.close()
+
+
+def test_non_literal_open_mode_stays_read_but_at_lower_confidence(repo, write):
+    """The mode isn't a literal, so the FS_READ default is kept (never drop
+    a candidate) but the evidence doesn't actually establish it -- unlike
+    the literal cases, this must not claim HIGH."""
+    write("m.py", "def load(p, mode):\n    open(p, mode)\n", commit="m")
+    store = build(repo)
+    assert direct_effects(store, "m.py") == {("FS_READ", "MEDIUM")}
+    store.close()
+
+
+def test_super_delegation_chain_reports_effects(repo, write):
+    """Regression for F2 end-to-end: before the fix, a handler whose entire
+    call chain ran through `super()` reported ZERO effects -- the call ref
+    was dropped by the parser (unflattenable receiver), so no edge was ever
+    recorded from the override to the base method carrying the direct
+    effect, and propagation had nothing to walk."""
+    write(
+        "base.py",
+        "import requests\n\n\nclass Base:\n    def helper(self):\n        requests.get('u')\n",
+        commit="base",
+    )
+    write(
+        "child.py",
+        "from base import Base\n\n\n"
+        "class Child(Base):\n    def go(self):\n        super().helper()\n",
+        commit="child",
+    )
+    store = build(repo)
+    assert "NETWORK" in kinds(effects_report(store, "HEAD", "child.py::Child.go"))
+    store.close()
+
+
 def test_project_override_tags_house_abstraction(repo, write):
     write("codegraph.toml", '[[effect]]\nmatch = "app.db.*"\nkind = "DB_WRITE"\n')
     write("app/__init__.py", "", commit="pkg")

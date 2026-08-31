@@ -2,7 +2,13 @@
 #
 # Loaded by `codegraph.effects.catalog.Catalog.load` and merged with a
 # project's `codegraph.toml` [[effect]] overrides. See catalog.py for the
-# matching rule (longest literal prefix wins, overrides break ties).
+# matching rule (longest literal prefix wins, overrides break ties) and for
+# how confidence is derived from a rule's own match specificity unless it
+# sets an explicit `confidence` override (HIGH/MEDIUM/LOW) -- a fully
+# literal pattern (no wildcard at all) is HIGH, a bare wildcard-head
+# pattern like `*.execute` (matching any receiver whatsoever) is LOW, and
+# anything with a real but partial literal prefix (`requests.*`,
+# `boto3.*`) is MEDIUM.
 #
 # GLOBAL_MUTATE has no entries here by design: it is detected syntactically
 # (assignment to a module/class-level name), not by a call-site catalog.
@@ -44,8 +50,29 @@ match = "os.getenv"
 kind = "ENV_READ"
 
 [[effect]]
+# `parse.py`'s `_open_call_marker` only produces this name for a bare
+# `open(...)` call whose mode is absent or a literal read-only string
+# (e.g. no second arg, or `"r"`/`"rb"`) -- a genuine read, so the derived
+# HIGH confidence (this pattern has no wildcard at all) is warranted.
 match = "open"
 kind = "FS_READ"
+
+[[effect]]
+# A literal mode string containing w/a/x/+ -- also a genuine, not merely
+# inferred, write; HIGH is warranted for the same reason as `open` above.
+match = "open!write"
+kind = "FS_WRITE"
+
+[[effect]]
+# The mode argument was present but not a string literal (a variable, an
+# expression) -- kept at the conservative FS_READ default, since dropping
+# it would violate the over-approximation bias, but *not* at HIGH: unlike
+# the two rules above, the evidence here does not actually establish the
+# kind, so an explicit override caps it below what this pattern's literal
+# spelling would otherwise derive.
+match = "open!ambiguous"
+kind = "FS_READ"
+confidence = "MEDIUM"
 
 [[effect]]
 match = "pathlib.Path.read*"

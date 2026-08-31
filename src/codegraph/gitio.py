@@ -29,14 +29,28 @@ def is_repo(root: Path) -> bool:
 
 
 def ls_tree(root: Path, rev: str) -> dict[str, str]:
-    out = _run(root, "ls-tree", "-r", "-z", "--format=%(objectname) %(path)", rev)
+    """`-r -z` with NO `--format`: the `%(path)` atom quotes a path (any
+    non-ASCII byte, or a literal `"`/`\\`) even under `-z`, honoring
+    `core.quotePath` for the non-ASCII case and quoting unconditionally for
+    the disambiguation-needed characters regardless of that setting -- so a
+    file like `ünïcode.py` comes back C-quoted (`"...\\303\\274n..."`), fails
+    `.endswith(".py")`, and silently drops out of the tree. Plain `ls-tree`
+    output (no `--format`) genuinely never quotes under `-z`, verified
+    against non-ASCII, space, embedded-quote and embedded-backslash paths;
+    parsing its `<mode> SP <type> SP <sha> TAB <path>` shape is a small
+    price for that guarantee.
+    """
+    out = _run(root, "ls-tree", "-r", "-z", rev)
     tree: dict[str, str] = {}
     for entry in out.split(b"\0"):
         if not entry:
             continue
-        sha, _, path = entry.decode().partition(" ")
-        if path.endswith(".py"):
-            tree[path] = sha
+        meta, _, path_bytes = entry.partition(b"\t")
+        path = path_bytes.decode()
+        if not path.endswith(".py"):
+            continue
+        sha = meta.split(b" ")[2].decode()
+        tree[path] = sha
     return tree
 
 

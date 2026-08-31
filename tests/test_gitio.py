@@ -109,6 +109,44 @@ def test_cat_file_batch_survives_early_abandonment(repo, tmp_path):
     assert not runner.is_alive(), "cat_file_batch cleanup hung on early abandonment"
 
 
+def test_ls_tree_sees_non_ascii_paths(repo, write):
+    """Regression for F1: `ls-tree --format=...` C-quotes a non-ASCII path
+    even under `-z` (`"\\303\\274n\\303\\257code.py"`), which fails
+    `.endswith(".py")` and silently drops the file from the tree."""
+    write("ünïcode.py", "def u():\n    return 1\n", commit="add unicode path")
+    tree = gitio.ls_tree(repo, "HEAD")
+    assert "ünïcode.py" in tree
+
+
+def test_ls_tree_sees_paths_with_a_space(repo, write):
+    write("has space.py", "def s():\n    return 1\n", commit="add spaced path")
+    tree = gitio.ls_tree(repo, "HEAD")
+    assert "has space.py" in tree
+
+
+def test_ls_tree_sees_paths_with_embedded_quote_or_backslash(repo, write):
+    """`"` and `\\` are C-quoted by `--format` unconditionally, independent
+    of `core.quotePath` -- only dropping `--format` entirely avoids it."""
+    write('weird"quote.py', "def q():\n    return 1\n", commit="add quoted path")
+    write("weird\\slash.py", "def s():\n    return 1\n", commit="add backslash path")
+    tree = gitio.ls_tree(repo, "HEAD")
+    assert 'weird"quote.py' in tree
+    assert "weird\\slash.py" in tree
+
+
+def test_ls_tree_and_status_paths_agree_on_a_dirty_unicode_file(repo, write):
+    """The compound failure the review flagged: with `ls_tree` dropping the
+    unicode path, an `Indexer` overlay would see it as absent from the base
+    tree and `status_paths` would report it `??`/`M` forever, on every
+    single diff, even once committed and clean. Once `ls_tree` sees the
+    path, a clean checkout must show no dirty status for it at all."""
+    write("ünïcode.py", "def u():\n    return 1\n", commit="add unicode path")
+    tree = gitio.ls_tree(repo, "HEAD")
+    assert "ünïcode.py" in tree
+    status = gitio.status_paths(repo)
+    assert "ünïcode.py" not in status
+
+
 def test_status_paths_reports_dirty_files(repo, write):
     write("a.py", "def alpha():\n    return 99\n")
     write("new.py", "def gamma():\n    pass\n")

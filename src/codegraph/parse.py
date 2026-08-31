@@ -74,6 +74,44 @@ def _dotted_name(node: ast.AST) -> str | None:
     return ".".join(reversed(parts))
 
 
+#: Any of these appearing in a literal `open(...)` mode string makes the
+#: call a write (or write-capable, for `+`): 'w'rite, 'a'ppend, e'x'clusive
+#: create, or read-'+'-write.
+_WRITE_MODE_CHARS = frozenset("wax+")
+
+
+def _open_call_marker(node: ast.Call) -> str:
+    """`open`'s effect kind (FS_READ vs FS_WRITE) depends on its `mode`
+    argument, which a plain dotted-name catalog match can never see --
+    this is the one place in the parser that still has the call site's
+    AST, so it is the one place this can be decided. Three outcomes,
+    encoded as three distinct synthetic names the built-in catalog
+    (`builtin.toml`) maps separately:
+
+    - no mode argument at all, or a literal mode with none of w/a/x/+:
+      a genuine read (`open` unchanged -- the plain, and by far the most
+      common, case).
+    - a literal mode containing w/a/x/+: a genuine write (`open!write`).
+    - a mode argument that isn't a string literal (a variable, an
+      f-string, ...): honestly unknown, so it keeps the conservative
+      FS_READ default (`open!ambiguous`) but at lower confidence, since
+      unlike the first case the evidence doesn't actually support it.
+    """
+    mode_node = node.args[1] if len(node.args) >= 2 else None
+    if mode_node is None:
+        for keyword in node.keywords:
+            if keyword.arg == "mode":
+                mode_node = keyword.value
+                break
+    if mode_node is None:
+        return "open"
+    if isinstance(mode_node, ast.Constant) and isinstance(mode_node.value, str):
+        if any(char in _WRITE_MODE_CHARS for char in mode_node.value):
+            return "open!write"
+        return "open"
+    return "open!ambiguous"
+
+
 def _decorator_names(node: ast.AST) -> tuple[str, ...]:
     decorators = getattr(node, "decorator_list", [])
     names = []
@@ -233,17 +271,47 @@ class _Collector(ast.NodeVisitor):
     # -- references ------------------------------------------------------
     def visit_Call(self, node: ast.Call) -> None:
         name = _dotted_name(node.func)
-        if name:
-            self.refs.append(
-                ParsedRef(
-                    ordinal=len(self.refs),
-                    from_qualname=self._current_owner.removesuffix(".<locals>"),
-                    ref_kind="call",
-                    raw_name=name,
-                    dotted=name if "." in name else None,
-                    line=node.lineno,
-                )
+        if name is None:
+            # The receiver isn't a flattenable Name/Attribute chain --
+            # `super().go()`, `PaymentService().charge(x)`,
+            # `self.items[0].run()`, `(a or b).fire()`, `d["k"].m()`. Losing
+            # the resolved target is fine; losing the ref entirely is not,
+            # since that would drop it from both the call graph AND the
+            # `unresolved` count with no signal at all (the failure mode
+            # this branch exists to close).
+            #
+            # Record whatever IS known: when `node.func` is itself an
+            # `Attribute` (true of all five examples above -- only its
+            # `.value` chain fails to flatten), that's the attribute name.
+            # It is deliberately given the synthetic `<attr>.` prefix rather
+            # than the bare name: `<attr>.go` still contains a "." so it
+            # flows through `resolve.py`'s existing `dotted`-gated pipeline
+            # exactly like any other qualified call, which routes it past
+            # the HIGH-confidence steps (imported-name, module-local,
+            # self-through-MRO -- none of which have any real basis for a
+            # receiver we know nothing about) and into the *existing*
+            # repo-wide by-last-segment step, unresolved-heuristic MEDIUM/LOW
+            # match on `go` alone. No new resolution logic. `<` can never
+            # appear in a real Python identifier, so this can never collide
+            # with a genuine dotted call. A call with no attribute at all
+            # (e.g. `handlers[i]()`) has nothing to key on and is recorded
+            # under a synthetic placeholder instead, purely so the COUNT is
+            # never silently lost.
+            name = (
+                f"<attr>.{node.func.attr}" if isinstance(node.func, ast.Attribute) else "<dynamic>"
             )
+        elif name == "open":
+            name = _open_call_marker(node)
+        self.refs.append(
+            ParsedRef(
+                ordinal=len(self.refs),
+                from_qualname=self._current_owner.removesuffix(".<locals>"),
+                ref_kind="call",
+                raw_name=name,
+                dotted=name if "." in name else None,
+                line=node.lineno,
+            )
+        )
         self.generic_visit(node)
 
     def visit_Global(self, node: ast.Global) -> None:
