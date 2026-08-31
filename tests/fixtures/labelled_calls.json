@@ -1,0 +1,47 @@
+{
+  "_readme": "Ground truth is hand-derived by reasoning about (and, where noted in task-15-report.md, executing) what these modules actually do at runtime -- never by running codegraph and recording its output. See task-15-report.md for the derivation of every entry below.",
+  "files": {
+    "pkg/__init__.py": "",
+    "pkg/utils.py": "def helper():\n    return \"utils.helper\"\n",
+    "pkg/plain_import.py": "import pkg.utils\n\n\ndef call_helper():\n    return pkg.utils.helper()\n",
+    "pkg/from_alias.py": "from pkg.utils import helper as h\n\n\ndef call_via_alias():\n    return h()\n",
+    "pkg/relative.py": "from .utils import helper\n\n\ndef call_relative():\n    return helper()\n",
+    "pkg/counter.py": "class Counter:\n    def __init__(self):\n        self.value = 0\n\n    def increment(self):\n        self.value += 1\n        return self._report()\n\n    def _report(self):\n        return f\"value={self.value}\"\n",
+    "pkg/inherit.py": "class Named:\n    def identify(self):\n        return f\"I am {self.__class__.__name__}\"\n\n\nclass Widget(Named):\n    def report(self):\n        return self.identify()\n",
+    "pkg/duck_unique.py": "class Renderer:\n    def render(self):\n        return \"rendered\"\n\n\ndef show(widget):\n    return widget.render()\n",
+    "pkg/duck_ambiguous.py": "class Document:\n    def save(self):\n        return \"document saved\"\n\n\nclass Settings:\n    def save(self):\n        return \"settings saved\"\n\n\ndef persist(item):\n    return item.save()\n"
+  },
+  "calls": [
+    {
+      "src": "pkg/plain_import.py::call_helper",
+      "expected": ["pkg/utils.py::helper"]
+    },
+    {
+      "src": "pkg/from_alias.py::call_via_alias",
+      "expected": ["pkg/utils.py::helper"]
+    },
+    {
+      "src": "pkg/relative.py::call_relative",
+      "expected": ["pkg/utils.py::helper"]
+    },
+    {
+      "src": "pkg/counter.py::Counter.increment",
+      "expected": ["pkg/counter.py::Counter._report"]
+    },
+    {
+      "src": "pkg/inherit.py::Widget.report",
+      "expected": ["pkg/inherit.py::Named.identify"]
+    },
+    {
+      "src": "pkg/duck_unique.py::show",
+      "expected": ["pkg/duck_unique.py::Renderer.render"]
+    },
+    {
+      "src": "pkg/duck_ambiguous.py::persist",
+      "expected": [
+        "pkg/duck_ambiguous.py::Document.save",
+        "pkg/duck_ambiguous.py::Settings.save"
+      ]
+    }
+  ]
+}
