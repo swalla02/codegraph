@@ -8,6 +8,7 @@ from pathlib import Path
 
 from codegraph import __version__, gitio
 from codegraph.indexer import FsTreeSource, GitTreeSource, Indexer
+from codegraph.maintenance import gc, install_hooks
 from codegraph.query.diff import MissingRevisionError, diff_report
 from codegraph.query.effects import effects_report
 from codegraph.query.impact import impact_report
@@ -52,7 +53,9 @@ def _cmd_index(args: argparse.Namespace) -> int:
         if args.rebuild:
             store.connection.execute("DELETE FROM blobs")
             store.connection.commit()
-        _print_stats(indexer.reconcile(args.rev))
+        stats = indexer.reconcile(args.rev)
+        if not args.quiet:
+            _print_stats(stats)
     finally:
         store.close()
     return 0
@@ -170,6 +173,33 @@ def _cmd_diff(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _cmd_gc(args: argparse.Namespace) -> int:
+    """Prune Layer 1 (the blob parse cache) down to what HEAD, the worktree,
+    and any `--keep`-named revisions still reference. Never touches Layer 2,
+    so this can never make an existing answer stale -- only slower to
+    rebuild for an evicted revision."""
+    root = Path(args.path).resolve()
+    store = Store.open(root)
+    try:
+        keep_revs = {"HEAD", WORKTREE, *args.keep}
+        removed = gc(store, keep_revs)
+        print(f"gc: removed {removed} blob(s) unreferenced by {', '.join(sorted(keep_revs))}")
+    finally:
+        store.close()
+    return 0
+
+
+def _cmd_install_hooks(args: argparse.Namespace) -> int:
+    """Install post-commit/post-checkout/post-merge hooks that warm the
+    cache in the background. Purely an optimization -- see D5: every query
+    reconciles the working tree itself, so results are identical whether or
+    not these ever fire."""
+    root = Path(args.path).resolve()
+    for path in install_hooks(root):
+        print(path)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codegraph")
     parser.add_argument("--version", action="version", version=__version__)
@@ -188,6 +218,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--rebuild",
         action="store_true",
         help="Discard the Layer 1 parse cache before reconciling",
+    )
+    index_parser.add_argument(
+        "--quiet", action="store_true", help="Suppress stats output (used by warming hooks)"
     )
     index_parser.set_defaults(handler=_cmd_index)
 
@@ -231,6 +264,25 @@ def build_parser() -> argparse.ArgumentParser:
     diff_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
     diff_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     diff_parser.set_defaults(handler=_cmd_diff)
+
+    gc_parser = subparsers.add_parser(
+        "gc", help="Prune Layer 1 cache entries unreachable from retained revisions"
+    )
+    gc_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    gc_parser.add_argument(
+        "--keep",
+        action="append",
+        default=[],
+        metavar="REV",
+        help="Additional revision to retain besides HEAD and the worktree (repeatable)",
+    )
+    gc_parser.set_defaults(handler=_cmd_gc)
+
+    hooks_parser = subparsers.add_parser(
+        "install-hooks", help="Install git hooks that warm the cache in the background"
+    )
+    hooks_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    hooks_parser.set_defaults(handler=_cmd_install_hooks)
 
     return parser
 
