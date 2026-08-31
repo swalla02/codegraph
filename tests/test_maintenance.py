@@ -4,7 +4,7 @@ import time
 
 from codegraph.cli import main
 from codegraph.indexer import GitTreeSource, Indexer
-from codegraph.maintenance import gc, install_hooks
+from codegraph.maintenance import gc, install_hooks, plan_hooks
 from codegraph.query.impact import impact_report
 from codegraph.resolve import find_symbol
 from codegraph.store import Store
@@ -260,6 +260,131 @@ def test_install_hooks_three_reruns_stay_at_one_invocation(repo):
     assert first == second == third
     assert third.count("codegraph index") == 1
     assert third.count("# >>> codegraph") == 1
+
+
+# --- Binary hooks, env -S, multi-block convergence, marker anchoring,
+# --- and half-marker refusal (3rd review round) --------------------------
+
+
+def test_install_hooks_skips_binary_hook_but_installs_the_others(repo):
+    """A compiled/binary post-commit (pre-commit frameworks and compiled
+    shims ship these) must not crash the whole command -- it's a non-shell
+    hook, refused the same as Perl, and the other two hooks still install."""
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    binary_hook = hooks_dir / "post-commit"
+    original = bytes([0x7F, 0x45, 0x4C, 0x46, 0x02, 0x01, 0x01, 0x00, 0xFF, 0xFE, 0x00, 0x01])
+    binary_hook.write_bytes(original)
+    binary_hook.chmod(binary_hook.stat().st_mode | stat.S_IXUSR)
+
+    written = install_hooks(repo)
+
+    assert binary_hook not in written
+    assert {p.name for p in written} == {"post-checkout", "post-merge"}
+    assert binary_hook.read_bytes() == original
+
+
+def test_install_hooks_resolves_env_dash_capital_s_flag(repo):
+    """`#!/usr/bin/env -S bash -e` names bash, not `-S` -- env's own flags
+    must be skipped when hunting for the interpreter token."""
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook = hooks_dir / "post-commit"
+    hook.write_text("#!/usr/bin/env -S bash -e\necho bash-with-env-S-ran\n")
+    hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
+
+    written = install_hooks(repo)
+
+    assert hook in written
+    content = hook.read_text()
+    assert content.startswith("#!/usr/bin/env -S bash -e\n")
+    assert "codegraph index" in content
+    assert "echo bash-with-env-S-ran" in content
+
+
+def test_install_hooks_converges_a_leading_and_trailing_double_block(repo):
+    """A file carrying two codegraph blocks (a current one spliced at the
+    top, plus a stale one still sitting at the end from an even older
+    install) must converge to exactly one block, not one-fewer."""
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook = hooks_dir / "post-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "# >>> codegraph (warming only; safe to remove) >>>\n"
+        '( cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"'
+        " && codegraph index --quiet >/dev/null 2>&1 & ) >/dev/null 2>&1 || true\n"
+        "# <<< codegraph (warming only; safe to remove) <<<\n"
+        "echo real-work\n"
+        "# >>> codegraph (warming only; safe to remove) >>>\n"
+        "_codegraph_status=$?\n"
+        '( cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"'
+        " && codegraph index --quiet >/dev/null 2>&1 & ) >/dev/null 2>&1 || true\n"
+        "exit $_codegraph_status\n"
+        "# <<< codegraph (warming only; safe to remove) <<<\n"
+    )
+    hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
+
+    written = install_hooks(repo)
+
+    content = hook.read_text()
+    assert hook in written
+    assert content.count("# >>> codegraph (warming only; safe to remove) >>>") == 1
+    assert content.count("# <<< codegraph (warming only; safe to remove) <<<") == 1
+    assert content.count("codegraph index") == 1
+    assert "_codegraph_status" not in content
+    assert "echo real-work" in content
+
+
+def test_install_hooks_ignores_marker_text_embedded_in_other_lines(repo):
+    """Marker matching must be anchored to a whole line, not a substring
+    search -- a hook whose own comment or echoed string happens to contain
+    the marker text must keep every real statement around it."""
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook = hooks_dir / "post-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "do_important_setup_step\n"
+        'echo "reminder: # >>> codegraph (warming only; safe to remove) >>> not a real marker"\n'
+        "do_important_setup_step\n"
+    )
+    hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
+
+    written = install_hooks(repo)
+
+    content = hook.read_text()
+    assert hook in written
+    assert content.count("do_important_setup_step") == 2
+    assert "not a real marker" in content
+    assert "codegraph index" in content
+
+
+def test_install_hooks_skips_half_marker_left_byte_identical(repo):
+    """A begin marker with no matching end is damage from some previous
+    mishap, not a shape to guess a repair for -- it must be skipped
+    loudly and left completely untouched, not silently grown a second
+    (also broken) block on the next run."""
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook = hooks_dir / "post-commit"
+    original = (
+        "#!/bin/sh\n"
+        "# >>> codegraph (warming only; safe to remove) >>>\n"
+        "echo oops-truncated-mid-block\n"
+    )
+    hook.write_text(original)
+    hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
+
+    written = install_hooks(repo)
+
+    assert hook not in written
+    assert hook.read_text() == original
+
+    results = plan_hooks(repo)
+    result = next(r for r in results if r.name == "post-commit")
+    assert not result.installed
+    assert "malformed" in result.reason.lower()
 
 
 def test_gc_does_not_corrupt_a_live_graph(repo, write):
