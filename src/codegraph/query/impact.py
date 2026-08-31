@@ -24,7 +24,7 @@ read as confirmed impact by default.
 
 from __future__ import annotations
 
-from codegraph.query.rank import salience, score
+from codegraph.query.rank import fan_in, salience, score
 from codegraph.render import Group, Report, Row, budget
 from codegraph.resolve import HIGH, LOW, MEDIUM
 from codegraph.store import Store
@@ -135,7 +135,7 @@ def impact_report(
             continue
 
         salience_value = salience(store, rev, dependent_id)
-        if salience_value >= 0.5:
+        if fan_in(store, rev, dependent_id) == 0:
             entry_points += 1
         modules.add(path)
 

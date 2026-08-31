@@ -28,6 +28,20 @@ def score(hop: int, confidence: str, salience_value: float) -> float:
     return (1.0 / hop) * _CONFIDENCE_WEIGHT[confidence] * (1.0 + salience_value)
 
 
+def fan_in(store: Store, rev: str, node_id: str) -> int:
+    """Count of DISTINCT callers of `node_id` -- never raw edge rows, since
+    the `edges` table can hold more than one row for the same (src, dst)
+    pair. `salience` folds this into its composite score; callers that need
+    the raw fan-in itself (e.g. to test whether a node is a true entry
+    point, `fan_in == 0`) should call this directly rather than
+    reverse-engineering it out of `salience`'s combined value, which a
+    public, well-called node can also cross via its other two terms alone."""
+    row = store.connection.execute(
+        "SELECT COUNT(DISTINCT src) AS n FROM edges WHERE rev=? AND dst=?", (rev, node_id)
+    ).fetchone()
+    return row["n"]
+
+
 def salience(store: Store, rev: str, node_id: str) -> float:
     """How much a node deserves attention on its own merits: 0.5 if it has
     no callers of its own (an entry point), 0.3 if its qualname's last
@@ -35,12 +49,10 @@ def salience(store: Store, rev: str, node_id: str) -> float:
     capped at `_FAN_IN_CAP` distinct callers."""
     connection = store.connection
 
-    fan_in = connection.execute(
-        "SELECT COUNT(DISTINCT src) AS n FROM edges WHERE rev=? AND dst=?", (rev, node_id)
-    ).fetchone()["n"]
+    callers = fan_in(store, rev, node_id)
 
     value = 0.0
-    if fan_in == 0:
+    if callers == 0:
         value += 0.5
 
     row = connection.execute(
@@ -50,9 +62,9 @@ def salience(store: Store, rev: str, node_id: str) -> float:
     if not last_segment.startswith("_"):
         value += 0.3
 
-    value += min(fan_in, _FAN_IN_CAP) / 20
+    value += min(callers, _FAN_IN_CAP) / 20
 
     return value
 
 
-__all__ = ["salience", "score"]
+__all__ = ["fan_in", "salience", "score"]

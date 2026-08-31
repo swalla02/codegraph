@@ -96,6 +96,25 @@ def test_summary_reports_reachable_effects(repo, write):
     store.close()
 
 
+def test_entry_points_excludes_popular_intermediaries(repo, write):
+    """Regression for the round-2 Major: `entry_points` must count nodes by
+    their OWN fan_in == 0, not by threshold-sniffing `salience`'s combined
+    score. `popular` is public and has 10 distinct callers -- its salience
+    (0 + 0.3 public + 0.5 fan-in-capped = 0.8) crosses 0.5 with no help from
+    the entry-point term at all, so it must NOT be counted. Each `callerN`
+    has no callers of its own and must be."""
+    lines = ["def target():\n    pass\n\n\ndef popular():\n    target()\n"]
+    lines += [f"def caller{i}():\n    popular()\n" for i in range(10)]
+    write("m.py", "\n\n".join(lines), commit="m")
+    store = build(repo)
+    report = impact_report(store, "HEAD", "m.py::target")
+    assert report.summary["entry_points"] == 10
+    found = listed(report)
+    assert "m.py::popular" in found
+    assert all(f"m.py::caller{i}" in found for i in range(10))
+    store.close()
+
+
 def test_duplicate_edge_rows_do_not_double_count_fan_in(tmp_path):
     """A caller that calls the target twice (two rows in `edges` for the
     same (src, dst) pair -- e.g. the same call appearing twice in a body)
