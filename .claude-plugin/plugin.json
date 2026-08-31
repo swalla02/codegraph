@@ -1,0 +1,11 @@
+{
+  "name": "codegraph",
+  "version": "0.1.0",
+  "description": "A sidecar code graph for Python: impact and side-effect analysis via a CLI (resolve, impact, effects, diff).",
+  "author": {
+    "name": "swalla02"
+  },
+  "homepage": "https://github.com/swalla02/codegraph",
+  "repository": "https://github.com/swalla02/codegraph",
+  "license": "MIT"
+}
