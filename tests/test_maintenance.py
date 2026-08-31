@@ -1,5 +1,6 @@
 import os
 import stat
+import time
 
 from codegraph.indexer import GitTreeSource, Indexer
 from codegraph.maintenance import gc, install_hooks
@@ -64,13 +65,51 @@ def test_install_hooks_preserves_pre_existing_hook(repo):
     written = install_hooks(repo)
 
     content = existing_hook.read_text()
-    assert original.strip() in content
+    assert "echo ran >> marker.txt" in content
     assert "codegraph index" in content
     assert existing_hook in written
 
     # The pre-existing behavior must still actually fire.
     git(repo, "commit", "--allow-empty", "-qm", "trigger hooks")
     assert (repo / "marker.txt").read_text() == "ran\n"
+
+
+def test_install_hooks_fires_even_after_a_pre_existing_exit(repo, monkeypatch, tmp_path):
+    """A pre-existing hook that ends in `exit 0` -- a very common idiom -- is
+    exactly the case that was silently broken: code appended after that
+    `exit` is unreachable, so the warming block never ran even though
+    install_hooks reported success. It must fire regardless, by running
+    before the pre-existing script's own logic rather than after it."""
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    existing_hook = hooks_dir / "post-commit"
+    existing_hook.write_text("#!/bin/sh\necho hi >> marker.txt\nexit 0\n")
+    existing_hook.chmod(existing_hook.stat().st_mode | stat.S_IXUSR)
+
+    # A `codegraph` shim on PATH that just logs that it was invoked.
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    log = tmp_path / "invoked.log"
+    shim = shim_dir / "codegraph"
+    shim.write_text(f'#!/bin/sh\necho invoked >> "{log}"\n')
+    shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
+
+    install_hooks(repo)
+    content = existing_hook.read_text()
+    # The codegraph block must precede the pre-existing `exit 0`, not follow it.
+    assert content.index("codegraph index") < content.index("exit 0")
+
+    git(repo, "commit", "--allow-empty", "-qm", "trigger hooks despite exit 0")
+
+    # The backgrounded warm-up may still be running when `git commit`
+    # returns; give it a short window to land before asserting it fired.
+    deadline = time.monotonic() + 2.0
+    while not log.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert log.exists(), "codegraph shim was never invoked -- warming block was skipped"
+    # The pre-existing hook's own behavior still ran too.
+    assert (repo / "marker.txt").read_text() == "hi\n"
 
 
 def test_install_hooks_is_idempotent(repo):

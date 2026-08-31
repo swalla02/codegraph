@@ -54,7 +54,13 @@ def _cmd_index(args: argparse.Namespace) -> int:
             store.connection.execute("DELETE FROM blobs")
             store.connection.commit()
         stats = indexer.reconcile(args.rev)
-        if not args.quiet:
+        if args.quiet:
+            # --quiet suppresses the stats chatter (this is what the
+            # warming hooks invoke in the background), but a parse failure
+            # is a real signal, not chatter -- let it through on stderr.
+            if stats.parse_errors:
+                print(f"parse errors: {stats.parse_errors}", file=sys.stderr)
+        else:
             _print_stats(stats)
     finally:
         store.close()

@@ -22,14 +22,16 @@ _HOOK_NAMES = ("post-commit", "post-checkout", "post-merge")
 _BEGIN_MARKER = "# >>> codegraph (warming only; safe to remove) >>>"
 _END_MARKER = "# <<< codegraph (warming only; safe to remove) <<<"
 
-# Preserves `$?` from whatever ran before this block (0 at a fresh script's
-# start) so appending to a pre-existing hook can never flip its exit status:
-# our warming command is backgrounded and its own status discarded, then the
-# script exits with the status it already had.
+# Fires a backgrounded job and falls straight through -- no `exit`, no
+# capturing `$?`. It has to sit as the *first* statement after the shebang
+# (see `_insert_after_shebang`) rather than at the end: a pre-existing hook
+# commonly ends in its own `exit 0` (or `exit 1`, or hits one inside an
+# `if`), and code appended after that is simply never reached. A block that
+# runs first can't be skipped that way, and since all it does is background
+# a job, it can't change -- or need to preserve -- whatever exit status the
+# rest of the script goes on to produce.
 _HOOK_BLOCK = f"""{_BEGIN_MARKER}
-_codegraph_status=$?
 ( cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && codegraph index --quiet >/dev/null 2>&1 & ) >/dev/null 2>&1 || true
-exit $_codegraph_status
 {_END_MARKER}
 """
 
@@ -103,14 +105,29 @@ def _hooks_dir(root: Path) -> Path:
     raise FileNotFoundError(f"not a git repository: {root}")
 
 
+def _insert_after_shebang(existing: str) -> str:
+    """Splice `_HOOK_BLOCK` in as the first statement of the script, right
+    after its shebang line so it always runs -- before any pre-existing
+    `exit`, `exec`, or `if`-guarded early return could skip it.
+
+    A file with no shebang gets one (`#!/bin/sh`) prepended; git hooks with
+    no shebang already run under the shell's default anyway, so this changes
+    nothing about how the rest of the script executes.
+    """
+    lines = existing.splitlines(keepends=True)
+    if lines and lines[0].startswith("#!"):
+        return lines[0] + _HOOK_BLOCK + "".join(lines[1:])
+    return "#!/bin/sh\n" + _HOOK_BLOCK + existing
+
+
 def install_hooks(root: Path) -> list[Path]:
     """Write (or extend) `post-commit`, `post-checkout`, and `post-merge`
     hooks that warm the codegraph cache in the background.
 
     Idempotent: re-running never double-appends the codegraph block. A
-    pre-existing hook is never overwritten -- the codegraph block is
-    appended after whatever was already there, guarded so it can only ever
-    add a background warm-up, never change the hook's own exit status.
+    pre-existing hook is never overwritten -- the codegraph block is spliced
+    in right after the shebang, so whatever the rest of the script does
+    (including its own `exit`) runs exactly as before, just after ours.
 
     Returns the paths of all three hooks (written or already present).
     """
@@ -123,11 +140,7 @@ def install_hooks(root: Path) -> list[Path]:
         existing = path.read_text() if path.exists() else ""
 
         if _BEGIN_MARKER not in existing:
-            if not existing:
-                existing = "#!/bin/sh\n"
-            elif not existing.endswith("\n"):
-                existing += "\n"
-            path.write_text(existing + _HOOK_BLOCK)
+            path.write_text(_insert_after_shebang(existing))
 
         mode = path.stat().st_mode
         path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
