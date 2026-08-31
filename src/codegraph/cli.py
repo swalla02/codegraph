@@ -8,6 +8,7 @@ from pathlib import Path
 
 from codegraph import __version__, gitio
 from codegraph.indexer import FsTreeSource, GitTreeSource, Indexer
+from codegraph.query.diff import MissingRevisionError, diff_report
 from codegraph.query.effects import effects_report
 from codegraph.query.impact import impact_report
 from codegraph.render import render_json, render_text
@@ -125,6 +126,44 @@ def _cmd_impact(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _diff_revspec(root: Path, revspec: str | None) -> tuple[str, str]:
+    """Split `<base>..<head>` into its two sides. A bare `<base>` (no `..`)
+    diffs it against the worktree. With no argument at all, base defaults
+    to `merge_base(default_branch, HEAD)` and head to the worktree --
+    "what has this branch changed so far."
+    """
+    if revspec:
+        if ".." in revspec:
+            base, _, head = revspec.partition("..")
+            return base, head or WORKTREE
+        return revspec, WORKTREE
+    if not gitio.is_repo(root):
+        raise MissingRevisionError("HEAD")
+    try:
+        branch = gitio.default_branch(root)
+        base = gitio.merge_base(root, branch, "HEAD")
+    except gitio.GitError as exc:
+        raise MissingRevisionError(str(exc)) from exc
+    return base, WORKTREE
+
+
+def _cmd_diff(args: argparse.Namespace) -> int:
+    """Report what changed between two revisions, compared on body_hash."""
+    root = Path(args.path).resolve()
+    store, indexer = open_workspace(root)
+    try:
+        try:
+            base, head = _diff_revspec(root, args.revspec)
+            report = diff_report(store, indexer, base, head)
+        except MissingRevisionError as exc:
+            print(f"revision not found: {exc.rev}", file=sys.stderr)
+            return 1
+        print(render_json(report) if args.json else render_text(report))
+        return 0
+    finally:
+        store.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codegraph")
     parser.add_argument("--version", action="version", version=__version__)
@@ -173,6 +212,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     impact_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     impact_parser.set_defaults(handler=_cmd_impact)
+
+    diff_parser = subparsers.add_parser(
+        "diff", help="Report what changed between two revisions"
+    )
+    diff_parser.add_argument(
+        "revspec",
+        nargs="?",
+        default=None,
+        help="<base>..<head> (default: merge-base(default branch, HEAD)..WORKTREE)",
+    )
+    diff_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    diff_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    diff_parser.set_defaults(handler=_cmd_diff)
 
     return parser
 
