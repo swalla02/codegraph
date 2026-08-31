@@ -28,11 +28,16 @@ Reach for this skill:
    ```
 
    `<name>` can be a trailing name (`open_workspace`), a qualname
-   (`cli.py::open_workspace`), or a full node id. Exit code tells you what
-   happened: `0` and one line of output means a single unambiguous match
-   (the node id, e.g. `src/codegraph/cli.py::open_workspace`); `2` means
-   more than one symbol matched and every match is printed — pick the right
-   one and re-run with the full id; `1` means nothing matched.
+   (`cli.py::open_workspace`), or a full node id.
+
+   All three symbol-taking commands — `resolve`, `impact`, and `effects` —
+   share the same exit-code convention for resolving that name/id to a
+   symbol: `0` means a single unambiguous match (the node id is printed,
+   e.g. `src/codegraph/cli.py::open_workspace`, and for `impact`/`effects`
+   the report follows); `1` means nothing matched (a message on stderr);
+   `2` means more than one symbol matched, and every match is printed
+   (`resolve` to stdout, `impact`/`effects` to stderr) — pick the right one
+   and re-run with the full id.
 
 2. Ask what depends on it and what it can reach:
 
@@ -72,10 +77,16 @@ the full set and how confident it is in each edge.
 
 ## Reading the output
 
-- `impact`'s summary line (`symbols · modules · entry_points ·
-  low_confidence_hidden · effects_reachable`) counts `LOW`-confidence
-  dependents in `low_confidence_hidden` but hides them from the `dependents`
-  and `tests` groups by default — the resolver's least certain guesses are
+- `impact`'s summary has five fields, in order: `symbols`, `modules`,
+  `entry_points`, and `low_confidence_hidden` are all integer counts;
+  `effects_reachable` is a **list of effect-kind strings**, not a count —
+  e.g. `["DB_WRITE", "PROCESS"]`, or `[]` when the symbol reaches nothing.
+  In `--json` output it is a real JSON array; in the default text output
+  the summary line joins all five fields with ` · `, so
+  `effects_reachable` shows up as Python's list repr, e.g.
+  `6 · 1 · 6 · 0 · ['DB_WRITE', 'PROCESS']`. `low_confidence_hidden` counts
+  `LOW`-confidence dependents that are held back from the `dependents` and
+  `tests` groups by default — the resolver's least certain guesses are
   real information, but they should not read as confirmed impact. Pass
   `--all` to include them in the listed rows.
 - Rows under a `tests` group are dependents whose path is under `tests/` or
