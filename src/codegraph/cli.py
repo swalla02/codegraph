@@ -9,6 +9,7 @@ from pathlib import Path
 from codegraph import __version__, gitio
 from codegraph.indexer import FsTreeSource, GitTreeSource, Indexer
 from codegraph.query.effects import effects_report
+from codegraph.query.impact import impact_report
 from codegraph.render import render_json, render_text
 from codegraph.resolve import find_symbol
 from codegraph.store import WORKTREE, Store
@@ -95,6 +96,35 @@ def _cmd_effects(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _cmd_impact(args: argparse.Namespace) -> int:
+    """Report the ranked dependents of a symbol -- everything a change to
+    it could break."""
+    root = Path(args.path).resolve()
+    store, indexer = open_workspace(root)
+    try:
+        indexer.reconcile(args.rev)
+        matches = find_symbol(store, args.rev, args.symbol)
+        if not matches:
+            print(f"no symbol matching {args.symbol!r}", file=sys.stderr)
+            return 1
+        if len(matches) > 1:
+            print(f"ambiguous symbol {args.symbol!r}:", file=sys.stderr)
+            for row in matches:
+                print(f"  {row['id']}", file=sys.stderr)
+            return 2
+        report = impact_report(
+            store,
+            args.rev,
+            matches[0]["id"],
+            max_hops=args.hops,
+            include_low=args.all,
+        )
+        print(render_json(report) if args.json else render_text(report))
+        return 0
+    finally:
+        store.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codegraph")
     parser.add_argument("--version", action="version", version=__version__)
@@ -130,6 +160,19 @@ def build_parser() -> argparse.ArgumentParser:
     effects_parser.add_argument("--rev", default=WORKTREE, help="Revision to query")
     effects_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     effects_parser.set_defaults(handler=_cmd_effects)
+
+    impact_parser = subparsers.add_parser("impact", help="Report the ranked dependents of a symbol")
+    impact_parser.add_argument("symbol", help="Node id, qualname, or trailing name")
+    impact_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    impact_parser.add_argument("--rev", default=WORKTREE, help="Revision to query")
+    impact_parser.add_argument(
+        "--hops", type=int, default=3, help="Maximum hops to walk (default: 3)"
+    )
+    impact_parser.add_argument(
+        "--all", action="store_true", help="Include LOW-confidence dependents"
+    )
+    impact_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    impact_parser.set_defaults(handler=_cmd_impact)
 
     return parser
 
