@@ -86,3 +86,38 @@ def test_missing_base_revision_reports_name_and_raises(repo, write):
     with pytest.raises(MissingRevisionError, match="deadbeef"):
         diff_report(store, indexer, "deadbeef" * 5, "HEAD")
     store.close()
+
+
+def test_new_module_only_file_appears_in_added(repo, write):
+    store, indexer = build(repo)
+    base = git(repo, "rev-parse", "HEAD").strip()
+    write("config.py", "TIMEOUT = 30\n", commit="add config")
+    report = diff_report(store, indexer, base, "HEAD")
+    assert "config.py::<module>" in rows(report, "added")
+    store.close()
+
+
+def test_deleted_module_only_file_appears_in_removed(repo, write):
+    write("config.py", "TIMEOUT = 30\n", commit="add config")
+    store, indexer = build(repo)
+    base = git(repo, "rev-parse", "HEAD").strip()
+    (repo / "config.py").unlink()
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "remove config")
+    report = diff_report(store, indexer, base, "HEAD")
+    assert "config.py::<module>" in rows(report, "removed")
+    store.close()
+
+
+def test_module_level_effect_addition_is_changed_and_new_effect(repo, write):
+    write("m.py", "TIMEOUT = 30\n", commit="m")
+    store, indexer = build(repo)
+    base = git(repo, "rev-parse", "HEAD").strip()
+    write(
+        "m.py",
+        "import requests\n\nTIMEOUT = 30\nrequests.post('u')\n",
+        commit="add module-level network call",
+    )
+    report = diff_report(store, indexer, base, "HEAD")
+    assert "m.py::<module>" in rows(report, "changed")
+    assert "NETWORK" in str(report.summary)
+    store.close()

@@ -198,9 +198,15 @@ class Indexer:
             result = parse_blob(data)
             errors += int(result.error is not None)
             connection.execute(
-                "INSERT OR REPLACE INTO blobs(blob_sha, status, error, parser_version) "
-                "VALUES(?, ?, ?, ?)",
-                (sha, "error" if result.error else "ok", result.error, PARSER_VERSION),
+                "INSERT OR REPLACE INTO blobs(blob_sha, status, error, parser_version,"
+                " module_body_hash) VALUES(?, ?, ?, ?, ?)",
+                (
+                    sha,
+                    "error" if result.error else "ok",
+                    result.error,
+                    PARSER_VERSION,
+                    result.module_body_hash,
+                ),
             )
             connection.executemany(
                 "INSERT OR REPLACE INTO blob_nodes(blob_sha, ordinal, qualname, kind,"
@@ -246,13 +252,30 @@ class Indexer:
         Every path also gets a synthetic module node (`path::<module>`), so
         that a module-scope call's edge `src` — an import-time side effect
         like `app = create_app()` — has a real row in `nodes` rather than a
-        dangling id. Its `body_hash` is the path's blob sha: a file-changed
-        signal, not a symbol-changed one, since no per-symbol hash exists at
-        module scope. Its span is a placeholder (`1..1`): the file's true
-        last line isn't available from Layer 1's parsed tables without
-        re-reading blob content, and nothing downstream depends on it yet.
+        dangling id. Its `body_hash` is `parse.py`'s `module_body_hash`: a
+        structural hash of the module's top-level statements with nested
+        def/class bodies elided, computed once per blob and cached on the
+        `blobs` row alongside it -- whitespace-insensitive like every other
+        `body_hash`, but still sensitive to a module-scope statement (an
+        import, a top-level call) changing. Falls back to the blob sha
+        itself when a blob has no cached hash (a parse error leaves it
+        empty), so a broken file's module node still changes identity
+        when its content does. Its span is a placeholder (`1..1`): the
+        file's true last line isn't available from Layer 1's parsed
+        tables without re-reading blob content, and nothing downstream
+        depends on it yet.
         """
         connection = self.store.connection
+        module_hashes: dict[str, str] = {}
+        shas = set(tree.values())
+        if shas:
+            placeholders = ",".join("?" * len(shas))
+            for row in connection.execute(
+                f"SELECT blob_sha, module_body_hash FROM blobs WHERE blob_sha IN ({placeholders})",
+                tuple(shas),
+            ):
+                module_hashes[row["blob_sha"]] = row["module_body_hash"]
+
         shadowed = 0
         rows: list[tuple] = []
         for path, sha in tree.items():
@@ -284,7 +307,7 @@ class Indexer:
                     "module",
                     1,
                     1,
-                    sha,
+                    module_hashes.get(sha) or sha,
                     "live",
                 )
             )

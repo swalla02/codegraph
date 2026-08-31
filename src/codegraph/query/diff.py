@@ -24,14 +24,6 @@ from codegraph.query.impact import impact_report
 from codegraph.render import Group, Report, Row, budget
 from codegraph.store import Store
 
-#: `Indexer._materialize_nodes` also writes one synthetic module-scope node
-#: per path (`path::<module>`), whose `body_hash` is the *file's* blob sha --
-#: a file-changed signal, not a symbol-changed one. Comparing those would
-#: mean any touch to a file (including a pure line-shift) shows up as a
-#: "changed" row, defeating the point of this module. They are excluded
-#: from every set below.
-_MODULE_KIND = "module"
-
 
 class MissingRevisionError(Exception):
     """A requested revision could not be resolved to a real commit.
@@ -65,12 +57,19 @@ def _resolve(indexer: Indexer, rev: str) -> str:
 
 
 def _nodes(store: Store, rev: str) -> dict[str, sqlite3.Row]:
+    """Every node at `rev`, including the synthetic per-path module-scope
+    node (`path::<module>`, `kind="module"`). It is not special-cased out:
+    `parse.py` gives it a `body_hash` over the module's top-level
+    statements with nested def/class bodies elided, so it is exactly as
+    line-shift-insensitive as every other node here -- and it is where a
+    new import or a module-level side-effecting call (code with no def of
+    its own to attach to) actually lives, so excluding it would make the
+    single most effect-dense kind of change invisible to `diff`."""
     return {
         row["id"]: row
         for row in store.connection.execute(
-            "SELECT id, path, qualname, kind, line_start, body_hash FROM nodes"
-            " WHERE rev=? AND kind != ?",
-            (rev, _MODULE_KIND),
+            "SELECT id, path, qualname, kind, line_start, body_hash FROM nodes WHERE rev=?",
+            (rev,),
         )
     }
 

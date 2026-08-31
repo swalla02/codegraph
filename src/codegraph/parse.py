@@ -7,10 +7,11 @@ paths, and the parse cache is keyed on content alone.
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 from dataclasses import dataclass, field
 
-PARSER_VERSION = "1"
+PARSER_VERSION = "2"
 
 _DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
@@ -53,6 +54,10 @@ class ParseResult:
     nodes: tuple[ParsedNode, ...] = ()
     refs: tuple[ParsedRef, ...] = ()
     imports: tuple[ParsedImport, ...] = ()
+    #: Structural hash of the module's top-level statements, with every
+    #: nested function/class BODY elided (see `_module_skeleton`). Empty on
+    #: a parse error, since there is no tree to hash.
+    module_body_hash: str = ""
     error: str | None = None
 
 
@@ -84,6 +89,50 @@ def _body_hash(node: ast.AST) -> str:
     # ast.dump omits lineno/col_offset unless include_attributes=True, so this
     # hash is invariant to where the definition sits in the file.
     return hashlib.blake2b(ast.dump(node).encode(), digest_size=16).hexdigest()
+
+
+class _BodyElider(ast.NodeTransformer):
+    """Replace every function/class def's `body` with a single placeholder
+    statement, without recursing into the original body first.
+
+    Used to build the module-level structural hash: a def/class's own
+    `body_hash` already covers everything inside it (via `_body_hash` on
+    the untouched node), so folding that same content into the module hash
+    too would double-count it and reintroduce the exact line-shift churn
+    `body_hash` comparison exists to avoid (an edit two functions away from
+    a def would ripple into every def nested inside it, transitively, all
+    the way up to the module). Not recursing into the original body before
+    replacing it also means a closure nested inside a top-level function
+    is dropped for free -- it is already inside that function's own
+    (unelided) `body_hash`.
+
+    Everything else about the def -- its name, decorators, arguments,
+    base classes, and its position among the module's other top-level
+    statements -- is left intact, so renaming a def, changing its
+    signature, or reordering top-level statements still changes the
+    module hash.
+    """
+
+    def _elide(self, node: ast.AST) -> ast.AST:
+        clone = copy.copy(node)
+        clone.body = [ast.Pass()]
+        return clone
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        return self._elide(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
+        return self._elide(node)
+
+
+def _module_body_hash(tree: ast.Module) -> str:
+    """Structural hash of `tree`'s top-level statements, reusing
+    `_body_hash` (the same dump-and-hash `parse.py` already uses for a
+    def/class's own body) over a copy with nested def/class bodies elided."""
+    skeleton = _BodyElider().visit(copy.deepcopy(tree))
+    return _body_hash(skeleton)
 
 
 class _Collector(ast.NodeVisitor):
@@ -286,5 +335,6 @@ def parse_blob(source: bytes) -> ParseResult:
         nodes=_apply_shadowing(collector.nodes),
         refs=tuple(collector.refs),
         imports=tuple(collector.imports),
+        module_body_hash=_module_body_hash(tree),
         error=None,
     )

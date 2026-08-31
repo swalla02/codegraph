@@ -135,6 +135,12 @@ def _diff_revspec(root: Path, revspec: str | None) -> tuple[str, str]:
     if revspec:
         if ".." in revspec:
             base, _, head = revspec.partition("..")
+            if not base:
+                # "..HEAD" -- an empty base has no sensible default (unlike
+                # an empty head, which reasonably falls back to WORKTREE),
+                # so name the missing side rather than passing "" through
+                # to raise a blank, nameless error later.
+                raise MissingRevisionError("<base>")
             return base, head or WORKTREE
         return revspec, WORKTREE
     if not gitio.is_repo(root):
