@@ -2,6 +2,7 @@ import os
 import stat
 import time
 
+from codegraph.cli import main
 from codegraph.indexer import GitTreeSource, Indexer
 from codegraph.maintenance import gc, install_hooks
 from codegraph.query.impact import impact_report
@@ -123,6 +124,142 @@ def test_install_hooks_is_idempotent(repo):
     assert first == second
     assert second.count("codegraph index") == 1
     assert {p.name for p in written_again} == {"post-commit", "post-checkout", "post-merge"}
+
+
+# --- Interpreter allowlist and stale-install repair (2nd review round) ---
+
+
+def test_install_hooks_skips_perl_hook_untouched(repo):
+    """Splicing shell syntax into a hook written for a different
+    interpreter corrupts it outright, not just fails to warm it. A Perl
+    hook must be left byte-for-byte alone and absent from the returned
+    (installed) list."""
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    perl_hook = hooks_dir / "post-commit"
+    original = '#!/usr/bin/perl\nprint "perl-hook-ran\\n";\n'
+    perl_hook.write_text(original)
+    perl_hook.chmod(perl_hook.stat().st_mode | stat.S_IXUSR)
+
+    written = install_hooks(repo)
+
+    assert perl_hook not in written
+    assert perl_hook.read_text() == original
+
+
+def test_install_hooks_skips_env_python_hook_untouched(repo):
+    """`#!/usr/bin/env python3` is exactly as unsafe to splice into as a
+    direct `#!/usr/bin/perl` -- the `env` indirection must still resolve to
+    the real interpreter for the allowlist check."""
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    python_hook = hooks_dir / "post-checkout"
+    original = "#!/usr/bin/env python3\nprint('python-hook-ran')\n"
+    python_hook.write_text(original)
+    python_hook.chmod(python_hook.stat().st_mode | stat.S_IXUSR)
+
+    written = install_hooks(repo)
+
+    assert python_hook not in written
+    assert python_hook.read_text() == original
+
+
+def test_install_hooks_reports_skip_reason_on_cli(repo, capsys):
+    """A skip must be loud, not silent: the CLI names the skipped hook and
+    says why, on stderr, distinct from the installed paths on stdout."""
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    perl_hook = hooks_dir / "post-commit"
+    perl_hook.write_text('#!/usr/bin/perl\nprint "hi\\n";\n')
+    perl_hook.chmod(perl_hook.stat().st_mode | stat.S_IXUSR)
+
+    assert main(["install-hooks", "--path", str(repo)]) == 0
+
+    captured = capsys.readouterr()
+    assert "post-commit" not in captured.out
+    assert "post-checkout" in captured.out
+    assert "post-merge" in captured.out
+    assert "skipped post-commit" in captured.err
+    assert "perl" in captured.err.lower()
+
+
+def test_install_hooks_still_installs_allowlisted_shell_shapes(repo):
+    """`#!/bin/bash -e`, `#!/usr/bin/env bash`, and a fully absent shebang
+    all name (or don't contradict) a POSIX-shell-compatible interpreter and
+    must still install normally."""
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+
+    bash_flag_hook = hooks_dir / "post-commit"
+    bash_flag_hook.write_text("#!/bin/bash -e\necho bash-ran\n")
+    bash_flag_hook.chmod(bash_flag_hook.stat().st_mode | stat.S_IXUSR)
+
+    env_bash_hook = hooks_dir / "post-checkout"
+    env_bash_hook.write_text("#!/usr/bin/env bash\necho env-bash-ran\n")
+    env_bash_hook.chmod(env_bash_hook.stat().st_mode | stat.S_IXUSR)
+
+    # post-merge: no pre-existing file at all.
+
+    written = install_hooks(repo)
+
+    assert {p.name for p in written} == {"post-commit", "post-checkout", "post-merge"}
+    assert "codegraph index" in bash_flag_hook.read_text()
+    assert bash_flag_hook.read_text().startswith("#!/bin/bash -e\n")
+    assert "codegraph index" in env_bash_hook.read_text()
+    assert env_bash_hook.read_text().startswith("#!/usr/bin/env bash\n")
+
+
+def test_install_hooks_repairs_a_stale_pre_fix_install(repo):
+    """A hook carrying the OLD append-at-end block (with `$?` preservation,
+    installed after the pre-existing hook's own `exit 0`) must not be left
+    byte-identical -- it was silently dead. install_hooks repairs it into a
+    live, top-of-file block."""
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    stale_hook = hooks_dir / "post-commit"
+    stale_hook.write_text(
+        "#!/bin/sh\n"
+        "echo hi >> marker.txt\n"
+        "exit 0\n"
+        "# >>> codegraph (warming only; safe to remove) >>>\n"
+        "_codegraph_status=$?\n"
+        '( cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"'
+        ' && codegraph index --quiet >/dev/null 2>&1 & ) >/dev/null 2>&1 || true\n'
+        "exit $_codegraph_status\n"
+        "# <<< codegraph (warming only; safe to remove) <<<\n"
+    )
+    stale_hook.chmod(stale_hook.stat().st_mode | stat.S_IXUSR)
+
+    written = install_hooks(repo)
+
+    content = stale_hook.read_text()
+    assert stale_hook in written
+    assert "_codegraph_status" not in content  # old dead artifact is gone
+    assert content.count("codegraph index") == 1
+    assert content.index("codegraph index") < content.index("exit 0")
+    assert "echo hi >> marker.txt" in content
+
+
+def test_install_hooks_three_reruns_stay_at_one_invocation(repo):
+    """Repair and idempotency share one mechanism (strip-then-insert), so
+    repeated calls -- even against a hook that keeps ending in its own
+    `exit 0` -- must converge, not accumulate."""
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook = hooks_dir / "post-commit"
+    hook.write_text("#!/bin/sh\necho hi >> marker.txt\nexit 0\n")
+    hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
+
+    install_hooks(repo)
+    first = hook.read_text()
+    install_hooks(repo)
+    second = hook.read_text()
+    install_hooks(repo)
+    third = hook.read_text()
+
+    assert first == second == third
+    assert third.count("codegraph index") == 1
+    assert third.count("# >>> codegraph") == 1
 
 
 def test_gc_does_not_corrupt_a_live_graph(repo, write):

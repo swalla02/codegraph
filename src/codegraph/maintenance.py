@@ -11,6 +11,7 @@ hook never fires, or `gc` is never run, results are byte-identical.
 from __future__ import annotations
 
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 
 from codegraph.store import Store
@@ -34,6 +35,12 @@ _HOOK_BLOCK = f"""{_BEGIN_MARKER}
 ( cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && codegraph index --quiet >/dev/null 2>&1 & ) >/dev/null 2>&1 || true
 {_END_MARKER}
 """
+
+# Splicing shell syntax into a script written for a different interpreter
+# corrupts it outright (a Perl or Python hook fails to even parse). This is
+# the allowlist of interpreters `_HOOK_BLOCK`'s POSIX-shell syntax is safe
+# to land inside; anything else is left completely untouched.
+_SHELL_INTERPRETERS = {"sh", "bash", "dash", "ash", "ksh", "zsh"}
 
 
 def _chunks(items: list[str], size: int) -> list[list[str]]:
@@ -105,6 +112,43 @@ def _hooks_dir(root: Path) -> Path:
     raise FileNotFoundError(f"not a git repository: {root}")
 
 
+def _shebang_interpreter(shebang_line: str) -> str:
+    """The interpreter name a `#!...` line claims, resolving
+    `#!/usr/bin/env <interp> [flags]` to `<interp>` the same as
+    `#!/path/to/<interp> [flags]`. Empty string if the line names nothing
+    (a bare `#!`)."""
+    tokens = shebang_line[2:].split()
+    if not tokens:
+        return ""
+    name = Path(tokens[0]).name
+    if name == "env" and len(tokens) > 1:
+        name = Path(tokens[1]).name
+    return name
+
+
+def _is_shell_shebang(shebang_line: str) -> bool:
+    return _shebang_interpreter(shebang_line) in _SHELL_INTERPRETERS
+
+
+def _strip_existing_block(text: str) -> str:
+    """Remove a previously-installed codegraph block, wherever it sits and
+    whatever its interior looks like (this repairs a stale block from an
+    older version of `install_hooks` -- e.g. one still doing `$?`
+    preservation, or one appended at the end after a pre-existing `exit` --
+    just as readily as a current one). A malformed/truncated marker pair
+    (no matching end) is left alone rather than guessed at."""
+    start = text.find(_BEGIN_MARKER)
+    if start == -1:
+        return text
+    end = text.find(_END_MARKER, start)
+    if end == -1:
+        return text
+    end += len(_END_MARKER)
+    tail = text[end:]
+    tail = tail.removeprefix("\n")
+    return text[:start] + tail
+
+
 def _insert_after_shebang(existing: str) -> str:
     """Splice `_HOOK_BLOCK` in as the first statement of the script, right
     after its shebang line so it always runs -- before any pre-existing
@@ -120,30 +164,76 @@ def _insert_after_shebang(existing: str) -> str:
     return "#!/bin/sh\n" + _HOOK_BLOCK + existing
 
 
-def install_hooks(root: Path) -> list[Path]:
-    """Write (or extend) `post-commit`, `post-checkout`, and `post-merge`
-    hooks that warm the codegraph cache in the background.
+@dataclass(frozen=True)
+class HookResult:
+    """One hook's outcome: installed (written or repaired), or skipped with
+    a human-readable reason."""
 
-    Idempotent: re-running never double-appends the codegraph block. A
-    pre-existing hook is never overwritten -- the codegraph block is spliced
-    in right after the shebang, so whatever the rest of the script does
-    (including its own `exit`) runs exactly as before, just after ours.
+    name: str
+    path: Path
+    installed: bool
+    reason: str | None = None
 
-    Returns the paths of all three hooks (written or already present).
+
+def plan_hooks(root: Path) -> list[HookResult]:
+    """Install (or repair) `post-commit`, `post-checkout`, and
+    `post-merge`, one `HookResult` per hook.
+
+    A pre-existing hook whose shebang names an interpreter outside
+    `_SHELL_INTERPRETERS` (Perl, Python, Ruby, Node, ...) is **left
+    completely untouched** and reported as skipped -- splicing POSIX-shell
+    syntax into it would corrupt the script outright, not just fail to warm
+    it. A file with no shebang at all makes no interpreter claim to
+    contradict, so it's treated the same as a shell script (a `#!/bin/sh`
+    is added). This refusal is safe precisely because of D5: warming is
+    optional, so a skipped hook only ever costs speed, never correctness.
+
+    A hook already carrying a codegraph block -- from this run or an older
+    version of `install_hooks` -- has that block stripped and a fresh one
+    spliced in fresh each time. This is what makes repeated calls
+    idempotent (always converges to exactly one block) *and*
+    self-repairing (a block left dead by a since-fixed bug, e.g. one
+    appended after the pre-existing hook's own `exit 0`, is replaced with a
+    live one instead of staying broken forever).
     """
     hooks_dir = _hooks_dir(root)
     hooks_dir.mkdir(parents=True, exist_ok=True)
 
-    written: list[Path] = []
+    results: list[HookResult] = []
     for name in _HOOK_NAMES:
         path = hooks_dir / name
         existing = path.read_text() if path.exists() else ""
+        lines = existing.splitlines()
 
-        if _BEGIN_MARKER not in existing:
-            path.write_text(_insert_after_shebang(existing))
+        if lines and lines[0].startswith("#!") and not _is_shell_shebang(lines[0]):
+            results.append(
+                HookResult(
+                    name=name,
+                    path=path,
+                    installed=False,
+                    reason=(
+                        f"existing hook uses a non-shell interpreter ({lines[0].strip()}); "
+                        "warming not installed"
+                    ),
+                )
+            )
+            continue
 
+        content = _insert_after_shebang(_strip_existing_block(existing))
+        path.write_text(content)
         mode = path.stat().st_mode
         path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        written.append(path)
+        results.append(HookResult(name=name, path=path, installed=True))
 
-    return written
+    return results
+
+
+def install_hooks(root: Path) -> list[Path]:
+    """Paths of the hooks actually installed or repaired.
+
+    Omits any hook skipped for using a non-shell interpreter -- see
+    `plan_hooks` for the reason behind each skip, which is what the CLI
+    surfaces to the user (a skip must be loud, never silent: D5 licenses
+    skipping a hook, not hiding that it happened).
+    """
+    return [result.path for result in plan_hooks(root) if result.installed]

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from codegraph import __version__, gitio
 from codegraph.indexer import FsTreeSource, GitTreeSource, Indexer
-from codegraph.maintenance import gc, install_hooks
+from codegraph.maintenance import gc, plan_hooks
 from codegraph.query.diff import MissingRevisionError, diff_report
 from codegraph.query.effects import effects_report
 from codegraph.query.impact import impact_report
@@ -199,10 +199,17 @@ def _cmd_install_hooks(args: argparse.Namespace) -> int:
     """Install post-commit/post-checkout/post-merge hooks that warm the
     cache in the background. Purely an optimization -- see D5: every query
     reconciles the working tree itself, so results are identical whether or
-    not these ever fire."""
+    not these ever fire. A hook whose pre-existing script isn't
+    shell-compatible is skipped rather than corrupted -- reported by name
+    and reason on stderr, never silently, since a silent skip would be the
+    same trust failure as the corruption it avoids.
+    """
     root = Path(args.path).resolve()
-    for path in install_hooks(root):
-        print(path)
+    for result in plan_hooks(root):
+        if result.installed:
+            print(result.path)
+        else:
+            print(f"skipped {result.name}: {result.reason}", file=sys.stderr)
     return 0
 
 
