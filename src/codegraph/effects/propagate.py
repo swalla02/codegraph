@@ -99,7 +99,18 @@ def propagate(store: Store, rev: str) -> int:
     for row in connection.execute(
         "SELECT node_id, kind, confidence FROM effects WHERE rev=? AND direct=1", (rev,)
     ):
-        direct_by_node.setdefault(row["node_id"], {})[row["kind"]] = row["confidence"]
+        # A node can carry more than one direct=1 row for the same
+        # (node_id, kind) -- `effects` has no UNIQUE constraint and
+        # `detect_direct` writes one row per call site, so two calls in
+        # one function (e.g. one `open()` with a literal mode, one with a
+        # variable mode) are enough to produce it. Reduce with `stronger()`
+        # rather than letting SQL scan order pick whichever row happens to
+        # come back last -- this must match `witness_path`'s own
+        # `direct_confidence` reduction (below) exactly, since the graph a
+        # confidence is derived from and the graph the witness BFS
+        # traverses have to stay identical for the BFS to stay total.
+        bucket = direct_by_node.setdefault(row["node_id"], {})
+        bucket[row["kind"]] = stronger(bucket.get(row["kind"], row["confidence"]), row["confidence"])
         direct_nodes_by_kind.setdefault(row["kind"], set()).add(row["node_id"])
 
     # node_confidence[node][kind] = the strongest tier at which `node` can

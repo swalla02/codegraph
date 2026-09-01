@@ -88,10 +88,48 @@ def test_fully_literal_match_is_high_confidence():
 
 def test_partial_prefix_match_is_medium_confidence():
     """`requests.*` and `boto3.*` have a real but partial literal prefix --
-    more specific than a bare wildcard head, but not a literal name."""
+    more specific than a bare wildcard head, but not a literal name. Uses
+    `requests.codes`, not `requests.get`: the literal HTTP-verb rules below
+    make `.get` HIGH now, so `.codes` -- a catch-all-only member with no
+    verb-specific rule of its own -- is the one that still exercises the
+    bare `requests.*` MEDIUM tier."""
     catalog = Catalog.load(Config())
-    assert catalog.match_with_confidence("requests.get") == ("NETWORK", MEDIUM)
+    assert catalog.match_with_confidence("requests.codes") == ("NETWORK", MEDIUM)
     assert catalog.match_with_confidence("boto3.client") == ("DB_WRITE", MEDIUM)
+
+
+@pytest.mark.parametrize(
+    "dotted",
+    [
+        "requests.get",
+        "requests.post",
+        "requests.put",
+        "requests.patch",
+        "requests.delete",
+        "requests.head",
+        "requests.options",
+        "requests.request",
+    ],
+)
+def test_requests_http_verbs_are_high_confidence(dotted):
+    """C3 follow-up: the literal HTTP verbs are the most common and least
+    ambiguous network call in Python and must not be worse-labeled than
+    before `requests.*` was tiered MEDIUM."""
+    catalog = Catalog.load(Config())
+    assert catalog.match_with_confidence(dotted) == ("NETWORK", HIGH)
+
+
+def test_requests_verb_literal_beats_requests_namespace_catchall():
+    """Longest-literal-prefix-wins must actually favor the literal verb
+    rule over the `requests.*` catch-all, not just declare it in a
+    docstring -- `requests.get`'s prefix (13 chars, no wildcard) is longer
+    than `requests.*`'s (9 chars, up to the `*`), so it wins regardless of
+    declaration order in builtin.toml."""
+    catalog = Catalog.load(Config())
+    kind, confidence = catalog.match_with_confidence("requests.get")
+    assert (kind, confidence) == ("NETWORK", HIGH)
+    # And the catch-all is still there for everything else in the namespace.
+    assert catalog.match_with_confidence("requests.codes") == ("NETWORK", MEDIUM)
 
 
 def test_indexers_own_source_reconcile_is_no_longer_a_high_confidence_db_write():

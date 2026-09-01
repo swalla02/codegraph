@@ -383,3 +383,131 @@ def test_effects_report_picks_the_strongest_confidence_for_a_repeated_kind(tmp_p
     row = next(r for g in report.groups for r in g.rows)
     assert row.detail.startswith("NETWORK HIGH")
     store.close()
+
+
+def test_evidence_location_picks_a_row_that_supports_the_reported_confidence(tmp_path):
+    """C1 regression (final verification, HIGH): `m.py::load` carries two
+    direct FS_READ rows for the SAME node -- `open(path, mode)` (ambiguous
+    mode, MEDIUM) on line 2, `open(path2)` (fully literal, HIGH) on line 3.
+    The reported confidence is the strongest across both rows (HIGH), so
+    the printed evidence must be the HIGH row at line 3. Before the fix,
+    `_evidence_location` picked `ORDER BY evidence_line LIMIT 1` with no
+    confidence filter and printed line 2 -- the MEDIUM, ambiguous call --
+    next to a HIGH label. Different lines AND different confidences is the
+    whole bug: B0's regression test seeded both rows at the same line and
+    never exercised this."""
+    store = Store.open(tmp_path)
+    rev = "HEAD"
+    connection = store.connection
+    connection.execute(
+        "INSERT INTO nodes(rev, id, path, qualname, kind, line_start, line_end, body_hash,"
+        " name_binding) VALUES(?,?,?,?,?,?,?,?,?)",
+        (rev, "m.py::load", "m.py", "load", "function", 1, 3, "x", "live"),
+    )
+    connection.executemany(
+        "INSERT INTO effects(rev, node_id, kind, direct, evidence_path, evidence_line,"
+        " confidence) VALUES(?,?,?,?,?,?,?)",
+        [
+            (rev, "m.py::load", "FS_READ", 1, "m.py", 2, "MEDIUM"),
+            (rev, "m.py::load", "FS_READ", 1, "m.py", 3, "HIGH"),
+        ],
+    )
+    connection.commit()
+
+    report = effects_report(store, rev, "m.py::load")
+    row = next(r for g in report.groups for r in g.rows)
+    assert row.detail.startswith("FS_READ HIGH")
+    assert row.location == "m.py:3"
+    store.close()
+
+
+def test_evidence_at_the_end_of_a_propagated_witness_chain_justifies_its_tier(tmp_path):
+    """Same bug, propagated shape: the witness chain's terminal node (`c`)
+    carries two direct NETWORK rows at different lines and confidences.
+    `a` reaches `c` over two HIGH edges, so the reported confidence is
+    HIGH; the printed location must be `c`'s HIGH row (line 9), not its
+    earlier MEDIUM row (line 5) -- the evidence at the end of a witness
+    chain has to justify the tier the chain is reported at, not just direct
+    effects on the queried node itself."""
+    store = Store.open(tmp_path)
+    rev = "HEAD"
+    connection = store.connection
+    connection.executemany(
+        "INSERT INTO nodes(rev, id, path, qualname, kind, line_start, line_end, body_hash,"
+        " name_binding) VALUES(?,?,?,?,?,?,?,?,?)",
+        [
+            (rev, "m.py::a", "m.py", "a", "function", 1, 1, "x", "live"),
+            (rev, "m.py::b", "m.py", "b", "function", 2, 2, "x", "live"),
+            (rev, "m.py::c", "m.py", "c", "function", 3, 3, "x", "live"),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO edges(rev, src, dst, kind, confidence, provenance, callsite_path,"
+        " callsite_line) VALUES(?,?,?,?,?,?,?,?)",
+        [
+            (rev, "m.py::a", "m.py::b", "CALLS", "HIGH", "static", "m.py", 1),
+            (rev, "m.py::b", "m.py::c", "CALLS", "HIGH", "static", "m.py", 2),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO effects(rev, node_id, kind, direct, evidence_path, evidence_line,"
+        " confidence) VALUES(?,?,?,?,?,?,?)",
+        [
+            (rev, "m.py::c", "NETWORK", 1, "m.py", 5, "MEDIUM"),
+            (rev, "m.py::c", "NETWORK", 1, "m.py", 9, "HIGH"),
+        ],
+    )
+    connection.commit()
+
+    propagate(store, rev)
+
+    report = effects_report(store, rev, "m.py::a")
+    row = next(r for g in report.groups for r in g.rows)
+    assert row.detail.startswith("NETWORK HIGH via")
+    assert row.location == "m.py:9"
+    store.close()
+
+
+def test_propagate_reduces_duplicate_direct_rows_with_stronger_not_scan_order(tmp_path):
+    """C2 regression (final verification, MED): `propagate.py:102` used to
+    keep whichever `direct=1` row SQL scan order returned last for a given
+    (node_id, kind) rather than reducing with `stronger()`, the way
+    `witness_path`'s own `direct_confidence` does. `callee` carries a HIGH
+    NETWORK row inserted BEFORE a LOW one; a last-write-wins reduction
+    would leave `callee`'s own confidence at LOW, making it ineligible at
+    the HIGH tier and silently downgrading `caller` (reached over a HIGH
+    CALLS edge) to LOW -- proven order-dependent on an identical graph.
+    `stronger()` must pick HIGH regardless of insertion order."""
+    store = Store.open(tmp_path)
+    rev = "HEAD"
+    connection = store.connection
+    connection.executemany(
+        "INSERT INTO nodes(rev, id, path, qualname, kind, line_start, line_end, body_hash,"
+        " name_binding) VALUES(?,?,?,?,?,?,?,?,?)",
+        [
+            (rev, "m.py::caller", "m.py", "caller", "function", 1, 1, "x", "live"),
+            (rev, "m.py::callee", "m.py", "callee", "function", 2, 2, "x", "live"),
+        ],
+    )
+    connection.execute(
+        "INSERT INTO edges(rev, src, dst, kind, confidence, provenance, callsite_path,"
+        " callsite_line) VALUES(?,?,?,?,?,?,?,?)",
+        (rev, "m.py::caller", "m.py::callee", "CALLS", "HIGH", "static", "m.py", 1),
+    )
+    # HIGH row inserted BEFORE the LOW row -- last-write-wins would keep LOW.
+    connection.executemany(
+        "INSERT INTO effects(rev, node_id, kind, direct, evidence_path, evidence_line,"
+        " confidence) VALUES(?,?,?,?,?,?,?)",
+        [
+            (rev, "m.py::callee", "NETWORK", 1, "m.py", 5, "HIGH"),
+            (rev, "m.py::callee", "NETWORK", 1, "m.py", 1, "LOW"),
+        ],
+    )
+    connection.commit()
+
+    propagate(store, rev)
+
+    report = effects_report(store, rev, "m.py::caller")
+    row = next(r for g in report.groups for r in g.rows)
+    assert row.detail.startswith("NETWORK HIGH via")
+    store.close()

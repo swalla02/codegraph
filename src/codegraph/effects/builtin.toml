@@ -17,6 +17,47 @@
 match = "requests.*"
 kind = "NETWORK"
 
+# `requests.*` above has to stay MEDIUM: it matches the whole namespace,
+# including non-network members (`requests.codes`, `requests.utils.*`,
+# `Session()`), not just the HTTP verbs. But that leaves `requests.get` /
+# `.post` -- the single most common and least ambiguous network call in
+# Python -- worse labeled than before that fix, purely for uniformity. Each
+# of these is a fully literal pattern (no wildcard), so it derives HIGH
+# from its own specificity and, having a longer literal prefix than
+# `requests.*`, wins the match over it (see catalog.py's precedence rule)
+# without needing a `confidence` override.
+[[effect]]
+match = "requests.get"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.post"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.put"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.patch"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.delete"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.head"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.options"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.request"
+kind = "NETWORK"
+
 [[effect]]
 match = "httpx.*"
 kind = "NETWORK"
