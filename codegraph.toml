@@ -1,0 +1,50 @@
+# codegraph configuration -- https://github.com/swalla02/codegraph
+#
+# Nothing here is active: every setting is commented out, and the values shown
+# are the defaults codegraph already applies. Uncomment what you want to change.
+
+
+# How a file path becomes a Python module name for import resolution. The
+# longest matching root is stripped from the front of the path, so with "src"
+# in the list, src/pay/service.py resolves as the module `pay.service`. If
+# `codegraph status` reports a lot of unresolved references, a missing source
+# root is the first thing to check.
+# source_roots = ["", "src"]
+
+
+# How many equally-weak candidates one call site may name before codegraph
+# records it once as ambiguous instead of as that many low-confidence edges.
+# A call like `item.save()` that names nothing importable, nothing
+# module-local, and nothing reachable through `self` falls back to matching
+# `save` against every definition in the repository. On django that was 971
+# candidates for a single call site, and 96.6% of the whole graph was that kind
+# of guess -- the edge table grew with the square of the repository. Nothing is
+# discarded at the cap: the one ambiguous record makes the same claim the N
+# edges did. Raise it to get the full cross product back; 0 disables the cap.
+# ambiguity_limit = 25
+
+
+# Effect overrides, merged over the built-in catalog. The built-ins only know
+# public library calls (stdlib, requests/httpx, SQLAlchemy, psycopg, boto3,
+# ...), but most real side effects sit behind a house abstraction instead, and
+# for a call into a module THIS repository defines the built-ins are skipped
+# entirely -- only the overrides below apply.
+#
+# `match` is a dotted-name glob, matched against the call target after the
+# calling file's imports are expanded: with `from app import db` in scope, a
+# call to `db.save()` is matched as `app.db.save`. `kind` is one of DB_READ,
+# DB_WRITE, NETWORK, FS_READ, FS_WRITE, PROCESS, ENV_READ, GLOBAL_MUTATE,
+# NONDETERMINISM. Where two rules match, the one with the longer literal
+# prefix wins, so a specific override always beats a general built-in.
+
+# Every call into the house database module.
+# [[effect]]
+# match = "app.db.*"
+# kind = "DB_WRITE"
+
+# Any `<something>.enqueue(...)`, whatever the receiver turns out to be. A
+# wildcard head matches broadly and is scored LOW confidence for exactly that
+# reason; a fully literal pattern is scored HIGH.
+# [[effect]]
+# match = "*.enqueue"
+# kind = "NETWORK"
