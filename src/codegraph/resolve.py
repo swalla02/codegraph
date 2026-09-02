@@ -113,6 +113,10 @@ class ResolveContext:
     bases: dict[str, list[str]]  # class node id -> base class node ids
     enclosing_class: dict[str, str] = field(default_factory=dict)  # node id -> class node id
     subclasses: dict[str, list[str]] = field(default_factory=dict)  # inverse of `bases`
+    #: Memo for `_descendants`, shared across every file of the revision. The
+    #: hierarchy is fixed once inheritance has been resolved, but the walk runs
+    #: per `self.X` reference -- on django that cost 3.5s of a 11.2s resolve.
+    descendant_cache: dict[str, list[str]] = field(default_factory=dict)
 
 
 class Resolver(Protocol):
@@ -242,7 +246,11 @@ class AstResolver:
     @classmethod
     def _descendants(cls, start: str, ctx: ResolveContext) -> list[str]:
         """Every known subclass of `start`, transitively (excluding `start`)."""
-        return cls._walk(start, ctx.subclasses)[1:]
+        cached = ctx.descendant_cache.get(start)
+        if cached is None:
+            cached = cls._walk(start, ctx.subclasses)[1:]
+            ctx.descendant_cache[start] = cached
+        return cached
 
     # -- steps 4 and 5: a repo-wide match on the last segment -------------
     def _by_last_segment(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
@@ -363,6 +371,7 @@ class _SymbolTable:
         path: str,
         bases: dict[str, list[str]],
         subclasses: dict[str, list[str]] | None = None,
+        descendant_cache: dict[str, list[str]] | None = None,
     ) -> ResolveContext:
         return ResolveContext(
             rev=rev,
@@ -375,6 +384,7 @@ class _SymbolTable:
             bases=bases,
             enclosing_class=self.enclosing_class,
             subclasses=subclasses if subclasses is not None else {},
+            descendant_cache=descendant_cache if descendant_cache is not None else {},
         )
 
 
@@ -536,9 +546,13 @@ def resolve_revision(
         for base in base_ids:
             subclasses.setdefault(base, []).append(subclass)
 
+    # One cache object shared by every file's context, so the descendant walk
+    # runs once per class for the whole revision rather than once per reference.
+    descendant_cache: dict[str, list[str]] = {}
+
     call_refs = _refs_by_path(store, rev, "call")
     for path in table.paths:
-        ctx = table.context(rev, path, bases, subclasses)
+        ctx = table.context(rev, path, bases, subclasses, descendant_cache)
         for ref in call_refs.get(path, ()):
             src = _source_id(ref, table, path)
             hits = resolver.resolve_call(ref, ctx)
