@@ -146,3 +146,27 @@ def test_global_statement_with_multiple_names_recorded_separately():
     result = parse_blob(source)
     names = {r.raw_name for r in result.refs if r.ref_kind == "global"}
     assert names == {"A", "B"}
+
+
+def test_module_body_hash_ignores_line_shift():
+    top = parse_blob(b"def alpha():\n    return 1\n")
+    shifted = parse_blob(b"\n\n\ndef alpha():\n    return 1\n")
+    assert top.module_body_hash == shifted.module_body_hash
+
+
+def test_module_body_hash_ignores_nested_body_changes():
+    one = parse_blob(b"def alpha():\n    return 1\n")
+    two = parse_blob(b"def alpha():\n    return 2\n")
+    assert one.module_body_hash == two.module_body_hash
+
+
+def test_module_body_hash_changes_with_top_level_statement():
+    one = parse_blob(b"def alpha():\n    return 1\n")
+    two = parse_blob(b"import requests\n\n\ndef alpha():\n    return 1\n")
+    assert one.module_body_hash != two.module_body_hash
+
+
+def test_module_body_hash_changes_when_def_is_added():
+    one = parse_blob(b"def alpha():\n    return 1\n")
+    two = parse_blob(b"def alpha():\n    return 1\n\n\ndef beta():\n    return 2\n")
+    assert one.module_body_hash != two.module_body_hash

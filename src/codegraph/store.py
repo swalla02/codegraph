@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 WORKTREE = "WORKTREE"
 
@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS blobs (
     blob_sha TEXT PRIMARY KEY,
     status TEXT NOT NULL,
     error TEXT,
-    parser_version TEXT NOT NULL
+    parser_version TEXT NOT NULL,
+    module_body_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS blob_nodes (
     blob_sha TEXT NOT NULL,
