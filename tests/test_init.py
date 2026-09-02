@@ -249,13 +249,19 @@ def test_init_on_a_missing_path_fails_with_one_line(tmp_path, capsys):
 def test_init_on_a_read_only_directory_reports_instead_of_crashing(repo, capsys):
     """A repo checked out read-only (a CI cache, a mounted volume) must
     produce a named, one-line failure per file and a nonzero exit -- not a
-    PermissionError traceback, and not a half-written AGENTS.md."""
+    PermissionError traceback, and not a half-written AGENTS.md.
+
+    Both files are named, not just the first: a failure is isolated to the
+    file it happened on, so the user learns everything that needs fixing in
+    one run rather than one error per re-run.
+    """
     repo.chmod(0o555)
     try:
         assert main(["init", "--path", str(repo)]) == 1
         err = capsys.readouterr().err
-        assert "AGENTS.md" in err
         assert "Traceback" not in err
+        skipped = [line for line in err.splitlines() if line.startswith("skipped")]
+        assert [line.split()[1] for line in skipped] == ["AGENTS.md", CONFIG_NAME]
         assert not (repo / "AGENTS.md").exists()
     finally:
         repo.chmod(0o755)
