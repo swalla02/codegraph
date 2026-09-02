@@ -197,6 +197,30 @@ class _Collector(ast.NodeVisitor):
             )
         self.generic_visit(node)
 
+    def visit_Global(self, node: ast.Global) -> None:
+        self._record_global(node, node.names)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        self._record_global(node, node.names)
+
+    def _record_global(self, node: ast.AST, names: list[str]) -> None:
+        # `global`/`nonlocal` both bind the name to an outer scope, so a
+        # write to it after this statement is a mutation of shared state --
+        # GLOBAL_MUTATE has no catalog pattern to match against; this is
+        # the syntactic detection Task 10 hooks into.
+        owner = self._current_owner.removesuffix(".<locals>")
+        for name in names:
+            self.refs.append(
+                ParsedRef(
+                    ordinal=len(self.refs),
+                    from_qualname=owner,
+                    ref_kind="global",
+                    raw_name=name,
+                    dotted=None,
+                    line=node.lineno,
+                )
+            )
+
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             self.imports.append(

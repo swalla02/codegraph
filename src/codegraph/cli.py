@@ -8,6 +8,8 @@ from pathlib import Path
 
 from codegraph import __version__, gitio
 from codegraph.indexer import FsTreeSource, GitTreeSource, Indexer
+from codegraph.query.effects import effects_report
+from codegraph.render import render_json, render_text
 from codegraph.resolve import find_symbol
 from codegraph.store import WORKTREE, Store
 
@@ -71,6 +73,28 @@ def _cmd_resolve(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _cmd_effects(args: argparse.Namespace) -> int:
+    """Report the side effects transitively reachable from a symbol."""
+    root = Path(args.path).resolve()
+    store, indexer = open_workspace(root)
+    try:
+        indexer.reconcile(args.rev)
+        matches = find_symbol(store, args.rev, args.symbol)
+        if not matches:
+            print(f"no symbol matching {args.symbol!r}", file=sys.stderr)
+            return 1
+        if len(matches) > 1:
+            print(f"ambiguous symbol {args.symbol!r}:", file=sys.stderr)
+            for row in matches:
+                print(f"  {row['id']}", file=sys.stderr)
+            return 2
+        report = effects_report(store, args.rev, matches[0]["id"])
+        print(render_json(report) if args.json else render_text(report))
+        return 0
+    finally:
+        store.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codegraph")
     parser.add_argument("--version", action="version", version=__version__)
@@ -97,6 +121,15 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
     resolve_parser.add_argument("--rev", default=WORKTREE, help="Revision to resolve against")
     resolve_parser.set_defaults(handler=_cmd_resolve)
+
+    effects_parser = subparsers.add_parser(
+        "effects", help="Report side effects reachable from a symbol"
+    )
+    effects_parser.add_argument("symbol", help="Node id, qualname, or trailing name")
+    effects_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    effects_parser.add_argument("--rev", default=WORKTREE, help="Revision to query")
+    effects_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    effects_parser.set_defaults(handler=_cmd_effects)
 
     return parser
 

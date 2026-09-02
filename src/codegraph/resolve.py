@@ -186,6 +186,53 @@ class ResolveStats:
     unresolved: int = 0
 
 
+def build_import_maps(
+    connection: sqlite3.Connection, rev: str, config: Config
+) -> tuple[dict[str, dict[str, str]], dict[str, set[str]]]:
+    """Per-path local-alias -> absolute-dotted-module map, and the set of
+    modules each path imports (feeds `dependents()`).
+
+    The one place a raw `import`/`from ... import` row -- with its
+    relative-import `level` -- gets expanded into an absolute dotted module
+    name. Both the resolver (`_SymbolTable`, below) and effect detection's
+    catalog expansion (`effects/detect.py`) build on this rather than each
+    repeating the expansion, so the two cannot silently drift apart.
+    """
+    paths = [
+        row["path"]
+        for row in connection.execute("SELECT DISTINCT path FROM tree WHERE rev=?", (rev,))
+    ]
+    module_for = {path: module_for_path(path, config.source_roots) for path in paths}
+    alias_maps: dict[str, dict[str, str]] = {path: {} for path in paths}
+    imported_modules: dict[str, set[str]] = {path: set() for path in paths}
+
+    rows = connection.execute(
+        "SELECT t.path, i.module, i.level, i.name, i.alias FROM blob_imports i"
+        " JOIN tree t ON t.blob_sha = i.blob_sha WHERE t.rev=? ORDER BY t.path, i.ordinal",
+        (rev,),
+    )
+    for row in rows:
+        path = row["path"]
+        alias_map = alias_maps[path]
+        modules = imported_modules[path]
+        package = package_for_module(module_for[path], path)
+        module = absolute_module(row["module"], row["level"], package)
+        if row["name"] is None:
+            # `import a.b` / `import a.b as c`: the alias names the module,
+            # and a plain import also makes the full dotted path usable.
+            alias_map[row["alias"] or module] = module
+            if row["alias"] is None:
+                alias_map.setdefault(module.partition(".")[0], module.partition(".")[0])
+        else:
+            target = f"{module}.{row['name']}" if module else row["name"]
+            alias_map[row["alias"] or row["name"]] = target
+            # `from a.b import c` may name a module or a symbol; record both.
+            modules.add(target)
+        if module:
+            modules.add(module)
+    return alias_maps, imported_modules
+
+
 class _SymbolTable:
     """The revision's live symbol table, plus the per-file import maps."""
 
@@ -235,37 +282,7 @@ class _SymbolTable:
             if found:
                 self.enclosing_class[row["id"]] = found
 
-        self.import_maps: dict[str, dict[str, str]] = {path: {} for path in self.paths}
-        self.imported_modules: dict[str, set[str]] = {path: set() for path in self.paths}
-        self._build_imports(connection, rev)
-
-    def _build_imports(self, connection: sqlite3.Connection, rev: str) -> None:
-        """One pass over the revision's imports, expanding relative ones."""
-        rows = connection.execute(
-            "SELECT t.path, i.module, i.level, i.name, i.alias FROM blob_imports i"
-            " JOIN tree t ON t.blob_sha = i.blob_sha"
-            " WHERE t.rev=? ORDER BY t.path, i.ordinal",
-            (rev,),
-        )
-        for row in rows:
-            path = row["path"]
-            alias_map = self.import_maps[path]
-            modules = self.imported_modules[path]
-            package = package_for_module(self.module_for[path], path)
-            module = absolute_module(row["module"], row["level"], package)
-            if row["name"] is None:
-                # `import a.b` / `import a.b as c`: the alias names the module,
-                # and a plain import also makes the full dotted path usable.
-                alias_map[row["alias"] or module] = module
-                if row["alias"] is None:
-                    alias_map.setdefault(module.partition(".")[0], module.partition(".")[0])
-            else:
-                target = f"{module}.{row['name']}" if module else row["name"]
-                alias_map[row["alias"] or row["name"]] = target
-                # `from a.b import c` may name a module or a symbol; record both.
-                modules.add(target)
-            if module:
-                modules.add(module)
+        self.import_maps, self.imported_modules = build_import_maps(connection, rev, config)
 
     def context(self, rev: str, path: str, bases: dict[str, list[str]]) -> ResolveContext:
         return ResolveContext(
