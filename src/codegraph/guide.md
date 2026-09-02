@@ -1,8 +1,3 @@
----
-name: codegraph
-description: Use when about to modify a Python function or class, or when asked "what breaks if I change this", "what does this affect", "is this safe to change", or "what did this branch change" — answers with a ranked, git-native call graph instead of a grep.
----
-
 # codegraph
 
 `codegraph` is a sidecar index over a Python codebase (content-addressed by

@@ -76,3 +76,22 @@ def _subcommands(help_text):
     # argparse lists subcommands in a {a,b,c} block.
     match = re.search(r"\{([a-z,\-]+)\}", help_text)
     return match.group(1).split(",") if match else []
+
+
+def test_skill_md_is_the_generated_form_of_the_packaged_guide():
+    """`codegraph guide` and the plugin's SKILL.md must say the same thing,
+    forever.
+
+    They are one file: `src/codegraph/guide.md` is authored, and SKILL.md is
+    that plus the skill frontmatter. It has to be the package copy that is
+    canonical, because an installed codegraph ships `src/codegraph/` and
+    nothing else -- a `guide` reading SKILL.md out of the repo would work
+    from a checkout and fail on every real install.
+
+    If this fails, you edited SKILL.md directly. Edit
+    `src/codegraph/guide.md` instead and regenerate with
+    `uv run python -m codegraph.guide`.
+    """
+    from codegraph.guide import skill_text
+
+    assert (ROOT / "skills" / "codegraph" / "SKILL.md").read_text() == skill_text()

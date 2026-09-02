@@ -27,26 +27,61 @@ That also makes `codegraph diff` possible — the semantic delta of a branch:
 which symbols and edges changed, and which side effects newly became
 reachable.
 
-Built agent-first: a CLI, installable as a Claude Code plugin
-(`/plugin marketplace add swalla02/codegraph`), driven through `SKILL.md`
-rather than an MCP server (see "Why no MCP server" below), with a schema a
-visual navigator can project from later.
+Built agent-first: a CLI, driven through `AGENTS.md` (`codegraph init` writes
+the section, for any of the 25+ agents that read it) and through `SKILL.md`
+for Claude Code (`/plugin marketplace add swalla02/codegraph`), rather than an
+MCP server (see "Why no MCP server" below), with a schema a visual navigator
+can project from later.
 
 **Status:** implemented and in use. See
 [the design spec](docs/superpowers/specs/2026-08-29-codegraph-design.md) for
 the full rationale behind every decision below.
 
-## Install
+## Quickstart
 
-Requires Python 3.12+.
+Two commands, from a fresh machine to an agent that knows the tool exists:
 
 ```sh
-pip install /path/to/codegraph   # or: uv pip install /path/to/codegraph
+uv tool install --python 3.12 git+https://github.com/swalla02/codegraph
+cd /path/to/your/repo && codegraph init
 ```
 
-This installs the `codegraph` console script (`pyproject.toml`'s
-`[project.scripts]` entry point). Not yet published to PyPI — install from a
-checkout or a git URL until it is.
+**`--python 3.12` is not optional.** This tool needs Python 3.12+, and on a machine
+whose default interpreter is 3.11 — still the distro default nearly everywhere —
+the install fails outright rather than degrading. Passing the version explicitly
+makes `uv` fetch a suitable interpreter instead of failing on yours.
+
+`uv tool install` puts the `codegraph` console script (`pyproject.toml`'s
+`[project.scripts]` entry point) on `PATH` in its own isolated environment. Not
+yet published to PyPI, hence the git URL. From a local checkout, `uv pip install
+-e .` works the same way.
+
+### `codegraph init`
+
+`codegraph init` makes a repository's coding agents aware of codegraph, and is
+safe to re-run — it is idempotent, additive, and never overwrites content it
+did not write. It:
+
+- writes a short codegraph-owned section into `AGENTS.md` (creating the file if
+  needed), delimited by `<!-- codegraph:begin -->` / `<!-- codegraph:end -->`
+  so a later run updates that block in place instead of duplicating it. The
+  section is deliberately ~15 lines: it loads into *every* session of every
+  agent that reads `AGENTS.md`, so it names the commands and the trigger and
+  defers the rest to `codegraph guide`;
+- adds the documented `@AGENTS.md` import to `CLAUDE.md` **if that file already
+  exists**. It never creates one — for Claude Code the plugin below is strictly
+  better, because a skill loads on demand rather than into every session;
+- writes a fully commented-out `codegraph.toml` stub if there isn't one, and
+  never touches one there is.
+
+It does not install git hooks. That stays behind `install-hooks`, which you ask
+for by name.
+
+`AGENTS.md` is the cross-agent convention — Codex, Cursor, Gemini CLI, Copilot's
+coding agent, Aider, goose, opencode, Zed, Windsurf, Amp, Warp, Junie, Jules,
+Devin, RooCode, Kilo Code, Factory and others read it. Claude Code reads
+`CLAUDE.md` instead, which is what the `@AGENTS.md` import bridges
+([docs](https://code.claude.com/docs/en/memory)).
 
 ### As a Claude Code plugin
 
@@ -77,6 +112,8 @@ slower on a cold cache.
 | `codegraph impact <symbol> [--hops N] [--limit N] [--all] [--json]` | Report the ranked dependents of a symbol — everything a change to it could break. |
 | `codegraph diff [<base>..<head>] [--json]` | Report what changed between two revisions by content hash, never by line number: symbols added/removed/changed, plus any side effect newly reachable. Defaults to `merge-base(default branch, HEAD)..WORKTREE` — "what has this branch changed so far." |
 | `codegraph gc [--keep REV]` | Prune the Layer 1 parse cache down to what `HEAD`, the worktree, and any `--keep`-named revisions still reference. Never touches the graph itself, so it can only make a future answer slower to rebuild, never wrong. |
+| `codegraph init` | Make this repository's coding agents aware of codegraph: an `AGENTS.md` section, the `@AGENTS.md` bridge into an existing `CLAUDE.md`, and a commented `codegraph.toml` stub. Idempotent; never overwrites content it did not write; never touches `.git/`. |
+| `codegraph guide` | Print the agent-facing workflow to stdout — the same text the plugin ships as `SKILL.md`, so the short `AGENTS.md` section can defer to it rather than inline it. |
 | `codegraph install-hooks` | Install `post-commit`/`post-checkout`/`post-merge` git hooks that warm the cache in the background. Purely an optimization — every query reconciles the working tree itself regardless (see below), so results are identical whether or not a hook ever fires. |
 
 `resolve`, `impact`, and `effects` share one exit-code convention for
@@ -132,6 +169,11 @@ It lives at the repository root, not inside `.codegraph/`, because it is
 hand-written configuration meant to be committed and shared, whereas
 `.codegraph/` self-ignores and holds only derived cache: config is tracked,
 everything derived is disposable.
+
+`codegraph init` drops a fully commented-out version of this file, documenting
+every setting above with its default, if there isn't one already. It is inert
+until you uncomment something, and an existing `codegraph.toml` is never
+rewritten.
 
 ## Lazy refresh on query
 

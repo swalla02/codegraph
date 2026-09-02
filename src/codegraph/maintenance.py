@@ -22,6 +22,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from codegraph.markers import MalformedMarkerError, strip_marker_blocks
 from codegraph.store import Store
 
 _CHUNK = 400  # stays well under SQLite's default 999-variable limit per statement
@@ -49,15 +50,6 @@ _HOOK_BLOCK = f"""{_BEGIN_MARKER}
 # the allowlist of interpreters `_HOOK_BLOCK`'s POSIX-shell syntax is safe
 # to land inside; anything else is left completely untouched.
 _SHELL_INTERPRETERS = {"sh", "bash", "dash", "ash", "ksh", "zsh"}
-
-
-class _MalformedMarker(Exception):
-    """A codegraph marker line was found without its matching partner --
-    a lone BEGIN with no END, a lone END with no BEGIN, or two BEGINs
-    with no END between them. This is damage from a previous run gone
-    wrong, or a hand-edited file, and guessing how much surrounding
-    content to delete risks eating real statements. The caller must
-    refuse to touch the file, not repair around it."""
 
 
 def _chunks(items: list[str], size: int) -> list[list[str]]:
@@ -154,59 +146,6 @@ def _is_shell_shebang(shebang_line: str) -> bool:
     return _shebang_interpreter(shebang_line) in _SHELL_INTERPRETERS
 
 
-def _is_marker_line(line: str, marker: str) -> bool:
-    """True only if `line` (ignoring surrounding whitespace) is *exactly*
-    the marker, not merely a line that happens to contain it somewhere --
-    a hook whose own comment or quoted string mentions this marker text
-    must never be mistaken for a real block boundary."""
-    return line.strip() == marker
-
-
-def _strip_existing_blocks(text: str) -> str:
-    """Remove every complete codegraph block (a BEGIN marker line, its
-    contents, and the following END marker line -- matched as whole lines
-    only, never a substring inside a longer line). Loops until every
-    marker pair is gone, so a file carrying more than one block (an old
-    one left at the end plus a newer one spliced at the top, say) converges
-    to zero, not one-fewer.
-
-    Raises `_MalformedMarker` if the marker lines found don't pair up
-    cleanly -- a BEGIN with no following END, an END with no preceding
-    BEGIN, or two BEGINs with no END between them. The caller must treat
-    that as damage to leave alone, not a shape to repair by guessing.
-    """
-    lines = text.splitlines(keepends=True)
-    marker_positions = [
-        (index, "begin")
-        for index, line in enumerate(lines)
-        if _is_marker_line(line, _BEGIN_MARKER)
-    ] + [
-        (index, "end") for index, line in enumerate(lines) if _is_marker_line(line, _END_MARKER)
-    ]
-    marker_positions.sort()
-
-    blocks: list[tuple[int, int]] = []
-    pending_begin: int | None = None
-    for index, kind in marker_positions:
-        if kind == "begin":
-            if pending_begin is not None:
-                raise _MalformedMarker
-            pending_begin = index
-        else:
-            if pending_begin is None:
-                raise _MalformedMarker
-            blocks.append((pending_begin, index))
-            pending_begin = None
-    if pending_begin is not None:
-        raise _MalformedMarker
-
-    if not blocks:
-        return text
-
-    removed = {index for start, end in blocks for index in range(start, end + 1)}
-    return "".join(line for index, line in enumerate(lines) if index not in removed)
-
-
 def _insert_after_shebang(existing: str) -> str:
     """Splice `_HOOK_BLOCK` in as the first statement of the script, right
     after its shebang line so it always runs -- before any pre-existing
@@ -271,8 +210,8 @@ def _plan_one_hook(name: str, path: Path) -> HookResult:
         )
 
     try:
-        stripped = _strip_existing_blocks(existing)
-    except _MalformedMarker:
+        stripped = strip_marker_blocks(existing, _BEGIN_MARKER, _END_MARKER)
+    except MalformedMarkerError:
         return HookResult(
             name=name,
             path=path,
