@@ -32,3 +32,47 @@ def test_skill_documents_every_shipped_command():
     text = (ROOT / "skills" / "codegraph" / "SKILL.md").read_text()
     for command in ["codegraph resolve", "codegraph impact", "codegraph effects", "codegraph diff"]:
         assert command in text
+
+
+def test_every_command_the_readme_names_actually_exists():
+    """Pins the README's command names to the CLI's actual subcommands.
+
+    Prompted by the README opening on `impact_of(symbol)` and
+    `effects_of(symbol)` -- the API sketch from before the CLI existed, left
+    behind when it landed. Note this test would NOT have caught those two: they
+    were written without the `codegraph ` prefix, so nothing marked them as
+    commands at all. What it does catch is the ongoing case -- a command renamed
+    or removed while the README keeps advertising it, which is the way this
+    drifts once the names are written properly.
+    """
+    import re
+    from pathlib import Path
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    named = set(re.findall(r"codegraph ([a-z][a-z-]+)", readme))
+    assert named, "no commands found in the README -- has the format changed?"
+
+    help_text = _cli_help()
+    real = set(_subcommands(help_text))
+    assert named <= real, f"README names commands that do not exist: {sorted(named - real)}"
+
+
+def _cli_help():
+    import contextlib
+    import io
+
+    from codegraph.cli import main
+
+    # `main` builds its parser internally; --help is the supported way to see it.
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), contextlib.suppress(SystemExit):
+        main(["--help"])
+    return buffer.getvalue()
+
+
+def _subcommands(help_text):
+    import re
+
+    # argparse lists subcommands in a {a,b,c} block.
+    match = re.search(r"\{([a-z,\-]+)\}", help_text)
+    return match.group(1).split(",") if match else []

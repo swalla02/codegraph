@@ -6,11 +6,11 @@ code to import it.
 
 It answers two questions grep structurally cannot:
 
-- **`impact_of(symbol)`** — what transitively depends on this, ranked, with the
-  blast radius summarized rather than dumped.
-- **`effects_of(symbol)`** — does anything downstream write the database, hit
-  the network, touch the filesystem, or mutate global state — each claim backed
-  by a witness path to the exact `file:line` that causes it.
+- **`codegraph impact <symbol>`** — what transitively depends on this, ranked,
+  with the blast radius summarized rather than dumped.
+- **`codegraph effects <symbol>`** — does anything downstream write the
+  database, hit the network, touch the filesystem, or mutate global state —
+  each claim backed by a witness path to the exact `file:line` that causes it.
 
 Composed, they give the answer you actually want before a change: not "47 things
 call this," which is anxiety rather than information, but *"47 things call this,
