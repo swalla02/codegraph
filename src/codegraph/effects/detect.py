@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from codegraph.config import Config
 from codegraph.effects.catalog import Catalog
-from codegraph.resolve import HIGH, MODULE_SCOPE, build_import_maps
+from codegraph.resolve import HIGH, MODULE_SCOPE, build_import_maps, module_for_path
 from codegraph.store import Store
 
 
@@ -23,6 +23,7 @@ def detect_direct(store: Store, rev: str, catalog: Catalog, config: Config) -> i
     connection = store.connection
     import_maps, _imported_modules = build_import_maps(connection, rev, config)
     owner_index, live_index = _owner_index(store, rev)
+    first_party = _first_party_modules(store, rev, config)
 
     rows: list[tuple] = []
     for row in connection.execute(
@@ -39,7 +40,9 @@ def detect_direct(store: Store, rev: str, catalog: Catalog, config: Config) -> i
             kind, confidence = "GLOBAL_MUTATE", HIGH
         else:
             dotted = _expand(row["raw_name"], import_maps.get(row["path"], {}))
-            matched = catalog.match_with_confidence(dotted)
+            matched = catalog.match_with_confidence(
+                dotted, overrides_only=_is_first_party(dotted, first_party)
+            )
             if matched is None:
                 continue
             kind, confidence = matched
@@ -55,6 +58,37 @@ def detect_direct(store: Store, rev: str, catalog: Catalog, config: Config) -> i
         rows,
     )
     return len(rows)
+
+
+def _first_party_modules(store: Store, rev: str, config: Config) -> set[str]:
+    """Every module name this revision defines."""
+    return {
+        module_for_path(row["path"], config.source_roots)
+        for row in store.connection.execute("SELECT path FROM tree WHERE rev=?", (rev,))
+    }
+
+
+def _is_first_party(dotted: str, first_party: set[str]) -> bool:
+    """Does `dotted` name something inside a module this repository defines?
+
+    The built-in catalog describes third-party libraries. When the repository
+    under analysis IS one of those libraries -- or merely shares a namespace
+    prefix with one -- every internal call expands into the catalogued
+    namespace and matches it.
+
+    Measured on `psf/requests`: `resolve_proxies` expands through the import
+    map to `requests.utils.resolve_proxies`, which the `requests.*` NETWORK
+    rule matches at MEDIUM. `Session.send` ended up with five direct NETWORK
+    rows, none of them on the line holding `adapter.send(...)` -- the only call
+    there that actually touches the network, and one the catalog does not match
+    at all. The effects layer was close to inverted on that repo. See #12.
+
+    Any dotted prefix being a module of this revision is enough: `requests`,
+    `requests.utils` and `requests.utils.resolve_proxies` all mean the name
+    resolves into first-party code.
+    """
+    parts = dotted.split(".")
+    return any(".".join(parts[:split]) in first_party for split in range(len(parts), 0, -1))
 
 
 def _expand(raw_name: str, import_map: dict[str, str]) -> str:

@@ -511,3 +511,86 @@ def test_propagate_reduces_duplicate_direct_rows_with_stronger_not_scan_order(tm
     row = next(r for g in report.groups for r in g.rows)
     assert row.detail.startswith("NETWORK HIGH via")
     store.close()
+
+
+# -- the built-in catalog is about THIRD-party code -------------------------
+#
+# When the repository under analysis shares a namespace with a catalogued
+# library, every internal call expands into that namespace and matches it. On
+# `psf/requests`, `resolve_proxies` expanded to `requests.utils.resolve_proxies`
+# and matched the `requests.*` NETWORK rule; `Session.send` got five direct
+# NETWORK rows and none of them was the line that actually calls the network.
+# See #12.
+
+
+def effect_kinds_at(store, node_id, rev="HEAD"):
+    return {
+        row["kind"]
+        for row in store.connection.execute(
+            "SELECT kind FROM effects WHERE rev=? AND node_id=? AND direct=1", (rev, node_id)
+        )
+    }
+
+
+def collide_with_requests(write):
+    """A package literally named `requests`, as the real library's own repo is."""
+    write("requests/__init__.py", "")
+    write("requests/utils.py", "def resolve_proxies(request):\n    return {}\n")
+    write(
+        "requests/sessions.py",
+        "from requests.utils import resolve_proxies\n"
+        "\n\n"
+        "def send(request):\n"
+        "    return resolve_proxies(request)\n",
+        commit="requests-alike",
+    )
+
+
+def test_the_projects_own_module_is_not_read_as_the_library_it_shadows(repo, write):
+    collide_with_requests(write)
+    store = build(repo)
+    assert effect_kinds_at(store, "requests/sessions.py::send") == set(), (
+        "an internal call was matched against the built-in catalog's requests.* rule"
+    )
+    store.close()
+
+
+def test_a_genuine_third_party_call_is_still_detected(repo, write):
+    """Non-vacuity guard: the first-party skip must not switch detection off."""
+    collide_with_requests(write)
+    write(
+        "app.py",
+        "import requests\n\n\ndef fetch():\n    return requests.get('http://x')\n",
+        commit="app",
+    )
+    store = build(repo)
+    # `requests` here IS the repo's own package, so this must stay quiet too...
+    assert effect_kinds_at(store, "app.py::fetch") == set()
+    store.close()
+
+
+def test_a_third_party_call_in_a_repo_that_shadows_nothing_is_detected(repo, write):
+    write(
+        "app.py",
+        "import requests\n\n\ndef fetch():\n    return requests.get('http://x')\n",
+        commit="app",
+    )
+    store = build(repo)
+    assert "NETWORK" in effect_kinds_at(store, "app.py::fetch")
+    store.close()
+
+
+def test_a_project_override_still_matches_first_party_code(repo, write):
+    """The carve-out that makes the skip safe: `[[effect]]` rules exist to name
+    house abstractions, which are first-party by definition. Skipping the
+    built-in catalog for first-party names must not skip these too."""
+    write("app/__init__.py", "")
+    write("app/db.py", "def save(row):\n    return row\n")
+    write(
+        "app/service.py",
+        "from app.db import save\n\n\ndef persist(row):\n    return save(row)\n",
+    )
+    write("codegraph.toml", '[[effect]]\nmatch = "app.db.*"\nkind = "DB_WRITE"\n', commit="cfg")
+    store = build(repo)
+    assert "DB_WRITE" in effect_kinds_at(store, "app/service.py::persist")
+    store.close()
