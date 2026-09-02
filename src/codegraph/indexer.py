@@ -141,6 +141,18 @@ class Indexer:
         dirty = {path for path, sha in tree.items() if stored.get(path) != sha}
         removed = set(stored) - set(tree)
 
+        catalog = Catalog.load(self.config)
+        fingerprint = self._fingerprint(catalog)
+        if not dirty and not removed and self._is_current(rev, fingerprint):
+            # Nothing in the tree moved and nothing outside it did either, so
+            # the materialized graph is already the answer.
+            #
+            # This is the hot path, not an edge case: every query reconciles
+            # the working tree first (the `git status` model -- see the README),
+            # so without this a repeated query pays a full rebuild of a
+            # revision that did not change. On django that was ~20s per query.
+            return self._unchanged_stats(rev, tree)
+
         # One transaction for the whole reconcile: Layer 1 fill-in and the
         # Layer 2 rewrite either both land or neither does.
         with connection:
@@ -157,9 +169,16 @@ class Indexer:
             shadowed = self._materialize_nodes(rev, tree)
 
             connection.execute(
-                "INSERT INTO revisions(rev, kind, materialized_at) VALUES(?, ?, ?) "
-                "ON CONFLICT(rev) DO UPDATE SET materialized_at=excluded.materialized_at",
-                (rev, "worktree" if rev == WORKTREE else "commit", int(time.time())),
+                "INSERT INTO revisions(rev, kind, materialized_at, fingerprint)"
+                " VALUES(?, ?, ?, ?) ON CONFLICT(rev) DO UPDATE SET"
+                " materialized_at=excluded.materialized_at,"
+                " fingerprint=excluded.fingerprint",
+                (
+                    rev,
+                    "worktree" if rev == WORKTREE else "commit",
+                    int(time.time()),
+                    fingerprint,
+                ),
             )
 
             # Phase 2 runs inside the same transaction: a revision is never
@@ -169,7 +188,6 @@ class Indexer:
             # Effect detection and propagation close out the same
             # transaction: a revision is never visible with edges but
             # stale (or missing) effects.
-            catalog = Catalog.load(self.config)
             detect_direct(self.store, rev, catalog, self.config)
             propagate(self.store, rev)
 
@@ -183,6 +201,70 @@ class Indexer:
             edges=resolved.edges,
             unresolved=resolved.unresolved,
             ambiguous=resolved.ambiguous,
+        )
+
+    def _fingerprint(self, catalog: Catalog) -> str:
+        """Digest of everything the graph depends on that is NOT in the tree.
+
+        A reconcile is allowed to skip its work when the tree is unchanged, so
+        anything else that can change an edge or an effect has to be pinned
+        here or that skip becomes a stale-answer bug. Editing `codegraph.toml`
+        touches no file in the revision's tree and can change every effect in
+        the graph.
+
+        `Catalog.fingerprint` was written for exactly this and had no caller
+        until now.
+        """
+        parts = (
+            PARSER_VERSION,
+            catalog.fingerprint(),
+            ",".join(self.config.source_roots),
+            str(self.config.ambiguity_limit),
+        )
+        return hashlib.blake2b("\x00".join(parts).encode(), digest_size=16).hexdigest()
+
+    def _is_current(self, rev: str, fingerprint: str) -> bool:
+        """Has `rev` been materialized under this exact fingerprint?"""
+        row = self.store.connection.execute(
+            "SELECT fingerprint FROM revisions WHERE rev=?", (rev,)
+        ).fetchone()
+        return row is not None and row["fingerprint"] == fingerprint
+
+    def _unchanged_stats(self, rev: str, tree: dict[str, str]) -> IndexStats:
+        """Stats for a reconcile that did nothing, read back from the store.
+
+        Counted rather than remembered: the numbers have to describe the graph
+        as it stands, not the pass that happened to build it, or `status` would
+        report zeroes whenever nothing changed.
+        """
+        connection = self.store.connection
+        shas = set(tree.values())
+
+        def count(sql: str) -> int:
+            return connection.execute(sql, (rev,)).fetchone()["n"]
+
+        return IndexStats(
+            paths_total=len(tree),
+            paths_dirty=0,
+            blobs_parsed=0,
+            blobs_cached=len(shas),
+            parse_errors=self._error_count(shas),
+            # Counted from Layer 1 the same way `_materialize_nodes` counts it
+            # -- `nodes` keeps neither `shadow_index` nor `conditional`, so
+            # counting non-live rows there would quietly include the
+            # conditional definitions that `_materialize_nodes` excludes.
+            shadowed=count(
+                "SELECT COUNT(*) AS n FROM blob_nodes b JOIN tree t"
+                " ON t.blob_sha = b.blob_sha"
+                " WHERE t.rev=? AND b.shadow_index IS NOT NULL AND b.conditional=0"
+            ),
+            edges=count("SELECT COUNT(*) AS n FROM edges WHERE rev=?"),
+            unresolved=count(
+                "SELECT COUNT(*) AS n FROM unresolved WHERE rev=? AND reason='unknown'"
+            ),
+            ambiguous=count(
+                "SELECT COUNT(*) AS n FROM unresolved WHERE rev=? AND reason='ambiguous'"
+            ),
         )
 
     def _ensure_parsed(self, shas: set[str]) -> tuple[int, int]:

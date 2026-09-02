@@ -30,7 +30,18 @@ def dump_graph(store, rev):
         "unresolved": sorted(
             tuple(row)
             for row in connection.execute(
-                "SELECT path, raw_name FROM unresolved WHERE rev=?", (rev,)
+                "SELECT path, raw_name, ref_kind, reason FROM unresolved WHERE rev=?", (rev,)
+            )
+        ),
+        # Effects are part of the materialized revision, so they belong in the
+        # equivalence too. Leaving them out left the incremental-vs-cold net
+        # with a hole exactly where detection and propagation are narrowed.
+        "effects": sorted(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT node_id, kind, direct, evidence_path, evidence_line, confidence"
+                " FROM effects WHERE rev=?",
+                (rev,),
             )
         ),
     }
@@ -301,3 +312,116 @@ def test_no_single_reference_is_expanded_past_the_ambiguity_limit(repo, write):
     worst = max(row["n"] for row in rows)
     assert worst <= DEFAULT_AMBIGUITY_LIMIT, f"a single call site produced {worst} edges"
     store.close()
+
+
+# -- a reconcile that has nothing to do costs nothing ------------------------
+#
+# Every query reconciles the working tree first (the `git status` model), so a
+# repeated query used to pay a full rebuild of a revision that had not changed:
+# ~86s per query on django, ~2s on flask. See #7.
+
+
+def resolve_calls(monkeypatch):
+    """Count how many times `reconcile` reaches phase 2."""
+    import codegraph.indexer as indexer_module
+
+    calls = []
+    original = indexer_module.resolve_revision
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(indexer_module, "resolve_revision", spy)
+    return calls
+
+
+def test_reconciling_an_unchanged_tree_does_no_work(repo, write, monkeypatch):
+    write(
+        "m.py",
+        "import requests\n"
+        "\n\n"
+        "def fetch():\n"
+        "    requests.get('u')\n"
+        "\n\n"
+        "def caller():\n"
+        "    fetch()\n",
+        commit="m",
+    )
+    store = Store.open(repo)
+    indexer = Indexer(repo, store, GitTreeSource(repo))
+    indexer.reconcile(WORKTREE)
+
+    calls = resolve_calls(monkeypatch)
+    before = dump_graph(store, WORKTREE)
+    stats = indexer.reconcile(WORKTREE)
+
+    assert calls == [], "an unchanged tree was re-resolved"
+    assert dump_graph(store, WORKTREE) == before
+    # The numbers must still describe the graph, not the pass that skipped.
+    assert stats.paths_total == 2
+    assert stats.edges > 0
+    store.close()
+
+
+def test_a_real_edit_still_rebuilds(repo, write, monkeypatch):
+    """Non-vacuity guard for the skip above."""
+    store = Store.open(repo)
+    indexer = Indexer(repo, store, GitTreeSource(repo))
+    indexer.reconcile(WORKTREE)
+
+    calls = resolve_calls(monkeypatch)
+    write("a.py", "def alpha():\n    return 99\n")
+    indexer.reconcile(WORKTREE)
+    assert calls == [1]
+    store.close()
+
+
+def test_editing_the_config_invalidates_even_though_no_tracked_file_changed(repo, write):
+    """`codegraph.toml` is tracked, so editing it does change the tree -- but
+    the point stands for what the fingerprint protects: the graph depends on
+    inputs the tree diff alone cannot see."""
+    write("app/__init__.py", "")
+    write("app/db.py", "def save(row):\n    return row\n")
+    write(
+        "app/service.py",
+        "from app.db import save\n\n\ndef persist(row):\n    return save(row)\n",
+        commit="app",
+    )
+    store = Store.open(repo)
+    Indexer(repo, store, GitTreeSource(repo)).reconcile(WORKTREE)
+    assert not _effect_kinds(store, "app/service.py::persist")
+
+    (repo / "codegraph.toml").write_text('[[effect]]\nmatch = "app.db.*"\nkind = "DB_WRITE"\n')
+    # A NEW indexer, so the config is re-read -- the store is the same one.
+    Indexer(repo, store, GitTreeSource(repo)).reconcile(WORKTREE)
+    assert "DB_WRITE" in _effect_kinds(store, "app/service.py::persist")
+    store.close()
+
+
+def test_an_untracked_config_change_still_invalidates(repo, write):
+    """The fingerprint's real job. An untracked `codegraph.toml` is invisible to
+    the tree diff (`git status` does not list it into the tree source), so
+    without the fingerprint the reconcile would skip and keep serving a graph
+    built under the old catalog."""
+    write("m.py", "def house_call():\n    pass\n\n\ndef caller():\n    house_call()\n", commit="m")
+    (repo / ".gitignore").write_text("codegraph.toml\n")
+    store = Store.open(repo)
+    Indexer(repo, store, GitTreeSource(repo)).reconcile(WORKTREE)
+    assert not _effect_kinds(store, "m.py::caller")
+
+    (repo / "codegraph.toml").write_text('[[effect]]\nmatch = "house_call"\nkind = "DB_WRITE"\n')
+    Indexer(repo, store, GitTreeSource(repo)).reconcile(WORKTREE)
+    assert "DB_WRITE" in _effect_kinds(store, "m.py::caller"), (
+        "an ignored config change was skipped by the unchanged-tree fast path"
+    )
+    store.close()
+
+
+def _effect_kinds(store, node_id, rev=WORKTREE):
+    return {
+        row["kind"]
+        for row in store.connection.execute(
+            "SELECT kind FROM effects WHERE rev=? AND node_id=?", (rev, node_id)
+        )
+    }

@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 WORKTREE = "WORKTREE"
 
@@ -63,11 +63,17 @@ CREATE TABLE IF NOT EXISTS blob_imports (
 );
 
 -- Layer 2: materialized per revision, evictable.
+-- `fingerprint` pins everything OUTSIDE the tree that the materialized graph
+-- depends on: parser version, source roots, ambiguity limit, and the effect
+-- catalog's own digest. A reconcile whose tree is unchanged can only skip its
+-- work if these are unchanged too -- editing codegraph.toml changes no file in
+-- the tree but can change every edge and every effect.
 CREATE TABLE IF NOT EXISTS revisions (
     rev TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
     materialized_at INTEGER NOT NULL,
-    pinned INTEGER NOT NULL DEFAULT 0
+    pinned INTEGER NOT NULL DEFAULT 0,
+    fingerprint TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS tree (
     rev TEXT NOT NULL, path TEXT NOT NULL, blob_sha TEXT NOT NULL,
