@@ -123,9 +123,11 @@ class Catalog:
         )
         return cls(builtin_rules + override_rules, len(override_rules))
 
-    def _best_match(self, dotted: str) -> _Compiled | None:
+    def _best_match(self, dotted: str, *, overrides_only: bool = False) -> _Compiled | None:
         best: _Compiled | None = None
         for compiled in self._compiled:
+            if overrides_only and not compiled.is_override:
+                continue
             if not compiled.regex.match(dotted):
                 continue
             key = (compiled.prefix_len, compiled.is_override, compiled.rule.match)
@@ -136,12 +138,14 @@ class Catalog:
                 best = compiled
         return best
 
-    def match(self, dotted: str) -> str | None:
+    def match(self, dotted: str, *, overrides_only: bool = False) -> str | None:
         """The kind of the best-matching rule for `dotted`, or None."""
-        best = self._best_match(dotted)
+        best = self._best_match(dotted, overrides_only=overrides_only)
         return best.rule.kind if best else None
 
-    def match_with_confidence(self, dotted: str) -> tuple[str, str] | None:
+    def match_with_confidence(
+        self, dotted: str, *, overrides_only: bool = False
+    ) -> tuple[str, str] | None:
         """(kind, confidence) for the best-matching rule, or `None`.
 
         Confidence falls out of the winning rule's match specificity -- the
@@ -156,8 +160,16 @@ class Catalog:
         `confidence` field for the rare case where specificity of the NAME
         match doesn't track certainty of the KIND assigned to it (see
         `Rule.confidence`).
+
+        `overrides_only` restricts matching to the project's own `[[effect]]`
+        rules, skipping the built-in catalog. Callers pass it for a name that
+        belongs to a module THIS repository defines: the built-in catalog
+        describes third-party libraries, and applying it to first-party code
+        misreads the project's own functions as library calls. Project
+        overrides stay eligible, because naming house abstractions is exactly
+        what they are for. See `detect.py` and issue #12.
         """
-        best = self._best_match(dotted)
+        best = self._best_match(dotted, overrides_only=overrides_only)
         if best is None:
             return None
         if best.rule.confidence is not None:
