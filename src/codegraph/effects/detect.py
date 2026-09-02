@@ -18,20 +18,40 @@ from codegraph.resolve import HIGH, MODULE_SCOPE, build_import_maps, module_for_
 from codegraph.store import Store
 
 
-def detect_direct(store: Store, rev: str, catalog: Catalog, config: Config) -> int:
-    """Tag every ref in `rev` that is a direct effect. Returns rows written."""
+def detect_direct(
+    store: Store,
+    rev: str,
+    catalog: Catalog,
+    config: Config,
+    only_paths: set[str] | None = None,
+) -> int:
+    """Tag every ref in `rev` that is a direct effect. Returns rows written.
+
+    `only_paths` re-detects just those paths, leaving other paths' direct rows
+    alone. Direct detection is per-reference and reads nothing outside the file
+    a reference sits in except the import map, so narrowing it is sound whenever
+    those files' contents are the only thing that changed. Propagation is a
+    separate, still-global pass -- an effect flows along edges and cannot be
+    narrowed the same way.
+    """
     connection = store.connection
     import_maps, _imported_modules = build_import_maps(connection, rev, config)
     owner_index, live_index = _owner_index(store, rev)
     first_party = _first_party_modules(store, rev, config)
 
-    rows: list[tuple] = []
-    for row in connection.execute(
+    sql = (
         "SELECT t.path AS path, r.from_qualname, r.ref_kind, r.raw_name, r.line"
         " FROM blob_refs r JOIN tree t ON t.blob_sha = r.blob_sha"
-        " WHERE t.rev=? AND r.ref_kind IN ('call', 'global')",
-        (rev,),
-    ):
+        " WHERE t.rev=? AND r.ref_kind IN ('call', 'global')"
+    )
+    args: tuple = (rev,)
+    if only_paths is not None:
+        paths = sorted(only_paths)
+        sql += f" AND t.path IN ({','.join('?' * len(paths))})"
+        args += tuple(paths)
+
+    rows: list[tuple] = []
+    for row in connection.execute(sql, args):
         if row["ref_kind"] == "global":
             # Syntactic detection (assignment to a name declared `global`/
             # `nonlocal`), not a catalog match -- there is no pattern
@@ -51,7 +71,15 @@ def detect_direct(store: Store, rev: str, catalog: Catalog, config: Config) -> i
         )
         rows.append((rev, node_id, kind, 1, row["path"], row["line"], confidence))
 
-    connection.execute("DELETE FROM effects WHERE rev=? AND direct=1", (rev,))
+    if only_paths is None:
+        connection.execute("DELETE FROM effects WHERE rev=? AND direct=1", (rev,))
+    else:
+        paths = sorted(only_paths)
+        connection.execute(
+            "DELETE FROM effects WHERE rev=? AND direct=1 AND evidence_path IN"
+            f" ({','.join('?' * len(paths))})",
+            (rev, *paths),
+        )
     connection.executemany(
         "INSERT INTO effects(rev, node_id, kind, direct, evidence_path, evidence_line,"
         " confidence) VALUES(?,?,?,?,?,?,?)",

@@ -1,4 +1,12 @@
-from codegraph.parse import parse_blob
+import ast
+import copy
+
+from codegraph.parse import (
+    _body_hash,
+    _class_body_hash,
+    _module_body_hash,
+    parse_blob,
+)
 
 
 def qualnames(result):
@@ -273,3 +281,120 @@ def test_module_body_hash_changes_when_def_is_added():
     one = parse_blob(b"def alpha():\n    return 1\n")
     two = parse_blob(b"def alpha():\n    return 1\n\n\ndef beta():\n    return 2\n")
     assert one.module_body_hash != two.module_body_hash
+
+
+# -- body hashing is a persistent transform, not a deep copy ----------------
+#
+# `_elide_children` replaced a `deepcopy` + `NodeTransformer` pair. The copy was
+# quadratic in practice -- a module deep-copied once, then every class inside it
+# deep-copied again for its own hash -- and cost 4.8s to parse django's largest
+# test module, 3.8s of it inside `copy.deepcopy`. That put the "parse is
+# proportional to the diff" half of the cost guarantee on the wrong side of a
+# one-file edit. See #7.
+#
+# The reference implementation below is the code that was replaced. It is kept
+# as an oracle: the rewrite had to produce byte-identical hashes, or every
+# `body_hash` in every store would change meaning. Verified equal over all 2,929
+# modules and 11,072 classes of django before landing; this pins the property on
+# inputs a unit test can carry.
+
+
+class _ReferenceElider(ast.NodeTransformer):
+    """The pre-rewrite implementation, kept only to check the new one."""
+
+    def _elide(self, node):
+        clone = copy.copy(node)
+        clone.body = [ast.Pass()]
+        return clone
+
+    def visit_FunctionDef(self, node):
+        return self._elide(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        return self._elide(node)
+
+
+def _reference_module_hash(tree):
+    return _body_hash(_ReferenceElider().visit(copy.deepcopy(tree)))
+
+
+def _reference_class_hash(node):
+    skeleton = copy.deepcopy(node)
+    _ReferenceElider().generic_visit(skeleton)
+    return _body_hash(skeleton)
+
+
+NASTY_SOURCE = '''
+import os
+from a import b as c
+
+CONST = [1, 2, {"k": (3, 4)}]
+
+@decorated(arg=1)
+async def top(a, *args, b: int = 2, **kw) -> None:
+    """doc"""
+    def closure():
+        return 1
+    class Inner:
+        def deep(self):
+            return closure()
+    return Inner
+
+
+class Outer(Base, metaclass=Meta):
+    """doc"""
+    attr = 1
+
+    class Nested:
+        def method(self):
+            if True:
+                def deeper():
+                    pass
+            return 2
+
+    async def amethod(self):
+        async with x:
+            pass
+
+    @property
+    def prop(self):
+        return self.attr
+
+
+if os.environ:
+    def conditional():
+        pass
+else:
+    class AlsoConditional:
+        pass
+
+try:
+    from d import e
+except ImportError:
+    e = None
+'''
+
+
+def test_the_rewritten_body_hash_matches_the_implementation_it_replaced():
+    tree = ast.parse(NASTY_SOURCE)
+    assert _module_body_hash(tree) == _reference_module_hash(tree)
+    classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+    assert len(classes) >= 4, "fixture stopped covering nested and conditional classes"
+    for node in classes:
+        assert _class_body_hash(node) == _reference_class_hash(node), node.name
+
+
+def test_hashing_does_not_mutate_the_tree_it_is_given():
+    """The whole reason the old code deep-copied. If the transform ever starts
+    writing back into the original, the second hash of the same tree differs
+    from the first and every cached `body_hash` silently rots."""
+    tree = ast.parse(NASTY_SOURCE)
+    before = ast.dump(tree)
+    first = _module_body_hash(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            _class_body_hash(node)
+    assert ast.dump(tree) == before
+    assert _module_body_hash(tree) == first

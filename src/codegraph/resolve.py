@@ -426,14 +426,25 @@ def _nearest_class(path: str, qualname: str, class_ids: dict[tuple[str, str], st
     return None
 
 
-def _refs_by_path(store: Store, rev: str, ref_kind: str) -> dict[str, list[ParsedRef]]:
-    """Every reference of one kind in the revision, grouped by owning path."""
-    rows = store.connection.execute(
+def _refs_by_path(
+    store: Store, rev: str, ref_kind: str, only_paths: list[str] | None = None
+) -> dict[str, list[ParsedRef]]:
+    """References of one kind, grouped by owning path.
+
+    `only_paths` restricts the scan itself, not just the loop over the result:
+    a narrowed resolve that still read every reference in the repository would
+    be proportional to repo size in the one place the narrowing exists to fix.
+    """
+    sql = (
         "SELECT t.path, r.ordinal, r.from_qualname, r.ref_kind, r.raw_name, r.dotted, r.line"
         " FROM blob_refs r JOIN tree t ON t.blob_sha = r.blob_sha"
-        " WHERE t.rev=? AND r.ref_kind=? ORDER BY t.path, r.ordinal",
-        (rev, ref_kind),
+        " WHERE t.rev=? AND r.ref_kind=?"
     )
+    args: tuple = (rev, ref_kind)
+    if only_paths is not None:
+        sql += f" AND t.path IN ({','.join('?' * len(only_paths))})"
+        args += tuple(only_paths)
+    rows = store.connection.execute(sql + " ORDER BY t.path, r.ordinal", args)
     grouped: dict[str, list[ParsedRef]] = {}
     for row in rows:
         grouped.setdefault(row["path"], []).append(
@@ -503,15 +514,41 @@ def split_by_ambiguity_limit(
     return [hit for hit in hits if hit[1] != LOW], len(weak)
 
 
+def _load_bases(connection: sqlite3.Connection, rev: str) -> dict[str, list[str]]:
+    """Rebuild the class hierarchy from already-materialized INHERITS edges.
+
+    Only HIGH links feed the MRO walk, which is exactly the filter the
+    inheritance pass applies when it builds this map from scratch, so reading it
+    back is equivalent -- provided the base references it was built from have
+    not changed. That is a precondition the caller checks before narrowing; see
+    `Indexer._narrowable`.
+    """
+    bases: dict[str, list[str]] = {}
+    for row in connection.execute(
+        "SELECT src, dst FROM edges WHERE rev=? AND kind='INHERITS' AND confidence='HIGH'",
+        (rev,),
+    ):
+        bases.setdefault(row["src"], []).append(row["dst"])
+    return bases
+
+
 def resolve_revision(
-    store: Store, rev: str, config: Config, resolver: Resolver | None = None
+    store: Store,
+    rev: str,
+    config: Config,
+    resolver: Resolver | None = None,
+    only_paths: set[str] | None = None,
 ) -> ResolveStats:
     """Rewrite `edges`, `imports` and `unresolved` for one revision.
 
-    Still re-resolves the whole revision rather than narrowing to
-    `dependents()`: a whole-revision rewrite cannot leave a stale edge behind.
-    That is the one half of the cost guarantee this does not yet honour --
-    tracked, and stated in the README rather than glossed.
+    `only_paths` narrows the rewrite to those paths, leaving every other path's
+    rows in place. That is sound only when the revision's symbol table is
+    unchanged outside them -- a definition appearing or disappearing anywhere
+    changes what bare-name calls in unrelated files can match, and a changed
+    base class changes `self.X` resolution in every subclass, wherever it
+    lives. The caller owns that check (`Indexer._narrowable`); this function
+    trusts it. Passing `None` rewrites the whole revision, which cannot leave a
+    stale edge behind under any circumstances.
 
     `config.ambiguity_limit` bounds how many indistinguishable LOW candidates a
     single reference will be expanded into; past it the reference is recorded
@@ -522,14 +559,32 @@ def resolve_revision(
     limit = config.ambiguity_limit
     table = _SymbolTable(store, rev, config)
 
-    connection.execute("DELETE FROM edges WHERE rev=?", (rev,))
-    connection.execute("DELETE FROM imports WHERE rev=?", (rev,))
-    connection.execute("DELETE FROM unresolved WHERE rev=?", (rev,))
+    if only_paths is None:
+        target_paths = table.paths
+        bases: dict[str, list[str]] = {}
+        connection.execute("DELETE FROM edges WHERE rev=?", (rev,))
+        connection.execute("DELETE FROM imports WHERE rev=?", (rev,))
+        connection.execute("DELETE FROM unresolved WHERE rev=?", (rev,))
+    else:
+        target_paths = [path for path in table.paths if path in only_paths]
+        # Read the hierarchy back BEFORE deleting the edges it is derived from.
+        bases = _load_bases(connection, rev)
+        marks = ",".join("?" * len(target_paths))
+        args = (rev, *target_paths)
+        connection.execute(
+            f"DELETE FROM edges WHERE rev=? AND callsite_path IN ({marks})", args
+        )
+        connection.execute(
+            f"DELETE FROM imports WHERE rev=? AND importer_path IN ({marks})", args
+        )
+        connection.execute(f"DELETE FROM unresolved WHERE rev=? AND path IN ({marks})", args)
+    scan_paths = None if only_paths is None else target_paths
+
     connection.executemany(
         "INSERT INTO imports(rev, importer_path, module) VALUES(?, ?, ?)",
         [
             (rev, path, module)
-            for path in table.paths
+            for path in target_paths
             for module in sorted(table.imported_modules[path])
         ],
     )
@@ -541,9 +596,8 @@ def resolve_revision(
 
     # Inheritance first: `self.X` walks the class hierarchy, so the hierarchy
     # has to exist before any call is resolved.
-    bases: dict[str, list[str]] = {}
-    base_refs = _refs_by_path(store, rev, "base")
-    for path in table.paths:
+    base_refs = _refs_by_path(store, rev, "base", scan_paths)
+    for path in target_paths:
         ctx = table.context(rev, path, bases)
         for ref in base_refs.get(path, ()):
             src = _source_id(ref, table, path)
@@ -561,7 +615,7 @@ def resolve_revision(
                 # Only a certain link feeds the MRO walk, which claims HIGH.
                 # A weaker one still gets its edge, and a `self.X` that misses
                 # the walk falls through to the repo-wide name match anyway.
-                if confidence == HIGH:
+                if confidence == HIGH and only_paths is None:
                     bases.setdefault(src, []).append(node_id)
             if ambiguous_count:
                 ambiguous_rows.append(
@@ -579,8 +633,8 @@ def resolve_revision(
     # runs once per class for the whole revision rather than once per reference.
     descendant_cache: dict[str, list[str]] = {}
 
-    call_refs = _refs_by_path(store, rev, "call")
-    for path in table.paths:
+    call_refs = _refs_by_path(store, rev, "call", scan_paths)
+    for path in target_paths:
         ctx = table.context(rev, path, bases, subclasses, descendant_cache)
         for ref in call_refs.get(path, ()):
             src = _source_id(ref, table, path)
@@ -616,10 +670,17 @@ def resolve_revision(
         " VALUES(?, ?, ?, ?, ?, ?, ?)",
         unresolved_rows + ambiguous_rows + builtin_rows,
     )
+    # Counted over the whole revision, not over this pass: a narrowed rewrite
+    # touches a handful of paths but `status` has to describe the whole graph.
+    def total(sql: str) -> int:
+        return connection.execute(sql, (rev,)).fetchone()["n"]
+
     return ResolveStats(
-        edges=len(edge_rows),
-        unresolved=len(unresolved_rows),
-        ambiguous=len(ambiguous_rows),
+        edges=total("SELECT COUNT(*) AS n FROM edges WHERE rev=?"),
+        unresolved=total(
+            "SELECT COUNT(*) AS n FROM unresolved WHERE rev=? AND reason='unknown'"
+        ),
+        ambiguous=total("SELECT COUNT(*) AS n FROM unresolved WHERE rev=? AND reason='ambiguous'"),
     )
 
 

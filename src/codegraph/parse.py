@@ -129,48 +129,64 @@ def _body_hash(node: ast.AST) -> str:
     return hashlib.blake2b(ast.dump(node).encode(), digest_size=16).hexdigest()
 
 
-class _BodyElider(ast.NodeTransformer):
-    """Replace every function/class def's `body` with a single placeholder
-    statement, without recursing into the original body first.
+_PASS = ast.Pass()
 
-    Used to build the module-level structural hash: a def/class's own
-    `body_hash` already covers everything inside it (via `_body_hash` on
-    the untouched node), so folding that same content into the module hash
-    too would double-count it and reintroduce the exact line-shift churn
-    `body_hash` comparison exists to avoid (an edit two functions away from
-    a def would ripple into every def nested inside it, transitively, all
-    the way up to the module). Not recursing into the original body before
-    replacing it also means a closure nested inside a top-level function
-    is dropped for free -- it is already inside that function's own
-    (unelided) `body_hash`.
 
-    Everything else about the def -- its name, decorators, arguments,
-    base classes, and its position among the module's other top-level
-    statements -- is left intact, so renaming a def, changing its
-    signature, or reordering top-level statements still changes the
-    module hash.
+def _elide_nested(node: object) -> object:
+    """`node` with every def/class body replaced by a single `Pass`, without
+    mutating it and without copying anything that does not change.
+
+    `ast.NodeTransformer.generic_visit` writes back into the node it is given,
+    which is why the elider used to be handed `copy.deepcopy(...)`. That copy
+    was quadratic in practice: a module was deep-copied once, and then every
+    class inside it deep-copied again for its own hash. On django's largest test
+    module -- 52 classes -- parsing that one file cost 4.8s, 3.8s of it inside
+    `copy.deepcopy`, which put the "parse is proportional to the diff" half of
+    the cost guarantee on the wrong side of a 1-file edit.
+
+    This returns the original node unchanged when nothing inside it needed
+    eliding, so only the spine down to each def/class is ever copied, one level
+    deep at a time.
     """
-
-    def _elide(self, node: ast.AST) -> ast.AST:
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
         clone = copy.copy(node)
-        clone.body = [ast.Pass()]
+        clone.body = [_PASS]
         return clone
+    if not isinstance(node, ast.AST):
+        return node
+    return _elide_children(node)
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
-        return self._elide(node)
 
-    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+def _elide_children(node: ast.AST) -> ast.AST:
+    """`_elide_nested` applied to `node`'s children but never to `node` itself.
 
-    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
-        return self._elide(node)
+    This is the difference between hashing a module (whose own "body" is the
+    thing being described) and hashing a def (whose own body must stay intact
+    while its methods' bodies are elided).
+    """
+    replacements: dict[str, object] = {}
+    for name, value in ast.iter_fields(node):
+        if isinstance(value, list):
+            items = [_elide_nested(item) for item in value]
+            if any(new is not old for new, old in zip(items, value, strict=True)):
+                replacements[name] = items
+        elif isinstance(value, ast.AST):
+            item = _elide_nested(value)
+            if item is not value:
+                replacements[name] = item
+    if not replacements:
+        return node
+    clone = copy.copy(node)
+    for name, value in replacements.items():
+        setattr(clone, name, value)
+    return clone
 
 
 def _module_body_hash(tree: ast.Module) -> str:
     """Structural hash of `tree`'s top-level statements, reusing
     `_body_hash` (the same dump-and-hash `parse.py` already uses for a
-    def/class's own body) over a copy with nested def/class bodies elided."""
-    skeleton = _BodyElider().visit(copy.deepcopy(tree))
-    return _body_hash(skeleton)
+    def/class's own body) over a view with nested def/class bodies elided."""
+    return _body_hash(_elide_children(tree))
 
 
 def _class_body_hash(node: ast.ClassDef) -> str:
@@ -186,18 +202,15 @@ def _class_body_hash(node: ast.ClassDef) -> str:
     about module-level churn: an editor touching `PaymentService.charge`
     should not also report `PaymentService` itself as changed.
 
-    `_BodyElider().generic_visit(skeleton)` (not `.visit(skeleton)`) is the
-    deliberate difference from `_module_body_hash`: `generic_visit` walks
-    `skeleton`'s children without ever calling `visit_ClassDef` on
-    `skeleton` itself, so the class's own body list, bases, decorators,
-    and name stay intact -- only a `FunctionDef`/`ClassDef` found AMONG
-    its children (a method, a nested class) gets its body replaced with a
-    single `Pass`. Bases and decorators live in separate AST fields from
-    `body`, so they're hashed as-is regardless.
+    `_elide_children` (rather than `_elide_nested`) is what makes this differ
+    from hashing a plain def: it never elides `node` itself, so the class's own
+    body list, bases, decorators and name stay intact -- only a
+    `FunctionDef`/`ClassDef` found AMONG its children (a method, a nested
+    class) gets its body replaced with a single `Pass`. Bases and decorators
+    live in separate AST fields from `body`, so they're hashed as-is
+    regardless.
     """
-    skeleton = copy.deepcopy(node)
-    _BodyElider().generic_visit(skeleton)
-    return _body_hash(skeleton)
+    return _body_hash(_elide_children(node))
 
 
 class _Collector(ast.NodeVisitor):

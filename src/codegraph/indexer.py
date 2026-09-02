@@ -141,6 +141,19 @@ class Indexer:
         dirty = {path for path, sha in tree.items() if stored.get(path) != sha}
         removed = set(stored) - set(tree)
 
+        catalog = Catalog.load(self.config)
+        fingerprint = self._fingerprint(catalog)
+        fingerprint_ok = self._is_current(rev, fingerprint)
+        if not dirty and not removed and fingerprint_ok:
+            # Nothing in the tree moved and nothing outside it did either, so
+            # the materialized graph is already the answer.
+            #
+            # This is the hot path, not an edge case: every query reconciles
+            # the working tree first (the `git status` model -- see the README),
+            # so without this a repeated query pays a full rebuild of a
+            # revision that did not change. On django that was ~20s per query.
+            return self._unchanged_stats(rev, tree)
+
         # One transaction for the whole reconcile: Layer 1 fill-in and the
         # Layer 2 rewrite either both land or neither does.
         with connection:
@@ -153,25 +166,59 @@ class Indexer:
                 "INSERT INTO tree(rev, path, blob_sha) VALUES(?, ?, ?)",
                 [(rev, path, sha) for path, sha in tree.items()],
             )
-            connection.execute("DELETE FROM nodes WHERE rev=?", (rev,))
-            shadowed = self._materialize_nodes(rev, tree)
+
+            # `narrow` is the set of paths this reconcile may confine itself to,
+            # or None to rebuild the whole revision. See `_narrowable`.
+            narrow = self._narrowable(tree, stored, dirty, removed, fingerprint_ok)
+            if narrow is None:
+                connection.execute("DELETE FROM nodes WHERE rev=?", (rev,))
+                shadowed = self._materialize_nodes(rev, tree)
+            else:
+                marks = ",".join("?" * len(narrow))
+                connection.execute(
+                    f"DELETE FROM nodes WHERE rev=? AND path IN ({marks})",
+                    (rev, *sorted(narrow)),
+                )
+                self._materialize_nodes(rev, {p: tree[p] for p in narrow})
+                shadowed = self._shadowed_count(rev)
 
             connection.execute(
-                "INSERT INTO revisions(rev, kind, materialized_at) VALUES(?, ?, ?) "
-                "ON CONFLICT(rev) DO UPDATE SET materialized_at=excluded.materialized_at",
-                (rev, "worktree" if rev == WORKTREE else "commit", int(time.time())),
+                "INSERT INTO revisions(rev, kind, materialized_at, fingerprint)"
+                " VALUES(?, ?, ?, ?) ON CONFLICT(rev) DO UPDATE SET"
+                " materialized_at=excluded.materialized_at,"
+                " fingerprint=excluded.fingerprint",
+                (
+                    rev,
+                    "worktree" if rev == WORKTREE else "commit",
+                    int(time.time()),
+                    fingerprint,
+                ),
             )
 
             # Phase 2 runs inside the same transaction: a revision is never
             # visible with materialized nodes but stale edges.
-            resolved = resolve_revision(self.store, rev, self.config)
+            # Propagation reads exactly three things: the revision's node ids,
+            # its CALLS edges, and the (node, kind, confidence) of its direct
+            # effects. A narrowed pass can only change those within `narrow`,
+            # and `_narrowable` has already guaranteed the node ids are
+            # identical -- so snapshotting the other two before and after says
+            # whether propagation has any work to do at all. An edit that
+            # changes a literal or shifts lines usually changes neither.
+            before = None if narrow is None else self._propagation_inputs(rev, narrow)
+
+            resolved = resolve_revision(self.store, rev, self.config, only_paths=narrow)
 
             # Effect detection and propagation close out the same
             # transaction: a revision is never visible with edges but
             # stale (or missing) effects.
-            catalog = Catalog.load(self.config)
-            detect_direct(self.store, rev, catalog, self.config)
-            propagate(self.store, rev)
+            detect_direct(self.store, rev, catalog, self.config, only_paths=narrow)
+
+            # When it does have work, propagation is still whole-revision: an
+            # effect flows along edges, so a change anywhere can reach anywhere
+            # and there is no cheap frontier to start from. That remains the
+            # non-proportional phase -- see #7.
+            if before is None or before != self._propagation_inputs(rev, narrow):
+                propagate(self.store, rev)
 
         return IndexStats(
             paths_total=len(tree),
@@ -183,6 +230,181 @@ class Indexer:
             edges=resolved.edges,
             unresolved=resolved.unresolved,
             ambiguous=resolved.ambiguous,
+        )
+
+    def _narrowable(
+        self,
+        tree: dict[str, str],
+        stored: dict[str, str],
+        dirty: set[str],
+        removed: set[str],
+        fingerprint_ok: bool,
+    ) -> set[str] | None:
+        """The paths this reconcile may confine itself to, or None for all.
+
+        Resolution is global by nature: a bare-name call matches against every
+        definition in the revision, and `self.X` walks a class hierarchy that
+        spans files. So narrowing is only sound when the revision's SYMBOL
+        TABLE is provably unchanged -- then nothing outside the edited files
+        can resolve differently, and only those files' own references need
+        rebuilding.
+
+        The conditions, each of them load-bearing:
+
+        - the revision is already materialized under this fingerprint, so
+          there is a correct previous state to keep;
+        - no path was added or removed, since either changes `module_to_path`
+          and the repo-wide name index;
+        - every dirty path declares exactly the same symbols as before -- same
+          qualnames, kinds, live/shadowed bindings. A new `def` changes what
+          bare-name calls anywhere in the repo can match;
+        - every dirty path's base references are unchanged. A changed base
+          class moves `self.X` resolution in every subclass, wherever it lives,
+          and lets `_load_bases` read the hierarchy back from the existing
+          INHERITS edges instead of recomputing it.
+
+        Anything else falls back to a whole-revision rewrite, which cannot
+        leave a stale edge behind. Getting this wrong is worse than being slow,
+        so the check is deliberately conservative -- a body-only edit is the
+        case worth catching, and it is by far the common one.
+        """
+        if not fingerprint_ok or removed or set(tree) != set(stored):
+            return None
+        if not dirty:
+            return set()
+        for path in dirty:
+            before, after = stored[path], tree[path]
+            if self._symbol_signature(before) != self._symbol_signature(after):
+                return None
+            if self._base_signature(before) != self._base_signature(after):
+                return None
+        return set(dirty)
+
+    def _propagation_inputs(self, rev: str, paths: set[str]) -> tuple[frozenset, frozenset]:
+        """What `propagate` would see differently if these paths changed.
+
+        Deliberately projected: `evidence_line` is excluded because propagation
+        never reads it, so a call moving down a line must not be mistaken for a
+        change in what that call means.
+        """
+        if not paths:
+            return frozenset(), frozenset()
+        connection = self.store.connection
+        marks = ",".join("?" * len(paths))
+        args = (rev, *sorted(paths))
+        edges = frozenset(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT src, dst, confidence FROM edges"
+                f" WHERE rev=? AND kind='CALLS' AND callsite_path IN ({marks})",
+                args,
+            )
+        )
+        direct = frozenset(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT node_id, kind, confidence FROM effects"
+                f" WHERE rev=? AND direct=1 AND evidence_path IN ({marks})",
+                args,
+            )
+        )
+        return edges, direct
+
+    def _symbol_signature(self, blob_sha: str) -> frozenset[tuple]:
+        """What a blob DECLARES, ignoring what any of it does.
+
+        `body_hash` is deliberately absent: a changed body is exactly the edit
+        this is trying to let through.
+        """
+        return frozenset(
+            tuple(row)
+            for row in self.store.connection.execute(
+                "SELECT qualname, kind, name_binding, shadow_index, conditional"
+                " FROM blob_nodes WHERE blob_sha=?",
+                (blob_sha,),
+            )
+        )
+
+    def _base_signature(self, blob_sha: str) -> frozenset[tuple]:
+        """The blob's base-class references, ignoring line positions."""
+        return frozenset(
+            tuple(row)
+            for row in self.store.connection.execute(
+                "SELECT from_qualname, raw_name, dotted FROM blob_refs"
+                " WHERE blob_sha=? AND ref_kind='base'",
+                (blob_sha,),
+            )
+        )
+
+    def _shadowed_count(self, rev: str) -> int:
+        return self.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM blob_nodes b JOIN tree t ON t.blob_sha = b.blob_sha"
+            " WHERE t.rev=? AND b.shadow_index IS NOT NULL AND b.conditional=0",
+            (rev,),
+        ).fetchone()["n"]
+
+    def _fingerprint(self, catalog: Catalog) -> str:
+        """Digest of everything the graph depends on that is NOT in the tree.
+
+        A reconcile is allowed to skip its work when the tree is unchanged, so
+        anything else that can change an edge or an effect has to be pinned
+        here or that skip becomes a stale-answer bug. Editing `codegraph.toml`
+        touches no file in the revision's tree and can change every effect in
+        the graph.
+
+        `Catalog.fingerprint` was written for exactly this and had no caller
+        until now.
+        """
+        parts = (
+            PARSER_VERSION,
+            catalog.fingerprint(),
+            ",".join(self.config.source_roots),
+            str(self.config.ambiguity_limit),
+        )
+        return hashlib.blake2b("\x00".join(parts).encode(), digest_size=16).hexdigest()
+
+    def _is_current(self, rev: str, fingerprint: str) -> bool:
+        """Has `rev` been materialized under this exact fingerprint?"""
+        row = self.store.connection.execute(
+            "SELECT fingerprint FROM revisions WHERE rev=?", (rev,)
+        ).fetchone()
+        return row is not None and row["fingerprint"] == fingerprint
+
+    def _unchanged_stats(self, rev: str, tree: dict[str, str]) -> IndexStats:
+        """Stats for a reconcile that did nothing, read back from the store.
+
+        Counted rather than remembered: the numbers have to describe the graph
+        as it stands, not the pass that happened to build it, or `status` would
+        report zeroes whenever nothing changed.
+        """
+        connection = self.store.connection
+        shas = set(tree.values())
+
+        def count(sql: str) -> int:
+            return connection.execute(sql, (rev,)).fetchone()["n"]
+
+        return IndexStats(
+            paths_total=len(tree),
+            paths_dirty=0,
+            blobs_parsed=0,
+            blobs_cached=len(shas),
+            parse_errors=self._error_count(shas),
+            # Counted from Layer 1 the same way `_materialize_nodes` counts it
+            # -- `nodes` keeps neither `shadow_index` nor `conditional`, so
+            # counting non-live rows there would quietly include the
+            # conditional definitions that `_materialize_nodes` excludes.
+            shadowed=count(
+                "SELECT COUNT(*) AS n FROM blob_nodes b JOIN tree t"
+                " ON t.blob_sha = b.blob_sha"
+                " WHERE t.rev=? AND b.shadow_index IS NOT NULL AND b.conditional=0"
+            ),
+            edges=count("SELECT COUNT(*) AS n FROM edges WHERE rev=?"),
+            unresolved=count(
+                "SELECT COUNT(*) AS n FROM unresolved WHERE rev=? AND reason='unknown'"
+            ),
+            ambiguous=count(
+                "SELECT COUNT(*) AS n FROM unresolved WHERE rev=? AND reason='ambiguous'"
+            ),
         )
 
     def _ensure_parsed(self, shas: set[str]) -> tuple[int, int]:
