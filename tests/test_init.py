@@ -50,17 +50,32 @@ def test_running_init_twice_leaves_the_repo_byte_identical(repo):
     assert (repo / "AGENTS.md").read_text().count(BEGIN_MARKER) == 1
 
 
-def test_init_appends_to_an_existing_agents_md_without_touching_its_prose(repo):
+@pytest.mark.parametrize(
+    ("prose", "gap"),
+    [
+        pytest.param("# AGENTS.md\n\nRun `make test`.\n", "\n", id="ends-with-newline"),
+        pytest.param("# AGENTS.md\n\nNo trailing newline.", "\n\n", id="no-trailing-newline"),
+        pytest.param("# AGENTS.md\n\nBlank-terminated.\n\n", "", id="ends-blank-line"),
+        pytest.param("# AGENTS.md\n\nExtra room.\n\n\n", "", id="ends-several-blank-lines"),
+    ],
+)
+def test_init_appends_to_an_existing_agents_md_without_touching_its_prose(repo, prose, gap):
     """An AGENTS.md that exists but has no codegraph block gets one
-    appended -- and every byte the user wrote survives verbatim, which is
-    the difference between a tool you run on a real repo and one you don't."""
-    prose = "# AGENTS.md\n\nRun `make test` before pushing.\nUse tabs, we're like that.\n"
+    appended, every byte the user wrote surviving verbatim, with just enough
+    newlines added to leave one blank line before the block.
+
+    Topping up rather than trimming-and-re-adding is what makes this
+    stable: "always add a blank line" would pad a file that already ended
+    in one, and grow the gap by one every time the block is removed and
+    re-added; "normalize the tail first" would quietly eat blank lines the
+    user left in their own file.
+    """
     (repo / "AGENTS.md").write_text(prose)
 
     assert main(["init", "--path", str(repo)]) == 0
 
     content = (repo / "AGENTS.md").read_text()
-    assert content.startswith(prose)
+    assert content == prose + gap + AGENTS_BLOCK
     assert content.count(BEGIN_MARKER) == 1
     assert "codegraph impact" in content
 
