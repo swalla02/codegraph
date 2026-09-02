@@ -7,7 +7,9 @@ import sys
 from pathlib import Path
 
 from codegraph import __version__, gitio
+from codegraph.guide import guide_text
 from codegraph.indexer import FsTreeSource, GitTreeSource, Indexer
+from codegraph.init import SKIPPED, plan_init
 from codegraph.maintenance import gc, plan_hooks
 from codegraph.query.diff import MissingRevisionError, diff_report
 from codegraph.query.effects import effects_report
@@ -251,6 +253,47 @@ def _cmd_install_hooks(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_init(args: argparse.Namespace) -> int:
+    """Make this repository's coding agents aware of codegraph: an AGENTS.md
+    section, the CLAUDE.md bridge if there is a CLAUDE.md, and an inert
+    codegraph.toml stub. Idempotent and additive -- see `codegraph.init`.
+
+    Notably absent: git hooks. Those stay behind `install-hooks`, which the
+    user has to ask for by name.
+    """
+    root = Path(args.path).resolve()
+    if not root.is_dir():
+        print(f"not a directory: {root}", file=sys.stderr)
+        return 1
+    if not gitio.is_repo(root):
+        # Not fatal: codegraph indexes a plain directory too (see
+        # `open_workspace`'s FsTreeSource fallback), and the files written
+        # here are ordinary repo-root markdown that make just as much sense
+        # without git. Worth saying out loud, though -- `--path` pointing
+        # one directory off is a much likelier explanation than a
+        # deliberately un-versioned project.
+        print(f"note: {root} is not a git repository", file=sys.stderr)
+
+    failed = False
+    for result in plan_init(root):
+        line = f"{result.action:<9} {result.path.relative_to(root)}"
+        if result.reason:
+            line += f" -- {result.reason}"
+        if result.action == SKIPPED:
+            print(line, file=sys.stderr)
+            failed = True
+        else:
+            print(line)
+    return 1 if failed else 0
+
+
+def _cmd_guide(args: argparse.Namespace) -> int:
+    """Print the agent-facing workflow. The AGENTS.md block `init` writes
+    stays short by pointing here instead of inlining this."""
+    print(guide_text(), end="")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codegraph")
     parser.add_argument("--version", action="version", version=__version__)
@@ -334,6 +377,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Additional revision to retain besides HEAD and the worktree (repeatable)",
     )
     gc_parser.set_defaults(handler=_cmd_gc)
+
+    init_parser = subparsers.add_parser(
+        "init", help="Make this repository's coding agents aware of codegraph"
+    )
+    init_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    init_parser.set_defaults(handler=_cmd_init)
+
+    guide_parser = subparsers.add_parser("guide", help="Print the agent-facing workflow")
+    guide_parser.set_defaults(handler=_cmd_guide)
 
     hooks_parser = subparsers.add_parser(
         "install-hooks", help="Install git hooks that warm the cache in the background"
