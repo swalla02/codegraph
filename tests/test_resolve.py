@@ -1,5 +1,6 @@
 from codegraph.cli import main
 from codegraph.indexer import GitTreeSource, Indexer
+from codegraph.query.impact import impact_report
 from codegraph.resolve import module_for_path, split_by_ambiguity_limit
 from codegraph.store import Store
 
@@ -460,3 +461,147 @@ def test_split_by_ambiguity_limit_counts_only_the_weak_candidates():
 def test_split_by_ambiguity_limit_leaves_a_list_at_exactly_the_limit_alone():
     hits = [(f"a.py::x{i}", "LOW") for i in range(4)]
     assert split_by_ambiguity_limit(hits, 4) == (hits, 0)
+
+
+# -- self.X finds overrides, not just the inherited declaration -------------
+#
+# Walking only UP the MRO and stopping at the first hit drops every subclass
+# override, and `self` is an instance of the enclosing class or any subclass of
+# it. Worst case measured on `psf/requests`: `SessionRedirectMixin.send` is a
+# `...` stub that `Session` overrides, so `self.send()` inside
+# `resolve_redirects` bound to the stub at HIGH and `impact Session.send` found
+# nothing -- the edge that drives every redirect hop. See #14.
+
+
+def test_self_call_finds_the_subclass_override_as_well_as_the_base(repo, write):
+    write(
+        "shapes.py",
+        "class Shape:\n"
+        "    def area(self):\n"
+        "        return 0\n"
+        "\n"
+        "    def describe(self):\n"
+        "        return self.area()\n"
+        "\n\n"
+        "class Square(Shape):\n"
+        "    def area(self):\n"
+        "        return 4\n",
+        commit="shapes",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = {(dst, conf) for src, dst, conf in edges(store) if src == "shapes.py::Shape.describe"}
+    assert ("shapes.py::Shape.area", "HIGH") in found
+    assert ("shapes.py::Square.area", "MEDIUM") in found
+    store.close()
+
+
+def test_a_stub_base_does_not_hide_the_real_implementation(repo, write):
+    """The requests shape, minimised: the base declares the method with an
+    empty body and a subclass supplies the real one. First-match-wins bound
+    `self.send()` to the stub and stopped, making the real implementation
+    unreachable from `impact`."""
+    write(
+        "svc.py",
+        "class Mixin:\n"
+        "    def send(self):\n"
+        "        ...\n"
+        "\n"
+        "    def retry(self):\n"
+        "        return self.send()\n"
+        "\n\n"
+        "class Real(Mixin):\n"
+        "    def send(self):\n"
+        "        return 'sent'\n",
+        commit="svc",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    targets = {dst for src, dst, _ in edges(store) if src == "svc.py::Mixin.retry"}
+    assert "svc.py::Real.send" in targets, (
+        "the real implementation must be reachable, not just the stub"
+    )
+
+    report = impact_report(store, "HEAD", "svc.py::Real.send")
+    assert "svc.py::Mixin.retry" in {row.id for group in report.groups for row in group.rows}
+    store.close()
+
+
+def test_an_override_further_down_a_chain_is_still_found(repo, write):
+    write(
+        "chain.py",
+        "class A:\n"
+        "    def run(self):\n"
+        "        return 0\n"
+        "\n"
+        "    def go(self):\n"
+        "        return self.run()\n"
+        "\n\n"
+        "class B(A):\n"
+        "    pass\n"
+        "\n\n"
+        "class C(B):\n"
+        "    def run(self):\n"
+        "        return 1\n",
+        commit="chain",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    targets = {dst for src, dst, _ in edges(store) if src == "chain.py::A.go"}
+    assert targets == {"chain.py::A.run", "chain.py::C.run"}
+    store.close()
+
+
+def test_an_unrelated_class_with_the_same_method_name_is_not_pulled_in(repo, write):
+    """The override walk follows the class hierarchy, not the name. A class
+    that merely shares a method name must not become a HIGH/MEDIUM candidate --
+    that is the LOW fallback's job, at LOW."""
+    write(
+        "sep.py",
+        "class Base:\n"
+        "    def act(self):\n"
+        "        return 0\n"
+        "\n"
+        "    def trigger(self):\n"
+        "        return self.act()\n"
+        "\n\n"
+        "class Child(Base):\n"
+        "    def act(self):\n"
+        "        return 1\n"
+        "\n\n"
+        "class Stranger:\n"
+        "    def act(self):\n"
+        "        return 2\n",
+        commit="sep",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    targets = {dst for src, dst, _ in edges(store) if src == "sep.py::Base.trigger"}
+    assert targets == {"sep.py::Base.act", "sep.py::Child.act"}
+    assert "sep.py::Stranger.act" not in targets
+    store.close()
+
+
+def test_an_inheritance_cycle_does_not_hang_the_override_walk(repo, write):
+    """`class A(B)` / `class B(A)` is not valid Python at runtime, but it is
+    parseable, and the resolver reads text -- the downward walk has to be as
+    cycle-safe as the MRO walk above it."""
+    write(
+        "cyc.py",
+        "class A(B):\n"
+        "    def run(self):\n"
+        "        return 0\n"
+        "\n"
+        "    def go(self):\n"
+        "        return self.run()\n"
+        "\n\n"
+        "class B(A):\n"
+        "    def run(self):\n"
+        "        return 1\n",
+        commit="cyc",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")  # must terminate
+    targets = {dst for src, dst, _ in edges(store) if src == "cyc.py::A.go"}
+    assert "cyc.py::A.run" in targets
+    store.close()

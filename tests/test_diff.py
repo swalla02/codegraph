@@ -143,3 +143,70 @@ def test_module_level_effect_addition_is_changed_and_new_effect(repo, write):
     assert "m.py::<module>" in rows(report, "changed")
     assert "NETWORK" in str(report.summary)
     store.close()
+
+
+# -- the LOW fan-out must not read as a change ------------------------------
+#
+# `changed` also fires when a symbol's outgoing edges move, so that `foo()` now
+# reaching a different `foo` counts even when the body is untouched. LOW edges
+# broke that: they are a guess about the whole repo, so an untouched function's
+# LOW set moves whenever anyone adds a same-named symbol anywhere. On
+# `psf/requests` one new `AttrProxy.__init__` in a test marked every
+# `super().__init__()` caller changed -- 7 of 20 rows, in files whose git blob
+# was byte-identical across the range. See #13.
+
+
+def test_an_unrelated_same_named_symbol_does_not_mark_a_file_changed(repo, write):
+    write(
+        "stable.py",
+        "class Thing:\n"
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        "        self.x = 1\n",
+        commit="stable",
+    )
+    write("other.py", "class One:\n    def __init__(self):\n        pass\n", commit="other")
+    store, indexer = build(repo)
+    base = git(repo, "rev-parse", "HEAD").strip()
+
+    # A brand-new class in a DIFFERENT file. `stable.py` is not touched.
+    write(
+        "other.py",
+        "class One:\n"
+        "    def __init__(self):\n"
+        "        pass\n"
+        "\n\n"
+        "class Two:\n"
+        "    def __init__(self):\n"
+        "        pass\n",
+        commit="add Two",
+    )
+    assert git(repo, "rev-parse", f"{base}:stable.py") == git(repo, "rev-parse", "HEAD:stable.py")
+
+    report = diff_report(store, indexer, base, "HEAD")
+    changed = rows(report, "changed")
+    assert not [node_id for node_id in changed if node_id.startswith("stable.py")], (
+        f"stable.py is byte-identical across the range but was reported changed: {changed}"
+    )
+    assert "other.py::Two.__init__" in rows(report, "added")
+    store.close()
+
+
+def test_a_confident_callee_disappearing_still_reads_as_changed(repo, write):
+    """Non-vacuity guard for the filter above: the edge-set comparison must
+    still fire for edges the resolver was confident about, or it has just been
+    switched off. `caller`'s body is identical in both revisions -- only what
+    `helper()` resolves to changed."""
+    write(
+        "m.py",
+        "def helper():\n    return 1\n\n\ndef caller():\n    return helper()\n",
+        commit="m",
+    )
+    store, indexer = build(repo)
+    base = git(repo, "rev-parse", "HEAD").strip()
+    write("m.py", "def caller():\n    return helper()\n", commit="drop helper")
+
+    report = diff_report(store, indexer, base, "HEAD")
+    assert "m.py::caller" in rows(report, "changed")
+    assert "m.py::helper" in rows(report, "removed")
+    store.close()

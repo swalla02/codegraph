@@ -75,8 +75,32 @@ def _nodes(store: Store, rev: str) -> dict[str, sqlite3.Row]:
 
 
 def _edges_by_src(store: Store, rev: str) -> dict[str, set[tuple[str, str]]]:
+    """Outgoing edges per symbol, EXCLUDING the low-confidence fan-out.
+
+    A symbol whose body hash is unchanged is still reported as `changed` when
+    its callees changed -- `foo()` now reaching a different `foo` is a real
+    change in behaviour even though not one character of this function moved.
+    That is worth catching, but only for edges the resolver was actually
+    confident about.
+
+    A LOW edge is not a statement about this symbol. It is a guess about the
+    whole repository: the bare-name fallback matches a call's last segment
+    against every definition there is, so the LOW set of an untouched function
+    moves whenever anyone anywhere adds or deletes a same-named symbol.
+    Comparing those guesses across two revisions manufactures change out of
+    edits that never came near the file.
+
+    Measured on `psf/requests` before this filter: one new `AttrProxy.__init__`
+    in a test file added a candidate to every `super().__init__()` call site in
+    the repository, and `diff` reported `HTTPAdapter.__init__`,
+    `BaseAdapter.__init__`, `LookupDict.__init__`, `JSONDecodeError.__init__`
+    and others as `changed` -- in files whose git blob SHA was byte-identical
+    across the range. 7 of 20 `changed` rows, 35% of the list. See issue #13.
+    """
     edges: dict[str, set[tuple[str, str]]] = {}
-    for row in store.connection.execute("SELECT src, dst, kind FROM edges WHERE rev=?", (rev,)):
+    for row in store.connection.execute(
+        "SELECT src, dst, kind FROM edges WHERE rev=? AND confidence != 'LOW'", (rev,)
+    ):
         edges.setdefault(row["src"], set()).add((row["dst"], row["kind"]))
     return edges
 
