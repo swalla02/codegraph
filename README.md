@@ -157,18 +157,29 @@ are not in the same place:
   results do not depend on file mtimes across checkouts (which `git
   checkout` rewrites indiscriminately and an mtime-keyed cache would have
   re-parsed on every switch).
-- **Resolve (Layer 2) — not yet proportional.** `resolve_revision` currently
-  re-resolves the *entire* symbol table for a revision on every reconcile,
-  rather than the design's intended `D ∪ dependents(D)` incremental
-  invalidation (`resolve.dependents` exists and is tested, but has no
-  production caller yet). Measured, one-file edit, steady state: flask (83
-  files) reconciles in 0.36s, django (2,930 files) in **22s** — of which one
-  blob is parsed and everything else is the whole revision being rebuilt.
-  django's *cold* index is 65s, so at that size an incremental edit costs a
-  third of a full re-index rather than nothing. The resolve step, not the
-  parse step, is where reconcile time scales with repository size today.
-  Tracked as follow-up work; this README will stop calling this out honestly
-  the day it's fixed, not before.
+- **Resolve (Layer 2) — proportional for most edits, not all.** Resolution is
+  global by nature: a bare-name call matches every definition in the revision,
+  and `self.X` walks a class hierarchy that spans files. So a reconcile narrows
+  to the edited files only when it can prove the revision's *symbol table* is
+  unchanged — same qualnames, same kinds, same live/shadowed bindings, same
+  base classes. A body-only edit qualifies; adding, removing or renaming a
+  definition does not, and falls back to a whole-revision rewrite, which cannot
+  leave a stale edge behind. Measured on django (2,930 files):
+
+  | | before | now |
+  |---|---|---|
+  | reconcile with no changes (every query pays this) | ~86s | **0.34s** |
+  | body-only edit | ~86s | **3.7s** |
+  | edit that adds or removes a definition | ~86s | 22.9s |
+  | cold index | 83.6s | 45.1s |
+
+  So the honest version: the common cases are proportional now, and the
+  symbol-table-changing case is not. What remains non-proportional is effect
+  *propagation* — an effect flows along edges, so a change anywhere can reach
+  anywhere and there is no cheap frontier to start from. It is skipped
+  entirely when a narrowed edit provably did not change any of its three
+  inputs, which is why a body-only edit is 3.7s rather than 9s, but a
+  structural edit still pays it in full.
 
 ## Why no MCP server
 

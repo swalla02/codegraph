@@ -425,3 +425,114 @@ def _effect_kinds(store, node_id, rev=WORKTREE):
             "SELECT kind FROM effects WHERE rev=? AND node_id=?", (rev, node_id)
         )
     }
+
+
+# -- narrowing an edit to the files it can affect ---------------------------
+#
+# Resolution is global by nature: a bare-name call matches every definition in
+# the revision, and `self.X` walks a hierarchy that spans files. Narrowing is
+# sound only when the symbol table is provably unchanged. These tests pin both
+# halves -- that the narrow path fires when it should, and that it does NOT
+# when a change could reach other files. Getting the second wrong is a stale
+# graph, which is worse than being slow.
+
+
+def narrow_sets(monkeypatch):
+    """Record the `only_paths` of every phase-2 call."""
+    import codegraph.indexer as indexer_module
+
+    seen = []
+    original = indexer_module.resolve_revision
+
+    def spy(store, rev, config, resolver=None, only_paths=None):
+        seen.append(only_paths)
+        return original(store, rev, config, resolver, only_paths)
+
+    monkeypatch.setattr(indexer_module, "resolve_revision", spy)
+    return seen
+
+
+def test_a_body_only_edit_is_narrowed_to_that_file(repo, write, monkeypatch):
+    write("a.py", "def alpha():\n    return 1\n")
+    write("b.py", "def beta():\n    return 2\n", commit="two")
+    store = Store.open(repo)
+    indexer = Indexer(repo, store, GitTreeSource(repo))
+    indexer.reconcile(WORKTREE)
+
+    seen = narrow_sets(monkeypatch)
+    write("a.py", "def alpha():\n    return 1 + 1\n")
+    indexer.reconcile(WORKTREE)
+    assert seen == [{"a.py"}]
+    store.close()
+
+
+def test_a_body_only_edit_still_equals_a_cold_rebuild(repo, write):
+    write("lib.py", "def helper():\n    return 1\n")
+    write(
+        "app.py",
+        "from lib import helper\n\n\ndef run(x):\n    return helper() + x.helper()\n",
+        commit="two",
+    )
+    store = Store.open(repo)
+    indexer = Indexer(repo, store, GitTreeSource(repo))
+    indexer.reconcile(WORKTREE)
+    for value in range(2, 6):
+        write("lib.py", f"def helper():\n    return {value}\n")
+        indexer.reconcile(WORKTREE)
+    incremental = dump_graph(store, WORKTREE)
+    store.close()
+    assert incremental == cold_dump(repo, WORKTREE)
+
+
+@pytest.mark.parametrize(
+    "label, source",
+    [
+        ("adds a definition", "def alpha():\n    return 1\n\n\ndef added():\n    pass\n"),
+        ("removes a definition", ""),
+        ("renames a definition", "def renamed():\n    return 1\n"),
+        ("changes a base class", "class Base:\n    pass\n\n\nclass alpha(Base):\n    pass\n"),
+    ],
+)
+def test_a_change_that_can_reach_other_files_forces_a_full_rebuild(
+    repo, write, monkeypatch, label, source
+):
+    write("b.py", "def beta():\n    return 2\n", commit="b")
+    store = Store.open(repo)
+    indexer = Indexer(repo, store, GitTreeSource(repo))
+    indexer.reconcile(WORKTREE)
+
+    seen = narrow_sets(monkeypatch)
+    write("a.py", source)
+    indexer.reconcile(WORKTREE)
+    assert seen == [None], f"{label} was narrowed, but it changes the symbol table"
+    store.close()
+
+
+def test_a_definition_added_elsewhere_updates_another_files_edges(repo, write):
+    """The concrete reason the symbol-table check exists. `caller` is never
+    touched, but a new `save` in another file changes what its bare-name call
+    can match -- so narrowing to the edited file would leave a stale graph."""
+    write(
+        "caller.py",
+        "def caller(item):\n    return item.save()\n",
+    )
+    write("one.py", "class One:\n    def save(self):\n        return 1\n", commit="two")
+    store = Store.open(repo)
+    indexer = Indexer(repo, store, GitTreeSource(repo))
+    indexer.reconcile(WORKTREE)
+
+    def targets():
+        return {
+            row["dst"]
+            for row in store.connection.execute(
+                "SELECT dst FROM edges WHERE rev=? AND src='caller.py::caller'", (WORKTREE,)
+            )
+        }
+
+    assert targets() == {"one.py::One.save"}
+
+    write("two.py", "class Two:\n    def save(self):\n        return 2\n")
+    indexer.reconcile(WORKTREE)
+    assert targets() == {"one.py::One.save", "two.py::Two.save"}
+    assert dump_graph(store, WORKTREE) == cold_dump(repo, WORKTREE)
+    store.close()
