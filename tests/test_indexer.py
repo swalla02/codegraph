@@ -103,6 +103,35 @@ def test_syntax_error_is_recorded_not_raised(repo, write):
     store.close()
 
 
+def test_parse_errors_persist_across_runs(repo, write):
+    """Regression for F4: `_ensure_parsed` only counted errors over blobs
+    parsed THIS pass, so `status` reported `parse errors: 1` on the first
+    run and then silently reported 0 on every later run, even though the
+    broken file is unchanged, still unparseable, and still excluded from
+    the graph -- the count must reflect the revision's actual broken files,
+    not just newly-parsed ones."""
+    write("bad.py", "def broken(:\n", commit="bad")
+    store, indexer = build(repo)
+    first = indexer.reconcile("HEAD")
+    assert first.parse_errors == 1
+    second = indexer.reconcile("HEAD")
+    assert second.parse_errors == 1
+    store.close()
+
+
+def test_parse_errors_reflects_current_tree_not_every_blob_ever_seen(repo, write):
+    """A blob that was broken in an earlier revision but isn't part of the
+    current tree must not inflate the count."""
+    write("bad.py", "def broken(:\n", commit="bad")
+    store, indexer = build(repo)
+    stats = indexer.reconcile("HEAD")
+    assert stats.parse_errors == 1
+    write("bad.py", "def fixed():\n    return 1\n", commit="fix")
+    fixed_stats = indexer.reconcile("HEAD")
+    assert fixed_stats.parse_errors == 0
+    store.close()
+
+
 def test_works_without_git(tmp_path):
     (tmp_path / "solo.py").write_text("def solo():\n    pass\n")
     store = Store.open(tmp_path)

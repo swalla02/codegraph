@@ -1,0 +1,172 @@
+# Built-in effect catalog: dotted-name glob patterns to side-effect kinds.
+#
+# Loaded by `codegraph.effects.catalog.Catalog.load` and merged with a
+# project's `codegraph.toml` [[effect]] overrides. See catalog.py for the
+# matching rule (longest literal prefix wins, overrides break ties) and for
+# how confidence is derived from a rule's own match specificity unless it
+# sets an explicit `confidence` override (HIGH/MEDIUM/LOW) -- a fully
+# literal pattern (no wildcard at all) is HIGH, a bare wildcard-head
+# pattern like `*.execute` (matching any receiver whatsoever) is LOW, and
+# anything with a real but partial literal prefix (`requests.*`,
+# `boto3.*`) is MEDIUM.
+#
+# GLOBAL_MUTATE has no entries here by design: it is detected syntactically
+# (assignment to a module/class-level name), not by a call-site catalog.
+
+[[effect]]
+match = "requests.*"
+kind = "NETWORK"
+
+# `requests.*` above has to stay MEDIUM: it matches the whole namespace,
+# including non-network members (`requests.codes`, `requests.utils.*`,
+# `Session()`), not just the HTTP verbs. But that leaves `requests.get` /
+# `.post` -- the single most common and least ambiguous network call in
+# Python -- worse labeled than before that fix, purely for uniformity. Each
+# of these is a fully literal pattern (no wildcard), so it derives HIGH
+# from its own specificity and, having a longer literal prefix than
+# `requests.*`, wins the match over it (see catalog.py's precedence rule)
+# without needing a `confidence` override.
+[[effect]]
+match = "requests.get"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.post"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.put"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.patch"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.delete"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.head"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.options"
+kind = "NETWORK"
+
+[[effect]]
+match = "requests.request"
+kind = "NETWORK"
+
+[[effect]]
+match = "httpx.*"
+kind = "NETWORK"
+
+[[effect]]
+match = "urllib.request.*"
+kind = "NETWORK"
+
+[[effect]]
+match = "socket.*"
+kind = "NETWORK"
+
+[[effect]]
+match = "subprocess.*"
+kind = "PROCESS"
+
+[[effect]]
+match = "os.system"
+kind = "PROCESS"
+
+[[effect]]
+match = "os.exec*"
+kind = "PROCESS"
+
+[[effect]]
+match = "os.environ*"
+kind = "ENV_READ"
+
+[[effect]]
+match = "os.getenv"
+kind = "ENV_READ"
+
+[[effect]]
+# `parse.py`'s `_open_call_marker` only produces this name for a bare
+# `open(...)` call whose mode is absent or a literal read-only string
+# (e.g. no second arg, or `"r"`/`"rb"`) -- a genuine read, so the derived
+# HIGH confidence (this pattern has no wildcard at all) is warranted.
+match = "open"
+kind = "FS_READ"
+
+[[effect]]
+# A literal mode string containing w/a/x/+ -- also a genuine, not merely
+# inferred, write; HIGH is warranted for the same reason as `open` above.
+match = "open!write"
+kind = "FS_WRITE"
+
+[[effect]]
+# The mode argument was present but not a string literal (a variable, an
+# expression) -- kept at the conservative FS_READ default, since dropping
+# it would violate the over-approximation bias, but *not* at HIGH: unlike
+# the two rules above, the evidence here does not actually establish the
+# kind, so an explicit override caps it below what this pattern's literal
+# spelling would otherwise derive.
+match = "open!ambiguous"
+kind = "FS_READ"
+confidence = "MEDIUM"
+
+[[effect]]
+match = "pathlib.Path.read*"
+kind = "FS_READ"
+
+[[effect]]
+match = "pathlib.Path.write*"
+kind = "FS_WRITE"
+
+[[effect]]
+match = "shutil.*"
+kind = "FS_WRITE"
+
+[[effect]]
+match = "*.session.commit"
+kind = "DB_WRITE"
+
+[[effect]]
+match = "*.session.add"
+kind = "DB_WRITE"
+
+[[effect]]
+match = "*.execute"
+kind = "DB_WRITE"
+
+[[effect]]
+match = "*.fetchone"
+kind = "DB_READ"
+
+[[effect]]
+match = "*.fetchall"
+kind = "DB_READ"
+
+[[effect]]
+match = "*.fetchmany"
+kind = "DB_READ"
+
+[[effect]]
+match = "boto3.*"
+kind = "DB_WRITE"
+
+[[effect]]
+match = "random.*"
+kind = "NONDETERMINISM"
+
+[[effect]]
+match = "time.time"
+kind = "NONDETERMINISM"
+
+[[effect]]
+match = "uuid.uuid4"
+kind = "NONDETERMINISM"
+
+[[effect]]
+match = "datetime.datetime.now"
+kind = "NONDETERMINISM"

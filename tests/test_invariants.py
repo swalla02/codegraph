@@ -4,6 +4,7 @@ import subprocess
 
 import pytest
 
+from codegraph.config import DEFAULT_AMBIGUITY_LIMIT
 from codegraph.indexer import GitTreeSource, Indexer
 from codegraph.store import WORKTREE, Store
 from tests.conftest import git
@@ -220,4 +221,83 @@ def test_switch_parses_at_most_the_changed_files(repo, write):
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "touch three")
     assert indexer.reconcile("HEAD").blobs_parsed == 3
+    store.close()
+
+
+# -- graph size ------------------------------------------------------------
+#
+# The last-resort resolution step matches a bare name against every live
+# definition in the revision, so before the ambiguity cap the edge table grew
+# with the SQUARE of the repo: 120 edges/file on flask (83 files), 740 on django
+# (2,930 files) -- 2.09M LOW edges, 96.6% of the graph, up to 971 for a single
+# call site. Nothing caught it because every test repo here is a handful of
+# files. This is that missing test, at a size a unit test can afford. See #6.
+
+
+def duck_typed_repo(repo, write, count):
+    """`count` files, each carrying one edge of each shape.
+
+    `local{i}()` is a module-local call: exactly one HIGH edge per file however
+    big the repo gets -- the linear term, and what keeps the graph non-empty
+    once the cap fires. `item.save()` is the quadratic term: `save` is defined
+    in every file, so without a cap each of the `count` callers matches all
+    `count` definitions.
+    """
+    for i in range(count):
+        write(
+            f"m{i}.py",
+            f"class C{i}:\n"
+            f"    def save(self):\n"
+            f"        return {i}\n"
+            f"\n\n"
+            f"def local{i}():\n"
+            f"    return {i}\n"
+            f"\n\n"
+            f"def persist{i}(item):\n"
+            f"    local{i}()\n"
+            f"    return item.save()\n",
+        )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", f"{count} files")
+
+
+def edge_count(repo):
+    store = Store.open(repo)
+    try:
+        return Indexer(repo, store, GitTreeSource(repo)).reconcile("HEAD").edges
+    finally:
+        store.close()
+
+
+def test_graph_size_grows_with_the_repo_not_with_its_square(repo, write, tmp_path_factory):
+    small_root, large_root = repo, tmp_path_factory.mktemp("large")
+    git(large_root, "init", "-q", "-b", "main")
+    git(large_root, "config", "user.email", "test@example.com")
+    git(large_root, "config", "user.name", "Test")
+
+    def write_large(rel, text, commit=None):
+        (large_root / rel).write_text(text)
+
+    duck_typed_repo(small_root, write, 40)
+    duck_typed_repo(large_root, write_large, 160)
+
+    small, large = edge_count(small_root), edge_count(large_root)
+    growth = large / small
+    # 4x the files. Linear growth is 4x; quadratic is 16x. The bound is loose on
+    # purpose -- it is a growth-RATE guard, not a size target, and must not be
+    # tightened into a benchmark.
+    assert growth < 6.0, f"{small} -> {large} edges for 4x the files ({growth:.1f}x growth)"
+
+
+def test_no_single_reference_is_expanded_past_the_ambiguity_limit(repo, write):
+    duck_typed_repo(repo, write, 60)
+    store = Store.open(repo)
+    Indexer(repo, store, GitTreeSource(repo)).reconcile("HEAD")
+    rows = store.connection.execute(
+        "SELECT COUNT(*) AS n FROM edges WHERE rev='HEAD' GROUP BY src, callsite_path,"
+        " callsite_line"
+    ).fetchall()
+    assert rows, "no edges at all — the fixture stopped exercising anything"
+    worst = max(row["n"] for row in rows)
+    assert worst <= DEFAULT_AMBIGUITY_LIMIT, f"a single call site produced {worst} edges"
     store.close()

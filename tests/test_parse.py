@@ -32,6 +32,49 @@ def test_body_hash_changes_with_body():
     assert one.nodes[0].body_hash != two.nodes[0].body_hash
 
 
+def _class_hash(result):
+    return next(n.body_hash for n in result.nodes if n.qualname == "Beta")
+
+
+def _method_hash(result):
+    return next(n.body_hash for n in result.nodes if n.qualname == "Beta.gamma")
+
+
+def test_class_body_hash_ignores_a_method_body_edit():
+    """B7 regression: a class's body_hash used to include every nested
+    method's body verbatim, so editing one line inside a single method
+    reported BOTH the method AND its class as changed. `_BodyElider`
+    already solved exactly this for module nodes; it just wasn't applied
+    to classes too."""
+    one = parse_blob(b"class Beta:\n    def gamma(self):\n        return 1\n")
+    two = parse_blob(b"class Beta:\n    def gamma(self):\n        return 2\n")
+    assert _class_hash(one) == _class_hash(two)
+    # The method's own body_hash still changes -- only the class's doesn't.
+    assert _method_hash(one) != _method_hash(two)
+
+
+def test_class_body_hash_changes_when_a_method_is_added():
+    one = parse_blob(b"class Beta:\n    def gamma(self):\n        pass\n")
+    two = parse_blob(
+        b"class Beta:\n    def gamma(self):\n        pass\n\n    def delta(self):\n        pass\n"
+    )
+    assert _class_hash(one) != _class_hash(two)
+
+
+def test_class_body_hash_changes_with_bases_and_decorators():
+    plain = parse_blob(b"class Beta:\n    def gamma(self):\n        pass\n")
+    subclassed = parse_blob(b"class Beta(Base):\n    def gamma(self):\n        pass\n")
+    decorated = parse_blob(b"@final\nclass Beta:\n    def gamma(self):\n        pass\n")
+    assert _class_hash(plain) != _class_hash(subclassed)
+    assert _class_hash(plain) != _class_hash(decorated)
+
+
+def test_class_body_hash_ignores_line_position():
+    top = parse_blob(b"class Beta:\n    def gamma(self):\n        pass\n")
+    shifted = parse_blob(b"\n\n\nclass Beta:\n    def gamma(self):\n        pass\n")
+    assert _class_hash(top) == _class_hash(shifted)
+
+
 def test_shadowed_definitions_are_all_retained():
     result = parse_blob(b"def alpha():\n    return 1\n\n\ndef alpha():\n    return 2\n")
     alphas = [n for n in result.nodes if n.qualname == "alpha"]
@@ -88,6 +131,66 @@ def test_bare_call_and_self_call_recorded():
     assert raw == {"helper", "self.step"}
 
 
+def test_calls_on_non_flattenable_receivers_are_still_recorded():
+    """Regression for F2: a call whose receiver isn't a flattenable
+    Name/Attribute chain used to be dropped from `refs` entirely -- no edge
+    and no `unresolved` row, so the loss was invisible. `super().go()`,
+    `PaymentService().charge(x)`, `self.items[0].run()`, `(a or b).fire()`
+    and `d["k"].m()` must all still produce a `call` ref, carrying the
+    attribute name (marked with the synthetic `<attr>.` prefix so it is
+    routed past the HIGH-confidence resolver steps rather than falsely
+    matched as an imported/module-local/self name)."""
+    source = (
+        b"class Base:\n"
+        b"    def go(self):\n        pass\n\n\n"
+        b"class Child(Base):\n"
+        b"    def go(self):\n"
+        b"        super().go()\n"
+        b"        PaymentService().charge(1)\n"
+        b"        self.items[0].run()\n"
+        b"        (a or b).fire()\n"
+        b"        d['k'].m()\n"
+)
+    result = parse_blob(source)
+    raw = {r.raw_name for r in result.refs if r.ref_kind == "call"}
+    assert raw >= {
+        "<attr>.go",
+        "<attr>.charge",
+        "<attr>.run",
+        "<attr>.fire",
+        "<attr>.m",
+    }
+
+
+def test_call_with_no_attribute_at_all_is_recorded_under_a_placeholder():
+    """`handlers[i]()` -- the callable itself isn't even an attribute
+    access, so there is no name at all to key on; it must still be counted,
+    not silently dropped."""
+    source = b"def dispatch(handlers, i):\n    handlers[i]()\n"
+    result = parse_blob(source)
+    raw = {r.raw_name for r in result.refs if r.ref_kind == "call"}
+    assert raw == {"<dynamic>"}
+
+
+def test_open_call_mode_is_captured_in_raw_name():
+    """`open`'s effect kind depends on its mode argument, which the effect
+    catalog (a plain dotted-name matcher) can never see on its own -- the
+    parser is the one place with the call's AST, so it encodes what it
+    learns into the ref's `raw_name` for the catalog to key on."""
+    source = (
+        b"def f(mode):\n"
+        b"    open('a')\n"
+        b"    open('b', 'r')\n"
+        b"    open('c', 'w')\n"
+        b"    open('d', 'ab')\n"
+        b"    open('e', mode='x')\n"
+        b"    open('f', mode)\n"
+    )
+    result = parse_blob(source)
+    raw = [r.raw_name for r in result.refs if r.ref_kind == "call"]
+    assert raw == ["open", "open", "open!write", "open!write", "open!write", "open!ambiguous"]
+
+
 def test_imports_recorded_with_level():
     source = b"import os\nfrom . import sibling\nfrom pay.service import charge as c\n"
     result = parse_blob(source)
@@ -115,3 +218,58 @@ def test_syntax_error_returns_error_not_exception():
 def test_parse_is_deterministic():
     source = b"class A:\n    def m(self):\n        return other()\n"
     assert parse_blob(source) == parse_blob(source)
+
+
+def test_global_statement_recorded_as_ref():
+    source = b"COUNT = 0\n\n\ndef bump():\n    global COUNT\n    COUNT += 1\n"
+    result = parse_blob(source)
+    ref = next(r for r in result.refs if r.ref_kind == "global")
+    assert ref.from_qualname == "bump"
+    assert ref.raw_name == "COUNT"
+    assert ref.line == 5
+
+
+def test_nonlocal_statement_recorded_as_global_ref():
+    source = (
+        b"def outer():\n"
+        b"    x = 0\n"
+        b"    def inner():\n"
+        b"        nonlocal x\n"
+        b"        x += 1\n"
+        b"    return inner\n"
+    )
+    result = parse_blob(source)
+    ref = next(r for r in result.refs if r.ref_kind == "global")
+    assert ref.from_qualname == "outer.<locals>.inner"
+    assert ref.raw_name == "x"
+
+
+def test_global_statement_with_multiple_names_recorded_separately():
+    source = b"def bump():\n    global A, B\n    A += 1\n    B += 1\n"
+    result = parse_blob(source)
+    names = {r.raw_name for r in result.refs if r.ref_kind == "global"}
+    assert names == {"A", "B"}
+
+
+def test_module_body_hash_ignores_line_shift():
+    top = parse_blob(b"def alpha():\n    return 1\n")
+    shifted = parse_blob(b"\n\n\ndef alpha():\n    return 1\n")
+    assert top.module_body_hash == shifted.module_body_hash
+
+
+def test_module_body_hash_ignores_nested_body_changes():
+    one = parse_blob(b"def alpha():\n    return 1\n")
+    two = parse_blob(b"def alpha():\n    return 2\n")
+    assert one.module_body_hash == two.module_body_hash
+
+
+def test_module_body_hash_changes_with_top_level_statement():
+    one = parse_blob(b"def alpha():\n    return 1\n")
+    two = parse_blob(b"import requests\n\n\ndef alpha():\n    return 1\n")
+    assert one.module_body_hash != two.module_body_hash
+
+
+def test_module_body_hash_changes_when_def_is_added():
+    one = parse_blob(b"def alpha():\n    return 1\n")
+    two = parse_blob(b"def alpha():\n    return 1\n\n\ndef beta():\n    return 2\n")
+    assert one.module_body_hash != two.module_body_hash

@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 WORKTREE = "WORKTREE"
 
@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS blobs (
     blob_sha TEXT PRIMARY KEY,
     status TEXT NOT NULL,
     error TEXT,
-    parser_version TEXT NOT NULL
+    parser_version TEXT NOT NULL,
+    module_body_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS blob_nodes (
     blob_sha TEXT NOT NULL,
@@ -106,8 +107,20 @@ CREATE TABLE IF NOT EXISTS effects (
 CREATE TABLE IF NOT EXISTS imports (
     rev TEXT NOT NULL, importer_path TEXT NOT NULL, module TEXT NOT NULL
 );
+-- A call site that produced no edge, and why. `reason` is 'unknown' when no
+-- candidate was found at all, or 'ambiguous' when too many equally-weak ones
+-- were (see config.DEFAULT_AMBIGUITY_LIMIT); `candidates` carries the count the
+-- ambiguous case declined to enumerate, and is 0 for 'unknown'. Separating the
+-- two matters because they are opposite problems: 'unknown' means the resolver
+-- is blind to something, 'ambiguous' means it sees too much.
 CREATE TABLE IF NOT EXISTS unresolved (
-    rev TEXT NOT NULL, path TEXT NOT NULL, line INTEGER NOT NULL, raw_name TEXT NOT NULL
+    rev TEXT NOT NULL,
+    path TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    raw_name TEXT NOT NULL,
+    ref_kind TEXT NOT NULL DEFAULT 'call',
+    reason TEXT NOT NULL DEFAULT 'unknown',
+    candidates INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(rev, dst);

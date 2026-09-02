@@ -26,6 +26,28 @@ from codegraph.store import Store
 
 HIGH, MEDIUM, LOW = "HIGH", "MEDIUM", "LOW"
 
+#: Canonical rank for comparing confidence tiers: higher is stronger. This
+#: is the one place the tier order is defined -- `effects/propagate.py`,
+#: `query/impact.py`, and `query/effects.py` all compare confidence tiers
+#: and used to each redefine this table locally, with no guarantee they
+#: agreed: two copies used higher-is-stronger, one used the opposite
+#: polarity with the tiers spelled out as separate string literals rather
+#: than these constants, so renaming a tier would have silently produced a
+#: `KeyError` in whichever copy nobody happened to update. Importing this
+#: one table (and `stronger`/`weaker` below) is the fix.
+CONFIDENCE_RANK: dict[str, int] = {LOW: 0, MEDIUM: 1, HIGH: 2}
+
+
+def stronger(a: str, b: str) -> str:
+    """The more confident of two tiers (ties favor `a`)."""
+    return a if CONFIDENCE_RANK[a] >= CONFIDENCE_RANK[b] else b
+
+
+def weaker(a: str, b: str) -> str:
+    """The less confident of two tiers (ties favor `a`)."""
+    return a if CONFIDENCE_RANK[a] <= CONFIDENCE_RANK[b] else b
+
+
 PROVENANCE = "static"
 
 #: `src` for a reference made at module scope, which owns no node of its own.
@@ -184,6 +206,54 @@ class AstResolver:
 class ResolveStats:
     edges: int = 0
     unresolved: int = 0
+    ambiguous: int = 0
+
+
+def build_import_maps(
+    connection: sqlite3.Connection, rev: str, config: Config
+) -> tuple[dict[str, dict[str, str]], dict[str, set[str]]]:
+    """Per-path local-alias -> absolute-dotted-module map, and the set of
+    modules each path imports (feeds `dependents()`).
+
+    The one place a raw `import`/`from ... import` row -- with its
+    relative-import `level` -- gets expanded into an absolute dotted module
+    name. Both the resolver (`_SymbolTable`, below) and effect detection's
+    catalog expansion (`effects/detect.py`) build on this rather than each
+    repeating the expansion, so the two cannot silently drift apart.
+    """
+    paths = [
+        row["path"]
+        for row in connection.execute("SELECT DISTINCT path FROM tree WHERE rev=?", (rev,))
+    ]
+    module_for = {path: module_for_path(path, config.source_roots) for path in paths}
+    alias_maps: dict[str, dict[str, str]] = {path: {} for path in paths}
+    imported_modules: dict[str, set[str]] = {path: set() for path in paths}
+
+    rows = connection.execute(
+        "SELECT t.path, i.module, i.level, i.name, i.alias FROM blob_imports i"
+        " JOIN tree t ON t.blob_sha = i.blob_sha WHERE t.rev=? ORDER BY t.path, i.ordinal",
+        (rev,),
+    )
+    for row in rows:
+        path = row["path"]
+        alias_map = alias_maps[path]
+        modules = imported_modules[path]
+        package = package_for_module(module_for[path], path)
+        module = absolute_module(row["module"], row["level"], package)
+        if row["name"] is None:
+            # `import a.b` / `import a.b as c`: the alias names the module,
+            # and a plain import also makes the full dotted path usable.
+            alias_map[row["alias"] or module] = module
+            if row["alias"] is None:
+                alias_map.setdefault(module.partition(".")[0], module.partition(".")[0])
+        else:
+            target = f"{module}.{row['name']}" if module else row["name"]
+            alias_map[row["alias"] or row["name"]] = target
+            # `from a.b import c` may name a module or a symbol; record both.
+            modules.add(target)
+        if module:
+            modules.add(module)
+    return alias_maps, imported_modules
 
 
 class _SymbolTable:
@@ -235,37 +305,7 @@ class _SymbolTable:
             if found:
                 self.enclosing_class[row["id"]] = found
 
-        self.import_maps: dict[str, dict[str, str]] = {path: {} for path in self.paths}
-        self.imported_modules: dict[str, set[str]] = {path: set() for path in self.paths}
-        self._build_imports(connection, rev)
-
-    def _build_imports(self, connection: sqlite3.Connection, rev: str) -> None:
-        """One pass over the revision's imports, expanding relative ones."""
-        rows = connection.execute(
-            "SELECT t.path, i.module, i.level, i.name, i.alias FROM blob_imports i"
-            " JOIN tree t ON t.blob_sha = i.blob_sha"
-            " WHERE t.rev=? ORDER BY t.path, i.ordinal",
-            (rev,),
-        )
-        for row in rows:
-            path = row["path"]
-            alias_map = self.import_maps[path]
-            modules = self.imported_modules[path]
-            package = package_for_module(self.module_for[path], path)
-            module = absolute_module(row["module"], row["level"], package)
-            if row["name"] is None:
-                # `import a.b` / `import a.b as c`: the alias names the module,
-                # and a plain import also makes the full dotted path usable.
-                alias_map[row["alias"] or module] = module
-                if row["alias"] is None:
-                    alias_map.setdefault(module.partition(".")[0], module.partition(".")[0])
-            else:
-                target = f"{module}.{row['name']}" if module else row["name"]
-                alias_map[row["alias"] or row["name"]] = target
-                # `from a.b import c` may name a module or a symbol; record both.
-                modules.add(target)
-            if module:
-                modules.add(module)
+        self.import_maps, self.imported_modules = build_import_maps(connection, rev, config)
 
     def context(self, rev: str, path: str, bases: dict[str, list[str]]) -> ResolveContext:
         return ResolveContext(
@@ -340,17 +380,51 @@ def _source_id(ref: ParsedRef, table: _SymbolTable, path: str) -> str:
     return table.qualname_index.get((path, ref.from_qualname), candidates[-1][0])
 
 
+def split_by_ambiguity_limit(
+    hits: list[tuple[str, str]], limit: int
+) -> tuple[list[tuple[str, str]], int]:
+    """Split a resolver's candidates into the ones to materialize and the count
+    of low-confidence ones being collapsed instead.
+
+    The over-approximation bias says a candidate is never dropped to improve
+    precision, and this does not drop one: when a bare name matches hundreds of
+    definitions, the N edges and the single "ambiguous, N candidates" record
+    make exactly the same claim. Enumerating it is what is being declined, not
+    asserting it -- and enumerating it is quadratic in repo size while saying
+    nothing a reader could act on.
+
+    Only LOW candidates are ever collapsed. A HIGH or MEDIUM hit means the
+    resolver actually distinguished something, and is always materialized --
+    including alongside a collapsed LOW set, so a call site with one confident
+    answer and a long ambiguous tail keeps the answer.
+
+    `limit <= 0` disables the cap entirely.
+    """
+    if limit <= 0 or len(hits) <= limit:
+        return hits, 0
+    weak = [hit for hit in hits if hit[1] == LOW]
+    if len(weak) <= limit:
+        return hits, 0
+    return [hit for hit in hits if hit[1] != LOW], len(weak)
+
+
 def resolve_revision(
     store: Store, rev: str, config: Config, resolver: Resolver | None = None
 ) -> ResolveStats:
     """Rewrite `edges`, `imports` and `unresolved` for one revision.
 
-    v1 re-resolves the whole revision rather than narrowing to
-    `dependents()`; resolution is cheap next to parsing and a whole-revision
-    rewrite cannot leave a stale edge behind.
+    Still re-resolves the whole revision rather than narrowing to
+    `dependents()`: a whole-revision rewrite cannot leave a stale edge behind.
+    That is the one half of the cost guarantee this does not yet honour --
+    tracked, and stated in the README rather than glossed.
+
+    `config.ambiguity_limit` bounds how many indistinguishable LOW candidates a
+    single reference will be expanded into; past it the reference is recorded
+    once in `unresolved` as ambiguous. See `split_by_ambiguity_limit`.
     """
     resolver = resolver or AstResolver()
     connection = store.connection
+    limit = config.ambiguity_limit
     table = _SymbolTable(store, rev, config)
 
     connection.execute("DELETE FROM edges WHERE rev=?", (rev,))
@@ -367,6 +441,7 @@ def resolve_revision(
 
     edge_rows: list[tuple] = []
     unresolved_rows: list[tuple] = []
+    ambiguous_rows: list[tuple] = []
 
     # Inheritance first: `self.X` walks the class hierarchy, so the hierarchy
     # has to exist before any call is resolved.
@@ -376,7 +451,14 @@ def resolve_revision(
         ctx = table.context(rev, path, bases)
         for ref in base_refs.get(path, ()):
             src = _source_id(ref, table, path)
-            for node_id, confidence in resolver.resolve_call(ref, ctx):
+            # A base named by a bare, repo-wide-ambiguous name fans out exactly
+            # like a call does, and on a large repo it is the larger half of the
+            # blowup. Capping it cannot affect the MRO: only HIGH links feed
+            # `bases`, and the cap only ever collapses LOW ones.
+            kept, ambiguous_count = split_by_ambiguity_limit(
+                resolver.resolve_call(ref, ctx), limit
+            )
+            for node_id, confidence in kept:
                 edge_rows.append(
                     (rev, src, node_id, "INHERITS", confidence, PROVENANCE, path, ref.line)
                 )
@@ -385,6 +467,10 @@ def resolve_revision(
                 # the walk falls through to the repo-wide name match anyway.
                 if confidence == HIGH:
                     bases.setdefault(src, []).append(node_id)
+            if ambiguous_count:
+                ambiguous_rows.append(
+                    (rev, path, ref.line, ref.raw_name, "base", "ambiguous", ambiguous_count)
+                )
 
     call_refs = _refs_by_path(store, rev, "call")
     for path in table.paths:
@@ -392,14 +478,19 @@ def resolve_revision(
         for ref in call_refs.get(path, ()):
             src = _source_id(ref, table, path)
             hits = resolver.resolve_call(ref, ctx)
-            for node_id, confidence in hits:
+            kept, ambiguous_count = split_by_ambiguity_limit(hits, limit)
+            for node_id, confidence in kept:
                 edge_rows.append(
                     (rev, src, node_id, "CALLS", confidence, PROVENANCE, path, ref.line)
                 )
-            if not hits:
+            if ambiguous_count:
+                ambiguous_rows.append(
+                    (rev, path, ref.line, ref.raw_name, "call", "ambiguous", ambiguous_count)
+                )
+            elif not hits:
                 # Never dropped: the ref stays in `blob_refs` for effect
                 # detection, and the gap is counted as a health signal.
-                unresolved_rows.append((rev, path, ref.line, ref.raw_name))
+                unresolved_rows.append((rev, path, ref.line, ref.raw_name, "call", "unknown", 0))
 
     connection.executemany(
         "INSERT INTO edges(rev, src, dst, kind, confidence, provenance, callsite_path,"
@@ -407,10 +498,15 @@ def resolve_revision(
         edge_rows,
     )
     connection.executemany(
-        "INSERT INTO unresolved(rev, path, line, raw_name) VALUES(?, ?, ?, ?)",
-        unresolved_rows,
+        "INSERT INTO unresolved(rev, path, line, raw_name, ref_kind, reason, candidates)"
+        " VALUES(?, ?, ?, ?, ?, ?, ?)",
+        unresolved_rows + ambiguous_rows,
     )
-    return ResolveStats(edges=len(edge_rows), unresolved=len(unresolved_rows))
+    return ResolveStats(
+        edges=len(edge_rows),
+        unresolved=len(unresolved_rows),
+        ambiguous=len(ambiguous_rows),
+    )
 
 
 def dependents(store: Store, rev: str, modules: set[str]) -> set[str]:
@@ -426,11 +522,23 @@ def dependents(store: Store, rev: str, modules: set[str]) -> set[str]:
 
 
 def find_symbol(store: Store, rev: str, query: str) -> list[sqlite3.Row]:
-    """Fuzzy lookup: exact id, then exact qualname, then suffix match."""
+    """Fuzzy lookup: exact id, then exact qualname, then suffix match.
+
+    All three steps compare case-insensitively (`COLLATE NOCASE` for the
+    two exact steps; `LIKE`'s own ASCII case-folding, already the default,
+    for the suffix step), so a query's case can never change which set of
+    symbols comes back -- `resolve charge` and `resolve CHARGE` return the
+    identical result. Before this, steps 1-2 compared with binary `=`
+    while step 3 was already case-insensitive, so a query differing only
+    in case from the real name could fall straight through the (missed)
+    exact steps and land on step 3's dot-anchored suffix pattern -- which
+    can never match a top-level, dot-free qualname at all -- producing a
+    completely different, disjoint match set instead of the same one.
+    """
     columns = "id, path, qualname, kind, line_start, line_end, name_binding"
     for clause, parameters in (
-        ("id=?", (query,)),
-        ("qualname=?", (query,)),
+        ("id=? COLLATE NOCASE", (query,)),
+        ("qualname=? COLLATE NOCASE", (query,)),
         ("qualname LIKE ? ESCAPE '\\'", (f"%.{_escape_like(query)}",)),
     ):
         rows = store.connection.execute(
