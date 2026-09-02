@@ -16,6 +16,7 @@ improve precision, only recorded at a lower confidence.
 
 from __future__ import annotations
 
+import builtins
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -49,6 +50,31 @@ def weaker(a: str, b: str) -> str:
 
 
 PROVENANCE = "static"
+
+#: Python builtins, as the names they are actually called by.
+#:
+#: These matter because the last-resort step matches a call's final dotted
+#: segment against every definition in the repository, and plenty of builtins
+#: share a name with a plausible method: `set`, `list`, `next`, `id`, `type`,
+#: `format`, `hash`, `filter`, `map`, `open`, `sum`, `iter`, `compile`, `vars`.
+#: On `psf/requests` that turned `badargs = set(kwargs) - set(result)` inside
+#: `create_cookie` into an edge to `RequestsCookieJar.set`, which then carried
+#: an effect into a witness path presented as clickable evidence. See #17.
+BUILTIN_NAMES: frozenset[str] = frozenset(dir(builtins))
+
+
+def is_builtin_call(ref: ParsedRef) -> bool:
+    """Is this reference a call to a Python builtin rather than a repo symbol?
+
+    Only a BARE name can be: `x.set(...)` is a method call on something, and
+    must keep falling through to the name match. A bare name is safe to claim
+    here because the steps before this one have already ruled out every way a
+    repo symbol could legitimately shadow the builtin -- a module-local
+    `def set(...)` is caught at step 2 and an imported one at step 1, both at
+    HIGH. So a bare builtin name arriving at the last-resort step is the
+    builtin.
+    """
+    return not ref.dotted and ref.raw_name in BUILTIN_NAMES
 
 #: `src` for a reference made at module scope, which owns no node of its own.
 MODULE_SCOPE = "<module>"
@@ -254,6 +280,8 @@ class AstResolver:
 
     # -- steps 4 and 5: a repo-wide match on the last segment -------------
     def _by_last_segment(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
+        if is_builtin_call(ref):
+            return []
         candidates = ctx.name_index.get(ref.raw_name.rpartition(".")[2], ())
         if len(candidates) == 1:
             return [(candidates[0], MEDIUM)]
@@ -509,6 +537,7 @@ def resolve_revision(
     edge_rows: list[tuple] = []
     unresolved_rows: list[tuple] = []
     ambiguous_rows: list[tuple] = []
+    builtin_rows: list[tuple] = []
 
     # Inheritance first: `self.X` walks the class hierarchy, so the hierarchy
     # has to exist before any call is resolved.
@@ -565,6 +594,13 @@ def resolve_revision(
                 ambiguous_rows.append(
                     (rev, path, ref.line, ref.raw_name, "call", "ambiguous", ambiguous_count)
                 )
+            elif is_builtin_call(ref):
+                # Recorded, but not as a gap. A builtin is a reference the
+                # resolver understood and deliberately did not link to a repo
+                # symbol -- counting it as "unresolved" buries the real gaps
+                # under a large constant. Still written, so the choice is
+                # visible rather than silent.
+                builtin_rows.append((rev, path, ref.line, ref.raw_name, "call", "builtin", 0))
             elif not hits:
                 # Never dropped: the ref stays in `blob_refs` for effect
                 # detection, and the gap is counted as a health signal.
@@ -578,7 +614,7 @@ def resolve_revision(
     connection.executemany(
         "INSERT INTO unresolved(rev, path, line, raw_name, ref_kind, reason, candidates)"
         " VALUES(?, ?, ?, ?, ?, ?, ?)",
-        unresolved_rows + ambiguous_rows,
+        unresolved_rows + ambiguous_rows + builtin_rows,
     )
     return ResolveStats(
         edges=len(edge_rows),

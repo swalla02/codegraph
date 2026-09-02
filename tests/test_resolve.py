@@ -605,3 +605,89 @@ def test_an_inheritance_cycle_does_not_hang_the_override_walk(repo, write):
     targets = {dst for src, dst, _ in edges(store) if src == "cyc.py::A.go"}
     assert "cyc.py::A.run" in targets
     store.close()
+
+
+# -- builtins are not repo symbols -----------------------------------------
+#
+# The last-resort step matches a call's final segment against every definition
+# in the repo, and plenty of builtins share a name with a plausible method. On
+# `psf/requests`, `badargs = set(kwargs) - set(result)` inside `create_cookie`
+# became an edge to `RequestsCookieJar.set`, which then carried a NONDETERMINISM
+# effect into a witness path presented to the user as evidence. See #17.
+
+
+def repo_with_a_method_named_set(write):
+    write(
+        "jar.py",
+        "class Jar:\n"
+        "    def set(self, k, v):\n"
+        "        self._d[k] = v\n",
+    )
+    write(
+        "make.py",
+        "def build(kwargs, result):\n"
+        "    badargs = set(kwargs) - set(result)\n"
+        "    return badargs\n",
+        commit="jar",
+    )
+
+
+def test_a_bare_builtin_call_is_not_an_edge_to_a_same_named_method(repo, write):
+    repo_with_a_method_named_set(write)
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert not [dst for src, dst, _ in edges(store) if src == "make.py::build"], (
+        "the builtin set() was linked to a repo method named set"
+    )
+    store.close()
+
+
+def test_a_builtin_is_recorded_as_such_and_not_counted_as_a_gap(repo, write):
+    repo_with_a_method_named_set(write)
+    store, indexer = build(repo)
+    stats = indexer.reconcile("HEAD")
+    rows = [row for row in unresolved_rows(store) if row["path"] == "make.py"]
+    assert {row["reason"] for row in rows} == {"builtin"}
+    assert {row["raw_name"] for row in rows} == {"set"}
+    # Recorded, but a builtin is not a hole in the graph.
+    assert stats.unresolved == 0
+    store.close()
+
+
+def test_a_dotted_call_ending_in_a_builtin_name_still_falls_through(repo, write):
+    """Only a BARE name can be the builtin. `x.set(...)` is a method call on
+    something and must keep reaching the name match -- otherwise this fix would
+    blind the resolver to every `.set()`, `.list()` and `.format()` in the repo."""
+    write("jar.py", "class Jar:\n    def set(self, k):\n        return k\n")
+    write("use.py", "def store(j, k):\n    return j.set(k)\n", commit="use")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("use.py::store", "jar.py::Jar.set", "MEDIUM") in edges(store)
+    store.close()
+
+
+def test_a_module_local_definition_still_shadows_the_builtin(repo, write):
+    """The skip is only safe because the earlier steps run first. A repo that
+    really does define `set` must still resolve to its own."""
+    write(
+        "own.py",
+        "def set(x):\n    return x\n\n\ndef caller():\n    return set(1)\n",
+        commit="own",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("own.py::caller", "own.py::set", "HIGH") in edges(store)
+    store.close()
+
+
+def test_an_imported_definition_still_shadows_the_builtin(repo, write):
+    write("lib.py", "def set(x):\n    return x\n")
+    write(
+        "app.py",
+        "from lib import set\n\n\ndef caller():\n    return set(1)\n",
+        commit="imported",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("app.py::caller", "lib.py::set", "HIGH") in edges(store)
+    store.close()
