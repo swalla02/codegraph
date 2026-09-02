@@ -112,6 +112,11 @@ class ResolveContext:
     import_map: dict[str, str]  # local alias -> dotted target
     bases: dict[str, list[str]]  # class node id -> base class node ids
     enclosing_class: dict[str, str] = field(default_factory=dict)  # node id -> class node id
+    subclasses: dict[str, list[str]] = field(default_factory=dict)  # inverse of `bases`
+    #: Memo for `_descendants`, shared across every file of the revision. The
+    #: hierarchy is fixed once inheritance has been resolved, but the walk runs
+    #: per `self.X` reference -- on django that cost 3.5s of a 11.2s resolve.
+    descendant_cache: dict[str, list[str]] = field(default_factory=dict)
 
 
 class Resolver(Protocol):
@@ -165,8 +170,31 @@ class AstResolver:
         node_id = ctx.qualname_index.get((ctx.path, ref.raw_name))
         return [(node_id, HIGH)] if node_id else []
 
-    # -- step 3: self.X through the class and its bases -------------------
+    # -- step 3: self.X through the class, its bases, and its overrides ----
     def _through_self(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
+        """`self.X` resolves to the method the enclosing class inherits, PLUS
+        every override of it in a subclass.
+
+        Walking only up the MRO and stopping at the first hit is wrong, and
+        wrong in the direction that hurts most. `self` is an instance of the
+        enclosing class *or of any subclass of it*, so an override is a real
+        runtime candidate, and dropping it is the over-approximation bias
+        pointing backwards.
+
+        The damage is worst when the base declaration is an abstract stub. In
+        `requests`, `SessionRedirectMixin.send` has a `...` body and
+        `Session(SessionRedirectMixin)` supplies the real one; first-match-wins
+        bound `self.send()` inside `resolve_redirects` to the stub at HIGH
+        confidence, so `impact Session.send` -- the single most important edge
+        in the library, the one that drives every redirect hop -- reported
+        nothing. See issue #14.
+
+        The inherited match keeps HIGH: it is the declaration this class
+        actually resolves to by name. Overrides are MEDIUM, because which one
+        runs depends on the instance, and that is genuinely less certain than
+        a name lookup -- not LOW, which is the tier for a repo-wide guess with
+        no hierarchy behind it.
+        """
         head, _, attribute = ref.raw_name.partition(".")
         if head != "self" or not attribute or "." in attribute:
             return []
@@ -174,25 +202,55 @@ class AstResolver:
         start = ctx.enclosing_class.get(owner) if owner else None
         if start is None:
             return []
+
+        hits: list[tuple[str, str]] = []
         for class_id in self._mro(start, ctx):
-            class_path, _, class_qualname = class_id.partition("::")
-            node_id = ctx.qualname_index.get((class_path, f"{class_qualname}.{attribute}"))
+            node_id = self._method_on(class_id, attribute, ctx)
             if node_id:
-                return [(node_id, HIGH)]
-        return []
+                hits.append((node_id, HIGH))
+                break
+        if not hits:
+            return []
+
+        seen = {hits[0][0]}
+        for class_id in self._descendants(start, ctx):
+            node_id = self._method_on(class_id, attribute, ctx)
+            if node_id and node_id not in seen:
+                seen.add(node_id)
+                hits.append((node_id, MEDIUM))
+        return hits
 
     @staticmethod
-    def _mro(start: str, ctx: ResolveContext) -> list[str]:
-        """Breadth-first walk of the class and its known bases, cycle-safe."""
+    def _method_on(class_id: str, attribute: str, ctx: ResolveContext) -> str | None:
+        class_path, _, class_qualname = class_id.partition("::")
+        return ctx.qualname_index.get((class_path, f"{class_qualname}.{attribute}"))
+
+    @staticmethod
+    def _walk(start: str, adjacency: dict[str, list[str]]) -> list[str]:
+        """Breadth-first walk from `start` over `adjacency`, cycle-safe."""
         order, seen, queue = [], {start}, [start]
         while queue:
             current = queue.pop(0)
             order.append(current)
-            for base in ctx.bases.get(current, ()):
-                if base not in seen:
-                    seen.add(base)
-                    queue.append(base)
+            for nxt in adjacency.get(current, ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    queue.append(nxt)
         return order
+
+    @classmethod
+    def _mro(cls, start: str, ctx: ResolveContext) -> list[str]:
+        """The class and its known bases, nearest first."""
+        return cls._walk(start, ctx.bases)
+
+    @classmethod
+    def _descendants(cls, start: str, ctx: ResolveContext) -> list[str]:
+        """Every known subclass of `start`, transitively (excluding `start`)."""
+        cached = ctx.descendant_cache.get(start)
+        if cached is None:
+            cached = cls._walk(start, ctx.subclasses)[1:]
+            ctx.descendant_cache[start] = cached
+        return cached
 
     # -- steps 4 and 5: a repo-wide match on the last segment -------------
     def _by_last_segment(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
@@ -307,7 +365,14 @@ class _SymbolTable:
 
         self.import_maps, self.imported_modules = build_import_maps(connection, rev, config)
 
-    def context(self, rev: str, path: str, bases: dict[str, list[str]]) -> ResolveContext:
+    def context(
+        self,
+        rev: str,
+        path: str,
+        bases: dict[str, list[str]],
+        subclasses: dict[str, list[str]] | None = None,
+        descendant_cache: dict[str, list[str]] | None = None,
+    ) -> ResolveContext:
         return ResolveContext(
             rev=rev,
             path=path,
@@ -318,6 +383,8 @@ class _SymbolTable:
             import_map=self.import_maps[path],
             bases=bases,
             enclosing_class=self.enclosing_class,
+            subclasses=subclasses if subclasses is not None else {},
+            descendant_cache=descendant_cache if descendant_cache is not None else {},
         )
 
 
@@ -472,9 +539,20 @@ def resolve_revision(
                     (rev, path, ref.line, ref.raw_name, "base", "ambiguous", ambiguous_count)
                 )
 
+    # The hierarchy is complete now, so it can be inverted once: `self.X`
+    # needs to see downwards (overrides in subclasses) as well as upwards.
+    subclasses: dict[str, list[str]] = {}
+    for subclass, base_ids in bases.items():
+        for base in base_ids:
+            subclasses.setdefault(base, []).append(subclass)
+
+    # One cache object shared by every file's context, so the descendant walk
+    # runs once per class for the whole revision rather than once per reference.
+    descendant_cache: dict[str, list[str]] = {}
+
     call_refs = _refs_by_path(store, rev, "call")
     for path in table.paths:
-        ctx = table.context(rev, path, bases)
+        ctx = table.context(rev, path, bases, subclasses, descendant_cache)
         for ref in call_refs.get(path, ()):
             src = _source_id(ref, table, path)
             hits = resolver.resolve_call(ref, ctx)
