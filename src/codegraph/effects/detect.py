@@ -32,16 +32,21 @@ def detect_direct(store: Store, rev: str, catalog: Catalog, config: Config) -> i
         (rev,),
     ):
         if row["ref_kind"] == "global":
-            kind = "GLOBAL_MUTATE"
+            # Syntactic detection (assignment to a name declared `global`/
+            # `nonlocal`), not a catalog match -- there is no pattern
+            # specificity to derive uncertainty from, and none is
+            # warranted: this is exact by construction.
+            kind, confidence = "GLOBAL_MUTATE", HIGH
         else:
             dotted = _expand(row["raw_name"], import_maps.get(row["path"], {}))
-            kind = catalog.match(dotted)
-        if kind is None:
-            continue
+            matched = catalog.match_with_confidence(dotted)
+            if matched is None:
+                continue
+            kind, confidence = matched
         node_id = _owning_node(
             row["path"], row["from_qualname"], row["line"], owner_index, live_index
         )
-        rows.append((rev, node_id, kind, 1, row["path"], row["line"], HIGH))
+        rows.append((rev, node_id, kind, 1, row["path"], row["line"], confidence))
 
     connection.execute("DELETE FROM effects WHERE rev=? AND direct=1", (rev,))
     connection.executemany(

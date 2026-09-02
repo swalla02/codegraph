@@ -151,3 +151,28 @@ def test_limit_sets_truncated_flag(repo, write):
     report = impact_report(store, "HEAD", "m.py::target", limit=10)
     assert report.truncated is True
     store.close()
+
+
+def test_limit_is_a_total_budget_across_dependents_and_tests(repo, write):
+    """B3 regression: `dependents` and `tests` used to each be budgeted at
+    `limit` independently, so a report could print up to 2x its documented
+    budget (52 rows against a limit of 40, observed on codegraph's own
+    source). 15 production callers plus 15 test callers against a limit of
+    20 must keep at most 20 rows TOTAL, with `dependents` -- production
+    callers should never be crowded out by tests -- claiming its rows
+    first."""
+    prod_lines = ["def target():\n    pass\n"]
+    prod_lines += [f"def c{i}():\n    target()\n" for i in range(15)]
+    write("m.py", "\n\n".join(prod_lines), commit="m")
+    write("tests/__init__.py", "", commit="pkg")
+    test_lines = ["from m import target\n"]
+    test_lines += [f"def test_{i}():\n    target()\n" for i in range(15)]
+    write("tests/test_m.py", "\n\n".join(test_lines), commit="t")
+    store = build(repo)
+    report = impact_report(store, "HEAD", "m.py::target", limit=20)
+    total_kept = sum(len(g.rows) for g in report.groups)
+    assert total_kept == 20
+    assert report.truncated is True
+    dependents_group = next(g for g in report.groups if g.title == "dependents")
+    assert len(dependents_group.rows) == 15
+    store.close()

@@ -2,6 +2,8 @@ import subprocess
 import threading
 from pathlib import Path
 
+import pytest
+
 from codegraph import gitio
 from tests.conftest import git
 
@@ -109,6 +111,44 @@ def test_cat_file_batch_survives_early_abandonment(repo, tmp_path):
     assert not runner.is_alive(), "cat_file_batch cleanup hung on early abandonment"
 
 
+def test_ls_tree_sees_non_ascii_paths(repo, write):
+    """Regression for F1: `ls-tree --format=...` C-quotes a non-ASCII path
+    even under `-z` (`"\\303\\274n\\303\\257code.py"`), which fails
+    `.endswith(".py")` and silently drops the file from the tree."""
+    write("ünïcode.py", "def u():\n    return 1\n", commit="add unicode path")
+    tree = gitio.ls_tree(repo, "HEAD")
+    assert "ünïcode.py" in tree
+
+
+def test_ls_tree_sees_paths_with_a_space(repo, write):
+    write("has space.py", "def s():\n    return 1\n", commit="add spaced path")
+    tree = gitio.ls_tree(repo, "HEAD")
+    assert "has space.py" in tree
+
+
+def test_ls_tree_sees_paths_with_embedded_quote_or_backslash(repo, write):
+    """`"` and `\\` are C-quoted by `--format` unconditionally, independent
+    of `core.quotePath` -- only dropping `--format` entirely avoids it."""
+    write('weird"quote.py', "def q():\n    return 1\n", commit="add quoted path")
+    write("weird\\slash.py", "def s():\n    return 1\n", commit="add backslash path")
+    tree = gitio.ls_tree(repo, "HEAD")
+    assert 'weird"quote.py' in tree
+    assert "weird\\slash.py" in tree
+
+
+def test_ls_tree_and_status_paths_agree_on_a_dirty_unicode_file(repo, write):
+    """The compound failure the review flagged: with `ls_tree` dropping the
+    unicode path, an `Indexer` overlay would see it as absent from the base
+    tree and `status_paths` would report it `??`/`M` forever, on every
+    single diff, even once committed and clean. Once `ls_tree` sees the
+    path, a clean checkout must show no dirty status for it at all."""
+    write("ünïcode.py", "def u():\n    return 1\n", commit="add unicode path")
+    tree = gitio.ls_tree(repo, "HEAD")
+    assert "ünïcode.py" in tree
+    status = gitio.status_paths(repo)
+    assert "ünïcode.py" not in status
+
+
 def test_status_paths_reports_dirty_files(repo, write):
     write("a.py", "def alpha():\n    return 99\n")
     write("new.py", "def gamma():\n    pass\n")
@@ -149,3 +189,28 @@ def test_merge_base_and_default_branch(repo, write):
     write("c.py", "def gamma():\n    pass\n", commit="feature work")
     assert gitio.merge_base(repo, "main", "feature") == base
     assert gitio.default_branch(repo) == "main"
+
+
+# -- B9: a `rev` value that happens to start with `-` must be treated as a
+# revision (fails as "not found"), never reinterpreted as a git option.
+# `rev_parse` is the sharpest case: verified against a scratch repo that
+# WITHOUT the `--end-of-options` guard, `git rev-parse --not-a-real-option`
+# doesn't error at all -- rev-parse doesn't recognize the flag, falls back
+# to its "echo unrecognized arguments back verbatim" behavior, and exits 0
+# with the literal string "--not-a-real-option" as if it were a resolved
+# sha. That is a silently wrong answer, not just a confusing one.
+
+
+def test_rev_parse_treats_a_dash_prefixed_value_as_a_revision(repo):
+    with pytest.raises(gitio.GitError):
+        gitio.rev_parse(repo, "--not-a-real-option")
+
+
+def test_ls_tree_treats_a_dash_prefixed_rev_as_a_revision(repo):
+    with pytest.raises(gitio.GitError):
+        gitio.ls_tree(repo, "--not-a-real-option")
+
+
+def test_merge_base_treats_a_dash_prefixed_rev_as_a_revision(repo):
+    with pytest.raises(gitio.GitError):
+        gitio.merge_base(repo, "--not-a-real-option", "HEAD")

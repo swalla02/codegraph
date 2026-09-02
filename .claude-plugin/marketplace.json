@@ -1,0 +1,14 @@
+{
+  "name": "codegraph",
+  "owner": {
+    "name": "swalla02"
+  },
+  "plugins": [
+    {
+      "name": "codegraph",
+      "source": "./",
+      "description": "A sidecar code graph for Python: impact and side-effect analysis via a CLI (resolve, impact, effects, diff).",
+      "version": "0.1.0"
+    }
+  ]
+}

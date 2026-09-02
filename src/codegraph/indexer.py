@@ -143,7 +143,9 @@ class Indexer:
         # One transaction for the whole reconcile: Layer 1 fill-in and the
         # Layer 2 rewrite either both land or neither does.
         with connection:
-            parsed, cached, errors = self._ensure_parsed(set(tree.values()))
+            blob_shas = set(tree.values())
+            parsed, cached = self._ensure_parsed(blob_shas)
+            errors = self._error_count(blob_shas)
 
             connection.execute("DELETE FROM tree WHERE rev=?", (rev,))
             connection.executemany(
@@ -181,9 +183,9 @@ class Indexer:
             unresolved=resolved.unresolved,
         )
 
-    def _ensure_parsed(self, shas: set[str]) -> tuple[int, int, int]:
+    def _ensure_parsed(self, shas: set[str]) -> tuple[int, int]:
         """Fill Layer 1 for any sha not already parsed at the current parser
-        version. Returns (blobs_parsed, blobs_cached, parse_errors)."""
+        version. Returns (blobs_parsed, blobs_cached)."""
         connection = self.store.connection
         known = {
             row["blob_sha"]
@@ -192,11 +194,9 @@ class Indexer:
             )
         }
         missing = sorted(shas - known)
-        errors = 0
 
         for sha, data in self.source.read(missing):
             result = parse_blob(data)
-            errors += int(result.error is not None)
             connection.execute(
                 "INSERT OR REPLACE INTO blobs(blob_sha, status, error, parser_version,"
                 " module_body_hash) VALUES(?, ?, ?, ?, ?)",
@@ -243,7 +243,33 @@ class Indexer:
                 [(sha, i.ordinal, i.module, i.level, i.name, i.alias) for i in result.imports],
             )
 
-        return len(missing), len(shas) - len(missing), errors
+        return len(missing), len(shas) - len(missing)
+
+    def _error_count(self, shas: set[str]) -> int:
+        """Count of `shas` (the current revision's own blobs) whose Layer 1
+        parse is recorded as an error, regardless of whether that parse ran
+        this pass or an earlier one.
+
+        `_ensure_parsed` only fills in blobs Layer 1 hasn't seen yet, so
+        counting errors only over blobs parsed THIS pass (the old approach)
+        made `parse_errors` report correctly on the first run and then
+        silently vanish on every later run, since a broken file's blob is
+        cached (status='error') after run 1 and never re-parsed -- while the
+        file stays exactly as broken and excluded from the graph. Re-reading
+        the `blobs` table for the revision's current tree, instead of
+        trusting this pass's own counter, makes the number reflect reality
+        regardless of cache state.
+        """
+        if not shas:
+            return 0
+        connection = self.store.connection
+        placeholders = ",".join("?" * len(shas))
+        row = connection.execute(
+            f"SELECT COUNT(*) AS n FROM blobs WHERE status='error' AND blob_sha IN"
+            f" ({placeholders})",
+            tuple(shas),
+        ).fetchone()
+        return row["n"]
 
     def _materialize_nodes(self, rev: str, tree: dict[str, str]) -> int:
         """Rebuild Layer 2's `nodes` rows for `rev` from Layer 1, and return

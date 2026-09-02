@@ -74,6 +74,44 @@ def _dotted_name(node: ast.AST) -> str | None:
     return ".".join(reversed(parts))
 
 
+#: Any of these appearing in a literal `open(...)` mode string makes the
+#: call a write (or write-capable, for `+`): 'w'rite, 'a'ppend, e'x'clusive
+#: create, or read-'+'-write.
+_WRITE_MODE_CHARS = frozenset("wax+")
+
+
+def _open_call_marker(node: ast.Call) -> str:
+    """`open`'s effect kind (FS_READ vs FS_WRITE) depends on its `mode`
+    argument, which a plain dotted-name catalog match can never see --
+    this is the one place in the parser that still has the call site's
+    AST, so it is the one place this can be decided. Three outcomes,
+    encoded as three distinct synthetic names the built-in catalog
+    (`builtin.toml`) maps separately:
+
+    - no mode argument at all, or a literal mode with none of w/a/x/+:
+      a genuine read (`open` unchanged -- the plain, and by far the most
+      common, case).
+    - a literal mode containing w/a/x/+: a genuine write (`open!write`).
+    - a mode argument that isn't a string literal (a variable, an
+      f-string, ...): honestly unknown, so it keeps the conservative
+      FS_READ default (`open!ambiguous`) but at lower confidence, since
+      unlike the first case the evidence doesn't actually support it.
+    """
+    mode_node = node.args[1] if len(node.args) >= 2 else None
+    if mode_node is None:
+        for keyword in node.keywords:
+            if keyword.arg == "mode":
+                mode_node = keyword.value
+                break
+    if mode_node is None:
+        return "open"
+    if isinstance(mode_node, ast.Constant) and isinstance(mode_node.value, str):
+        if any(char in _WRITE_MODE_CHARS for char in mode_node.value):
+            return "open!write"
+        return "open"
+    return "open!ambiguous"
+
+
 def _decorator_names(node: ast.AST) -> tuple[str, ...]:
     decorators = getattr(node, "decorator_list", [])
     names = []
@@ -135,6 +173,33 @@ def _module_body_hash(tree: ast.Module) -> str:
     return _body_hash(skeleton)
 
 
+def _class_body_hash(node: ast.ClassDef) -> str:
+    """Structural hash of a class def, with every nested method/nested
+    class's OWN body elided -- the same treatment `_module_body_hash`
+    gives a module's top-level statements, applied one level down.
+
+    Without this, a class's `body_hash` covers its methods' bodies too, so
+    editing one line inside a single method changes both that method's own
+    `body_hash` (correctly) AND the class's (incorrectly) -- exactly the
+    line-shift-insensitivity `body_hash` comparison exists to provide, but
+    one level higher, and it matters for the same reason `diff` cares
+    about module-level churn: an editor touching `PaymentService.charge`
+    should not also report `PaymentService` itself as changed.
+
+    `_BodyElider().generic_visit(skeleton)` (not `.visit(skeleton)`) is the
+    deliberate difference from `_module_body_hash`: `generic_visit` walks
+    `skeleton`'s children without ever calling `visit_ClassDef` on
+    `skeleton` itself, so the class's own body list, bases, decorators,
+    and name stay intact -- only a `FunctionDef`/`ClassDef` found AMONG
+    its children (a method, a nested class) gets its body replaced with a
+    single `Pass`. Bases and decorators live in separate AST fields from
+    `body`, so they're hashed as-is regardless.
+    """
+    skeleton = copy.deepcopy(node)
+    _BodyElider().generic_visit(skeleton)
+    return _body_hash(skeleton)
+
+
 class _Collector(ast.NodeVisitor):
     def __init__(self) -> None:
         self.nodes: list[ParsedNode] = []
@@ -182,6 +247,13 @@ class _Collector(ast.NodeVisitor):
     def _visit_def(self, node: ast.AST, kind: str) -> None:
         decorators = _decorator_names(node)
         is_overload = any(d.split(".")[-1] == "overload" for d in decorators)
+        # A class's own body_hash elides its nested defs' bodies (mirroring
+        # _module_body_hash), since each method already carries its own
+        # unelided body_hash -- otherwise editing one line inside a single
+        # method would also change the class's hash. A function/method has
+        # no nested defs to elide out this way: its own body IS the thing
+        # body_hash is comparing.
+        body_hash = _class_body_hash(node) if kind == "class" else _body_hash(node)
         self.nodes.append(
             ParsedNode(
                 ordinal=len(self.nodes),
@@ -189,7 +261,7 @@ class _Collector(ast.NodeVisitor):
                 kind=kind,
                 line_start=node.lineno,
                 line_end=getattr(node, "end_lineno", node.lineno),
-                body_hash=_body_hash(node),
+                body_hash=body_hash,
                 name_binding="live",
                 shadow_index=None,
                 conditional=int(bool(self._conditional_depth) or is_overload),
@@ -233,17 +305,47 @@ class _Collector(ast.NodeVisitor):
     # -- references ------------------------------------------------------
     def visit_Call(self, node: ast.Call) -> None:
         name = _dotted_name(node.func)
-        if name:
-            self.refs.append(
-                ParsedRef(
-                    ordinal=len(self.refs),
-                    from_qualname=self._current_owner.removesuffix(".<locals>"),
-                    ref_kind="call",
-                    raw_name=name,
-                    dotted=name if "." in name else None,
-                    line=node.lineno,
-                )
+        if name is None:
+            # The receiver isn't a flattenable Name/Attribute chain --
+            # `super().go()`, `PaymentService().charge(x)`,
+            # `self.items[0].run()`, `(a or b).fire()`, `d["k"].m()`. Losing
+            # the resolved target is fine; losing the ref entirely is not,
+            # since that would drop it from both the call graph AND the
+            # `unresolved` count with no signal at all (the failure mode
+            # this branch exists to close).
+            #
+            # Record whatever IS known: when `node.func` is itself an
+            # `Attribute` (true of all five examples above -- only its
+            # `.value` chain fails to flatten), that's the attribute name.
+            # It is deliberately given the synthetic `<attr>.` prefix rather
+            # than the bare name: `<attr>.go` still contains a "." so it
+            # flows through `resolve.py`'s existing `dotted`-gated pipeline
+            # exactly like any other qualified call, which routes it past
+            # the HIGH-confidence steps (imported-name, module-local,
+            # self-through-MRO -- none of which have any real basis for a
+            # receiver we know nothing about) and into the *existing*
+            # repo-wide by-last-segment step, unresolved-heuristic MEDIUM/LOW
+            # match on `go` alone. No new resolution logic. `<` can never
+            # appear in a real Python identifier, so this can never collide
+            # with a genuine dotted call. A call with no attribute at all
+            # (e.g. `handlers[i]()`) has nothing to key on and is recorded
+            # under a synthetic placeholder instead, purely so the COUNT is
+            # never silently lost.
+            name = (
+                f"<attr>.{node.func.attr}" if isinstance(node.func, ast.Attribute) else "<dynamic>"
             )
+        elif name == "open":
+            name = _open_call_marker(node)
+        self.refs.append(
+            ParsedRef(
+                ordinal=len(self.refs),
+                from_qualname=self._current_owner.removesuffix(".<locals>"),
+                ref_kind="call",
+                raw_name=name,
+                dotted=name if "." in name else None,
+                line=node.lineno,
+            )
+        )
         self.generic_visit(node)
 
     def visit_Global(self, node: ast.Global) -> None:

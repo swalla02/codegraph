@@ -146,6 +146,65 @@ def test_external_call_is_unresolved_not_an_edge(repo, write):
     store.close()
 
 
+def test_super_call_resolves_weakly_by_name_not_dropped(repo, write):
+    """Regression for F2: `super().helper()`'s receiver (`super()`) isn't a
+    flattenable Name/Attribute chain, so `visit_Call` used to drop the ref
+    entirely -- no edge, no `unresolved` row. `helper` is unique in this
+    repo (unlike the overriding method's own name), so the existing
+    repo-wide by-last-segment step should now weakly resolve it at MEDIUM,
+    exactly as `test_unique_method_name_is_medium_confidence` does for
+    `thing.unique_op()`."""
+    write(
+        "base.py",
+        "class Base:\n    def helper(self):\n        pass\n",
+        commit="base",
+    )
+    write(
+        "child.py",
+        "from base import Base\n\n\n"
+        "class Child(Base):\n    def go(self):\n        super().helper()\n",
+        commit="child",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("child.py::Child.go", "base.py::Base.helper", "MEDIUM") in edges(store)
+    store.close()
+
+
+def test_call_on_non_flattenable_receiver_with_no_match_is_unresolved_not_dropped(repo, write):
+    """`PaymentService().charge(x)` has no `charge` defined anywhere in the
+    repo, so it cannot resolve -- but it must still show up in `unresolved`
+    rather than vanishing without a trace."""
+    write(
+        "m.py",
+        "class PaymentService:\n    pass\n\n\n"
+        "def run():\n    PaymentService().charge(1)\n",
+        commit="m",
+    )
+    store, indexer = build(repo)
+    stats = indexer.reconcile("HEAD")
+    assert stats.unresolved >= 1
+    rows = store.connection.execute("SELECT raw_name FROM unresolved WHERE rev='HEAD'").fetchall()
+    assert "<attr>.charge" in {row["raw_name"] for row in rows}
+    store.close()
+
+
+def test_dynamic_call_with_no_attribute_is_unresolved_not_dropped(repo, write):
+    """`handlers[i]()` -- the callable isn't even an attribute access, so
+    there is no name to key on at all; it still must be counted."""
+    write(
+        "m.py",
+        "def dispatch(handlers, i):\n    handlers[i]()\n",
+        commit="m",
+    )
+    store, indexer = build(repo)
+    stats = indexer.reconcile("HEAD")
+    assert stats.unresolved >= 1
+    rows = store.connection.execute("SELECT raw_name FROM unresolved WHERE rev='HEAD'").fetchall()
+    assert "<dynamic>" in {row["raw_name"] for row in rows}
+    store.close()
+
+
 def test_editing_a_module_updates_edges_in_its_importers(repo, write):
     write("dep.py", "def target():\n    pass\n", commit="dep")
     write("user.py", "from dep import target\n\n\ndef go():\n    target()\n", commit="user")
@@ -216,6 +275,33 @@ def test_resolve_command_exits_two_on_ambiguity(repo, write, capsys):
 
 def test_resolve_command_exits_one_when_nothing_matches(repo, capsys):
     assert main(["resolve", "nope", "--path", str(repo), "--rev", "HEAD"]) == 1
+
+
+def test_resolve_is_case_consistent_not_disjoint_across_query_case(repo, write, capsys):
+    """B5 regression: steps 1-2 of `find_symbol` compared with binary `=`
+    while step 3's `LIKE` was already case-insensitive. A query differing
+    only in case from the real name could fall through the (missed) exact
+    steps and land on step 3's dot-anchored suffix pattern instead --
+    which can never match a top-level, dot-free qualname at all -- so
+    `resolve charge` (1 match, the top-level function, via the exact-match
+    step) and `resolve CHARGE` (2 disjoint matches, two unrelated nested
+    methods, via the suffix step) used to return completely different
+    result sets and flip exit code 0 -> 2."""
+    write(
+        "pay.py",
+        (
+            "def charge():\n    pass\n\n\n"
+            "class PaymentService:\n    def charge(self):\n        pass\n\n\n"
+            "class Refund:\n    def charge(self):\n        pass\n"
+        ),
+        commit="pay",
+    )
+    assert main(["resolve", "charge", "--path", str(repo), "--rev", "HEAD"]) == 0
+    lower = capsys.readouterr().out.strip()
+    assert main(["resolve", "CHARGE", "--path", str(repo), "--rev", "HEAD"]) == 0
+    upper = capsys.readouterr().out.strip()
+    assert lower == "pay.py::charge"
+    assert upper == lower
 
 
 def test_status_reports_the_unresolved_count(repo, write, capsys):

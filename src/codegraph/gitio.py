@@ -29,14 +29,35 @@ def is_repo(root: Path) -> bool:
 
 
 def ls_tree(root: Path, rev: str) -> dict[str, str]:
-    out = _run(root, "ls-tree", "-r", "-z", "--format=%(objectname) %(path)", rev)
+    """`-r -z` with NO `--format`: the `%(path)` atom quotes a path (any
+    non-ASCII byte, or a literal `"`/`\\`) even under `-z`, honoring
+    `core.quotePath` for the non-ASCII case and quoting unconditionally for
+    the disambiguation-needed characters regardless of that setting -- so a
+    file like `ünïcode.py` comes back C-quoted (`"...\\303\\274n..."`), fails
+    `.endswith(".py")`, and silently drops out of the tree. Plain `ls-tree`
+    output (no `--format`) genuinely never quotes under `-z`, verified
+    against non-ASCII, space, embedded-quote and embedded-backslash paths;
+    parsing its `<mode> SP <type> SP <sha> TAB <path>` shape is a small
+    price for that guarantee.
+    """
+    # `--end-of-options` (verified against a scratch repo, git 2.43): a
+    # `rev` that happens to start with `-` (a maliciously or accidentally
+    # named branch/tag, or a bad `--rev` value threaded through from the
+    # CLI) would otherwise be parsed as an `ls-tree` OPTION rather than the
+    # tree-ish it is. Inert today -- callers only ever pass `HEAD`,
+    # `WORKTREE`, or a value already validated by `_resolve`/`rev_parse` --
+    # but live the moment that stops being true.
+    out = _run(root, "ls-tree", "-r", "-z", "--end-of-options", rev)
     tree: dict[str, str] = {}
     for entry in out.split(b"\0"):
         if not entry:
             continue
-        sha, _, path = entry.decode().partition(" ")
-        if path.endswith(".py"):
-            tree[path] = sha
+        meta, _, path_bytes = entry.partition(b"\t")
+        path = path_bytes.decode()
+        if not path.endswith(".py"):
+            continue
+        sha = meta.split(b" ")[2].decode()
+        tree[path] = sha
     return tree
 
 
@@ -153,11 +174,22 @@ def hash_object(root: Path, data: bytes) -> str:
 
 
 def rev_parse(root: Path, rev: str) -> str:
-    return _run(root, "rev-parse", rev).decode().strip()
+    # `--end-of-options` guards `rev` the same way `ls_tree` guards its
+    # `rev` (see there for why); `--verify` is paired with it on git's own
+    # recommendation (`git rev-parse --help`, "SPECIFYING REVISIONS": `git
+    # rev-parse --verify --end-of-options $REV`) -- `rev-parse` alone
+    # doesn't just resolve-or-error for a single revision, it "massages"
+    # each argument (which can echo one back verbatim rather than
+    # resolving it), so `--end-of-options` alone changes what this
+    # function returns; `--verify` restores the original single-sha-or-
+    # error shape every caller here relies on.
+    return _run(root, "rev-parse", "--verify", "--end-of-options", rev).decode().strip()
 
 
 def merge_base(root: Path, a: str, b: str) -> str:
-    return _run(root, "merge-base", a, b).decode().strip()
+    # Same `--end-of-options` guard as `ls_tree`/`rev_parse`, for the same
+    # reason: `a`/`b` can be user-controlled revs.
+    return _run(root, "merge-base", "--end-of-options", a, b).decode().strip()
 
 
 def default_branch(root: Path) -> str:
