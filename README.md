@@ -110,6 +110,24 @@ a root). `[[effect]]` entries merge over the built-in catalog by pattern;
 the nine effect kinds (`DB_WRITE`, `DB_READ`, `NETWORK`, `PROCESS`,
 `FS_WRITE`, `FS_READ`, `ENV_READ`, `GLOBAL_MUTATE`, `NONDETERMINISM`).
 
+`ambiguity_limit` (default `25`, `0` to disable) bounds the last-resort
+resolution step. When a call like `item.save()` names nothing importable,
+nothing module-local, and nothing reachable through `self`, the resolver
+falls back to matching `save` against every definition in the repository.
+On a small codebase that is a handful of candidates and a useful
+over-approximation. On django it was 971 for a single call site, and 96.6%
+of the whole graph was that kind of guess — the edge table grew with the
+*square* of the repository. Past this many equally-weak candidates the call
+is recorded once as ambiguous, with the name and the count, instead of as N
+edges. Nothing is discarded to improve precision: the N edges and the one
+record make the same claim, and a `HIGH` or `MEDIUM` hit — one the resolver
+actually distinguished — is never collapsed. Raise it if you want the full
+cross product back.
+
+```toml
+ambiguity_limit = 25
+```
+
 It lives at the repository root, not inside `.codegraph/`, because it is
 hand-written configuration meant to be committed and shared, whereas
 `.codegraph/` self-ignores and holds only derived cache: config is tracked,
@@ -143,11 +161,14 @@ are not in the same place:
   re-resolves the *entire* symbol table for a revision on every reconcile,
   rather than the design's intended `D ∪ dependents(D)` incremental
   invalidation (`resolve.dependents` exists and is tested, but has no
-  production caller yet). For a small-to-medium repository this is fast
-  enough not to notice; for a large one, the resolve step — not the parse
-  step — is where reconcile time will scale with repository size today, not
-  with the size of your diff. Tracked as follow-up work; this README will
-  stop calling this out honestly the day it's fixed, not before.
+  production caller yet). Measured, one-file edit, steady state: flask (83
+  files) reconciles in 0.36s, django (2,930 files) in **22s** — of which one
+  blob is parsed and everything else is the whole revision being rebuilt.
+  django's *cold* index is 65s, so at that size an incremental edit costs a
+  third of a full re-index rather than nothing. The resolve step, not the
+  parse step, is where reconcile time scales with repository size today.
+  Tracked as follow-up work; this README will stop calling this out honestly
+  the day it's fixed, not before.
 
 ## Why no MCP server
 
