@@ -112,7 +112,9 @@ CREATE TABLE IF NOT EXISTS imports (
 -- were (see config.DEFAULT_AMBIGUITY_LIMIT); `candidates` carries the count the
 -- ambiguous case declined to enumerate, and is 0 for 'unknown'. Separating the
 -- two matters because they are opposite problems: 'unknown' means the resolver
--- is blind to something, 'ambiguous' means it sees too much.
+-- is blind to something, 'ambiguous' means it sees too much. 'builtin' is
+-- neither: a call the resolver understood and deliberately did not link to a
+-- repo symbol, kept out of the gap count so the real gaps stay visible.
 CREATE TABLE IF NOT EXISTS unresolved (
     rev TEXT NOT NULL,
     path TEXT NOT NULL,
