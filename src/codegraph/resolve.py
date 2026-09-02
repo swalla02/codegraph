@@ -206,6 +206,7 @@ class AstResolver:
 class ResolveStats:
     edges: int = 0
     unresolved: int = 0
+    ambiguous: int = 0
 
 
 def build_import_maps(
@@ -379,17 +380,51 @@ def _source_id(ref: ParsedRef, table: _SymbolTable, path: str) -> str:
     return table.qualname_index.get((path, ref.from_qualname), candidates[-1][0])
 
 
+def split_by_ambiguity_limit(
+    hits: list[tuple[str, str]], limit: int
+) -> tuple[list[tuple[str, str]], int]:
+    """Split a resolver's candidates into the ones to materialize and the count
+    of low-confidence ones being collapsed instead.
+
+    The over-approximation bias says a candidate is never dropped to improve
+    precision, and this does not drop one: when a bare name matches hundreds of
+    definitions, the N edges and the single "ambiguous, N candidates" record
+    make exactly the same claim. Enumerating it is what is being declined, not
+    asserting it -- and enumerating it is quadratic in repo size while saying
+    nothing a reader could act on.
+
+    Only LOW candidates are ever collapsed. A HIGH or MEDIUM hit means the
+    resolver actually distinguished something, and is always materialized --
+    including alongside a collapsed LOW set, so a call site with one confident
+    answer and a long ambiguous tail keeps the answer.
+
+    `limit <= 0` disables the cap entirely.
+    """
+    if limit <= 0 or len(hits) <= limit:
+        return hits, 0
+    weak = [hit for hit in hits if hit[1] == LOW]
+    if len(weak) <= limit:
+        return hits, 0
+    return [hit for hit in hits if hit[1] != LOW], len(weak)
+
+
 def resolve_revision(
     store: Store, rev: str, config: Config, resolver: Resolver | None = None
 ) -> ResolveStats:
     """Rewrite `edges`, `imports` and `unresolved` for one revision.
 
-    v1 re-resolves the whole revision rather than narrowing to
-    `dependents()`; resolution is cheap next to parsing and a whole-revision
-    rewrite cannot leave a stale edge behind.
+    Still re-resolves the whole revision rather than narrowing to
+    `dependents()`: a whole-revision rewrite cannot leave a stale edge behind.
+    That is the one half of the cost guarantee this does not yet honour --
+    tracked, and stated in the README rather than glossed.
+
+    `config.ambiguity_limit` bounds how many indistinguishable LOW candidates a
+    single reference will be expanded into; past it the reference is recorded
+    once in `unresolved` as ambiguous. See `split_by_ambiguity_limit`.
     """
     resolver = resolver or AstResolver()
     connection = store.connection
+    limit = config.ambiguity_limit
     table = _SymbolTable(store, rev, config)
 
     connection.execute("DELETE FROM edges WHERE rev=?", (rev,))
@@ -406,6 +441,7 @@ def resolve_revision(
 
     edge_rows: list[tuple] = []
     unresolved_rows: list[tuple] = []
+    ambiguous_rows: list[tuple] = []
 
     # Inheritance first: `self.X` walks the class hierarchy, so the hierarchy
     # has to exist before any call is resolved.
@@ -415,7 +451,14 @@ def resolve_revision(
         ctx = table.context(rev, path, bases)
         for ref in base_refs.get(path, ()):
             src = _source_id(ref, table, path)
-            for node_id, confidence in resolver.resolve_call(ref, ctx):
+            # A base named by a bare, repo-wide-ambiguous name fans out exactly
+            # like a call does, and on a large repo it is the larger half of the
+            # blowup. Capping it cannot affect the MRO: only HIGH links feed
+            # `bases`, and the cap only ever collapses LOW ones.
+            kept, ambiguous_count = split_by_ambiguity_limit(
+                resolver.resolve_call(ref, ctx), limit
+            )
+            for node_id, confidence in kept:
                 edge_rows.append(
                     (rev, src, node_id, "INHERITS", confidence, PROVENANCE, path, ref.line)
                 )
@@ -424,6 +467,10 @@ def resolve_revision(
                 # the walk falls through to the repo-wide name match anyway.
                 if confidence == HIGH:
                     bases.setdefault(src, []).append(node_id)
+            if ambiguous_count:
+                ambiguous_rows.append(
+                    (rev, path, ref.line, ref.raw_name, "base", "ambiguous", ambiguous_count)
+                )
 
     call_refs = _refs_by_path(store, rev, "call")
     for path in table.paths:
@@ -431,14 +478,19 @@ def resolve_revision(
         for ref in call_refs.get(path, ()):
             src = _source_id(ref, table, path)
             hits = resolver.resolve_call(ref, ctx)
-            for node_id, confidence in hits:
+            kept, ambiguous_count = split_by_ambiguity_limit(hits, limit)
+            for node_id, confidence in kept:
                 edge_rows.append(
                     (rev, src, node_id, "CALLS", confidence, PROVENANCE, path, ref.line)
                 )
-            if not hits:
+            if ambiguous_count:
+                ambiguous_rows.append(
+                    (rev, path, ref.line, ref.raw_name, "call", "ambiguous", ambiguous_count)
+                )
+            elif not hits:
                 # Never dropped: the ref stays in `blob_refs` for effect
                 # detection, and the gap is counted as a health signal.
-                unresolved_rows.append((rev, path, ref.line, ref.raw_name))
+                unresolved_rows.append((rev, path, ref.line, ref.raw_name, "call", "unknown", 0))
 
     connection.executemany(
         "INSERT INTO edges(rev, src, dst, kind, confidence, provenance, callsite_path,"
@@ -446,10 +498,15 @@ def resolve_revision(
         edge_rows,
     )
     connection.executemany(
-        "INSERT INTO unresolved(rev, path, line, raw_name) VALUES(?, ?, ?, ?)",
-        unresolved_rows,
+        "INSERT INTO unresolved(rev, path, line, raw_name, ref_kind, reason, candidates)"
+        " VALUES(?, ?, ?, ?, ?, ?, ?)",
+        unresolved_rows + ambiguous_rows,
     )
-    return ResolveStats(edges=len(edge_rows), unresolved=len(unresolved_rows))
+    return ResolveStats(
+        edges=len(edge_rows),
+        unresolved=len(unresolved_rows),
+        ambiguous=len(ambiguous_rows),
+    )
 
 
 def dependents(store: Store, rev: str, modules: set[str]) -> set[str]:

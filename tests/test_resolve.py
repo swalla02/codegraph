@@ -1,6 +1,6 @@
 from codegraph.cli import main
 from codegraph.indexer import GitTreeSource, Indexer
-from codegraph.resolve import module_for_path
+from codegraph.resolve import module_for_path, split_by_ambiguity_limit
 from codegraph.store import Store
 
 
@@ -308,3 +308,155 @@ def test_status_reports_the_unresolved_count(repo, write, capsys):
     write("m.py", "import requests\n\n\ndef fetch():\n    requests.get('u')\n", commit="m")
     assert main(["status", "--path", str(repo), "--rev", "HEAD"]) == 0
     assert "unresolved: 1" in capsys.readouterr().out
+
+
+# -- the ambiguity cap -------------------------------------------------
+#
+# The last-resort step matches a call's final dotted segment against every live
+# definition in the revision. Measured on django (2,930 files) that produced 971
+# candidates for a single call site and 2.09M LOW edges -- 96.6% of the graph --
+# because the candidate list grows with the repo. See issue #6.
+
+
+def unresolved_rows(store, rev="HEAD"):
+    return [
+        dict(row)
+        for row in store.connection.execute(
+            "SELECT path, line, raw_name, ref_kind, reason, candidates FROM unresolved"
+            " WHERE rev=? ORDER BY path, line",
+            (rev,),
+        )
+    ]
+
+
+def many_savers(count):
+    """`count` classes that each define `save`, plus one caller that can only be
+    matched against all of them by name."""
+    classes = "\n\n".join(
+        f"class C{i}:\n    def save(self):\n        return {i}" for i in range(count)
+    )
+    return f"{classes}\n\n\ndef persist(item):\n    return item.save()\n"
+
+
+def test_ambiguity_under_the_limit_is_still_fully_enumerated(repo, write):
+    write("m.py", many_savers(3), commit="m")
+    write("codegraph.toml", "ambiguity_limit = 25\n", commit="cfg")
+    store, indexer = build(repo)
+    stats = indexer.reconcile("HEAD")
+    assert stats.ambiguous == 0
+    assert {dst for src, dst, _ in edges(store) if src == "m.py::persist"} == {
+        f"m.py::C{i}.save" for i in range(3)
+    }
+    store.close()
+
+
+def test_ambiguity_over_the_limit_is_recorded_once_instead_of_enumerated(repo, write):
+    write("m.py", many_savers(6), commit="m")
+    write("codegraph.toml", "ambiguity_limit = 4\n", commit="cfg")
+    store, indexer = build(repo)
+    stats = indexer.reconcile("HEAD")
+
+    # Not enumerated...
+    assert not [dst for src, dst, _ in edges(store) if src == "m.py::persist"]
+    # ...but not dropped either: the claim survives, with its size.
+    ambiguous = [row for row in unresolved_rows(store) if row["reason"] == "ambiguous"]
+    assert len(ambiguous) == 1
+    assert ambiguous[0]["raw_name"] == "item.save"
+    assert ambiguous[0]["ref_kind"] == "call"
+    assert ambiguous[0]["candidates"] == 6
+    assert stats.ambiguous == 1
+    store.close()
+
+
+def test_ambiguous_is_counted_separately_from_unknown(repo, write):
+    """They are opposite failures -- blind vs. dazzled -- and collapsing them
+    into one number makes the health signal unreadable."""
+    write("m.py", many_savers(6) + "\n\ndef gone():\n    no_such_name_anywhere()\n", commit="m")
+    write("codegraph.toml", "ambiguity_limit = 4\n", commit="cfg")
+    store, indexer = build(repo)
+    stats = indexer.reconcile("HEAD")
+    assert stats.ambiguous == 1
+    assert stats.unresolved >= 1
+    reasons = {row["reason"] for row in unresolved_rows(store)}
+    assert reasons == {"ambiguous", "unknown"}
+    store.close()
+
+
+def test_a_crowded_name_does_not_weaken_a_call_that_resolves_confidently(repo, write):
+    """`AstResolver` stops at the first step that matches, so a module-local
+    call never reaches the last-resort step at all -- the cap must not change
+    that just because the name is crowded elsewhere in the repo."""
+    write("crowd.py", many_savers(6), commit="crowd")
+    write(
+        "m.py",
+        "def save():\n    return 0\n\n\ndef caller():\n    return save()\n",
+        commit="m",
+    )
+    write("codegraph.toml", "ambiguity_limit = 2\n", commit="cfg")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    # module-local, so HIGH -- it never reaches the last-resort step at all
+    assert ("m.py::caller", "m.py::save", "HIGH") in edges(store)
+    store.close()
+
+
+def test_ambiguous_base_class_is_capped_without_disturbing_the_mro(repo, write):
+    """Bases fan out exactly like calls (on django they were the larger half of
+    the blowup), but only HIGH links feed the MRO walk and the cap only ever
+    collapses LOW ones -- so inheritance resolution is unchanged."""
+    write("crowd.py", "\n\n".join(f"class Base{i}:\n    pass" for i in range(6)), commit="crowd")
+    write("dup.py", "\n\n".join(f"class C{i}:\n    class Base:\n        pass" for i in range(6)),
+          commit="dup")
+    write(
+        "child.py",
+        "from crowd import Base0\n\n\nclass Child(Base0):\n    pass\n",
+        commit="child",
+    )
+    write("codegraph.toml", "ambiguity_limit = 3\n", commit="cfg")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    inherits = {
+        (row["src"], row["dst"], row["confidence"])
+        for row in store.connection.execute(
+            "SELECT src, dst, confidence FROM edges WHERE rev='HEAD' AND kind='INHERITS'"
+        )
+    }
+    # The import makes this one certain, so the cap cannot touch it.
+    assert ("child.py::Child", "crowd.py::Base0", "HIGH") in inherits
+    store.close()
+
+
+def test_ambiguity_limit_zero_disables_the_cap(repo, write):
+    write("m.py", many_savers(6), commit="m")
+    write("codegraph.toml", "ambiguity_limit = 0\n", commit="cfg")
+    store, indexer = build(repo)
+    stats = indexer.reconcile("HEAD")
+    assert stats.ambiguous == 0
+    assert len([dst for src, dst, _ in edges(store) if src == "m.py::persist"]) == 6
+    store.close()
+
+
+def test_split_by_ambiguity_limit_keeps_strong_candidates_alongside_a_collapsed_tail():
+    """`AstResolver` returns the first matching step's hits, so today a result is
+    either confident or entirely LOW and this mix cannot arise from it. The
+    `Resolver` protocol is a documented swap-in seam, though, and a smarter
+    engine can return both -- the cap must collapse only the part it cannot
+    distinguish, never the part it can."""
+    hits = [("a.py::x", "HIGH"), ("b.py::y", "MEDIUM")] + [
+        (f"c.py::z{i}", "LOW") for i in range(6)
+    ]
+    kept, collapsed = split_by_ambiguity_limit(hits, 4)
+    assert kept == [("a.py::x", "HIGH"), ("b.py::y", "MEDIUM")]
+    assert collapsed == 6
+
+
+def test_split_by_ambiguity_limit_counts_only_the_weak_candidates():
+    """A long list of candidates the resolver could actually tell apart is not
+    ambiguity, and must not be collapsed however long it is."""
+    hits = [(f"a.py::x{i}", "HIGH") for i in range(50)]
+    assert split_by_ambiguity_limit(hits, 4) == (hits, 0)
+
+
+def test_split_by_ambiguity_limit_leaves_a_list_at_exactly_the_limit_alone():
+    hits = [(f"a.py::x{i}", "LOW") for i in range(4)]
+    assert split_by_ambiguity_limit(hits, 4) == (hits, 0)

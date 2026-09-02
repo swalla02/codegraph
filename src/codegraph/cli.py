@@ -30,6 +30,8 @@ def _print_stats(stats) -> None:
     print(f"paths: {stats.paths_total} ({stats.paths_dirty} dirty)")
     print(f"blobs: {stats.blobs_parsed} parsed, {stats.blobs_cached} cached")
     print(f"edges: {stats.edges}, unresolved: {stats.unresolved}")
+    if stats.ambiguous:
+        print(f"ambiguous: {stats.ambiguous} reference(s) matched too many names to enumerate")
     if stats.parse_errors:
         print(f"parse errors: {stats.parse_errors}")
     if stats.shadowed:

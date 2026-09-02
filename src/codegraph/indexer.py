@@ -36,6 +36,7 @@ class IndexStats:
     shadowed: int = 0
     edges: int = 0
     unresolved: int = 0
+    ambiguous: int = 0
 
 
 class TreeSource(Protocol):
@@ -181,6 +182,7 @@ class Indexer:
             shadowed=shadowed,
             edges=resolved.edges,
             unresolved=resolved.unresolved,
+            ambiguous=resolved.ambiguous,
         )
 
     def _ensure_parsed(self, shas: set[str]) -> tuple[int, int]:
