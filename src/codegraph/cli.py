@@ -64,7 +64,19 @@ def _cmd_index(args: argparse.Namespace) -> int:
     store, indexer = open_workspace(root)
     try:
         if args.rebuild:
+            # Both layers, and in this order. Clearing only `blobs` re-parsed
+            # Layer 1 and then reconciled straight into the unchanged-tree fast
+            # path, because the tree and the fingerprint were untouched -- so
+            # Layer 2 was served from the previous build and `--rebuild` did
+            # not rebuild. Dropping the `revisions` row is what makes the fast
+            # path (and the narrowing that follows it) see no current state to
+            # keep. See issue #30.
+            #
+            # The flag is most likely to be reached for by someone who already
+            # suspects the graph is stale, which is exactly when silently
+            # serving the old one is worst.
             store.connection.execute("DELETE FROM blobs")
+            store.connection.execute("DELETE FROM revisions WHERE rev=?", (args.rev,))
             store.connection.commit()
         try:
             stats = indexer.reconcile(args.rev)
@@ -340,7 +352,7 @@ def build_parser() -> argparse.ArgumentParser:
     index_parser.add_argument(
         "--rebuild",
         action="store_true",
-        help="Discard the Layer 1 parse cache before reconciling",
+        help="Discard the parse cache AND the revision's graph, forcing a cold rebuild",
     )
     index_parser.add_argument(
         "--quiet", action="store_true", help="Suppress stats output (used by warming hooks)"
