@@ -50,10 +50,9 @@ def fan_in(store: Store, rev: str, node_id: str, ambiguity: Ambiguity | None = N
             "SELECT DISTINCT src FROM edges WHERE rev=? AND dst=?", (rev, node_id)
         )
     }
-    if ambiguity is not None:
-        sources.update(ambiguity.callers(node_id))
-        sources.update(ambiguity.inheritors(node_id))
-    return len(sources)
+    if ambiguity is None:
+        return len(sources)
+    return ambiguity.caller_count(node_id, sources)
 
 
 def salience(
@@ -71,10 +70,15 @@ def salience(
     if callers == 0:
         value += 0.5
 
-    row = connection.execute(
-        "SELECT qualname FROM nodes WHERE rev=? AND id=?", (rev, node_id)
-    ).fetchone()
-    last_segment = row["qualname"].rpartition(".")[2] if row else node_id.rpartition(".")[2]
+    # `Ambiguity` already holds every live node's last qualname segment --
+    # it is the key of the very name index this expands through -- so with
+    # one in hand this is a dict lookup rather than a query per dependent.
+    last_segment = ambiguity.name_of.get(node_id) if ambiguity is not None else None
+    if last_segment is None:
+        row = connection.execute(
+            "SELECT qualname FROM nodes WHERE rev=? AND id=?", (rev, node_id)
+        ).fetchone()
+        last_segment = row["qualname"].rpartition(".")[2] if row else node_id.rpartition(".")[2]
     if not last_segment.startswith("_"):
         value += 0.3
 

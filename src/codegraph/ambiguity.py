@@ -115,6 +115,15 @@ class Ambiguity:
         #: The same for `class X(Base)` references, kept apart because
         #: `impact`, `effects` and `islands` all walk CALLS and only CALLS.
         self.base_refs: dict[str, list[str]] = {n: sorted(s) for n, s in bases.items()}
+        # The same sets kept as sets, for membership rather than iteration.
+        # `rank.fan_in` has to union these with a node's materialized callers
+        # once per dependent, and a report on a crowded name walks thousands
+        # of dependents: iterating a caller list of thousands inside that loop
+        # is quadratic, and measurably so -- `impact Model.save` on django took
+        # 4m45s before this existed. Testing the (small) materialized side for
+        # membership here instead makes the union proportional to it.
+        self._call_sets: dict[str, frozenset[str]] = {n: frozenset(s) for n, s in calls.items()}
+        self._base_sets: dict[str, frozenset[str]] = {n: frozenset(s) for n, s in bases.items()}
 
     # -- pointwise -------------------------------------------------------
     def callers(self, node_id: str) -> list[str]:
@@ -135,6 +144,21 @@ class Ambiguity:
         if name is None:
             return []
         return self.base_refs.get(name, [])
+
+    def caller_count(self, node_id: str, also: set[str]) -> int:
+        """How many DISTINCT nodes call `node_id`, counting `also` -- the
+        node's materialized callers -- and the ambiguous ones together.
+
+        Proportional to `also`, never to the ambiguous set, which is why
+        this lives here rather than as a set union at the call site: on a
+        crowded name the ambiguous set has thousands of members and the
+        materialized one has a handful.
+        """
+        name = self.name_of.get(node_id)
+        calls = self._call_sets.get(name, frozenset()) if name is not None else frozenset()
+        bases = self._base_sets.get(name, frozenset()) if name is not None else frozenset()
+        derived = len(calls) + sum(1 for src in bases if src not in calls)
+        return derived + sum(1 for src in also if src not in calls and src not in bases)
 
     def candidates(self, raw_name: str) -> list[str]:
         """Everything an ambiguous reference to `raw_name` could mean --
