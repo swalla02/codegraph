@@ -273,6 +273,98 @@ are not in the same place:
   inputs, which is why a body-only edit is 3.7s rather than 9s, but a
   structural edit still pays it in full.
 
+## How good is the graph, honestly
+
+`tests/test_accuracy.py` reports precision 1.00 / recall 1.00, and that number
+means very little: it measures 10 hand-written call sites in a synthetic
+11-file repository, each authored to illustrate a rule the resolver already
+implements. It is a regression guard wearing a benchmark's clothes.
+
+`bench/` is the real measurement (#35). It runs a target repository's **own
+test suite** under `sys.monitoring`, records every `(caller, callee)` pair that
+actually executed, and scores the static graph against it. A call the tests
+made is a call that exists, so a traced edge missing from the static graph is a
+real gap — no labelling judgement involved.
+
+```sh
+uv run python -m bench.run requests          # clones, or --source-root DIR to copy a clone
+uv run python -m bench.run flask --json /tmp/flask.json
+uv run python -m bench.run requests --tests tests/test_utils.py   # narrow the suite
+```
+
+Each run copies the clone (an editable install writes into the tree, and the
+source clone must stay untouched), builds a venv, installs the target
+**editable** — a normal install copies the source into `site-packages`, where
+every in-repo frame is then filtered out as external and the trace comes back
+nearly empty, silently — traces the suite, indexes the same working tree, and
+scores. Nothing about it runs during `pytest -q`; only the scorer's arithmetic
+is unit-tested there (`tests/test_bench_scorer.py`).
+
+### What it measures
+
+| | psf/requests | pallets/flask |
+|---|---|---|
+| suite traced | `test_utils.py`, `test_structures.py` (240 tests) | `tests/` (494 tests) |
+| traced call edges (judgeable) | 115 | 2683 |
+| **recall** | **0.79** | **0.29** |
+| recall at HIGH/MEDIUM | 0.76 | 0.19 |
+| conditional precision | 0.99 (81/82) | 0.86 (206/239) |
+
+On `tests/test_utils.py` alone — the scope #35 recorded — requests is **0.93**
+recall, and all 6 misses are dunders invoked by syntax (`d[k]`, `for x in jar`,
+`len(f)`). Adding `test_structures.py`, which tests a mapping's dunders
+directly, drops it to 0.79: the same gap, weighted differently by which tests
+you run. **Recall is a property of the target repository and of the suite you
+trace, not a single number about codegraph.**
+
+flask is where a static resolver is supposed to do badly, and it does. Every
+miss is grouped by mechanism, and the grouping is the finding:
+
+| flask misses (1918 of 2683) | |
+|---|---|
+| target nested in another function (a view defined inside a test) | 564 |
+| reachable only through an out-of-repo frame | 552 |
+| target is decorated (`@app.route`, `@setupmethod`) | 523 |
+| target is a dunder, invoked by syntax or protocol | 223 |
+| target is a constructor — a real resolution gap | 21 |
+| target applied as a decorator by the source | 18 |
+| no implicit-invocation mechanism recognised | 15 |
+| call site attributed to another definition in the same file | 2 |
+
+The 552 "out-of-repo frame" misses are worth understanding before reading the
+0.29 as an indictment: those pairs are `test_x -> werkzeug's Client.get ->
+FlaskClient.open`, where **no call site anywhere in flask's text names the
+pair**. No static analysis of this repository could produce them, so they are
+counted apart rather than blamed on the resolver. Excluding them still leaves
+recall at 0.36. The honest summary is that on a framework, most of what runs is
+reached by decoration and dispatch, and a call-site-based graph sees about a
+third of it.
+
+### Why precision is reported as *conditional*
+
+A static edge the trace never saw is **not** thereby wrong — the suite may
+simply not cover it, and most of a library's surface is not exercised by its
+own tests. Unconditional precision is therefore not measurable this way, and
+the benchmark does not print a number for it. What is defensible: among static
+HIGH edges whose **two endpoints both executed at least once**, how many did
+the trace observe? 0.99 on requests, 0.86 on flask. That says the HIGH edges
+that could have been checked were taken; it does not say the resolver invents no
+edges.
+
+### The one filter that decides whether the number is honest
+
+`PY_START` fires when a **module body** or a **class body** starts executing —
+import time and definition time, not calls — and codegraph's CALLS edges do not
+model either (it has an `imports` table for the first). So a traced edge is
+judgeable only when its target is a *function or method* node. Without that
+filter requests measures 0.51, with a miss list full of `__init__.py::<module>
+-> api.py::<module>`: a wrong number that would send someone chasing a
+non-problem. Two neighbouring cases are counted separately rather than folded
+in, so that neither can quietly raise the score: a target that is a
+comprehension or lambda (never a node, since `nodes` holds definitions), and a
+target `nodes` does not contain at all (a hole in codegraph's own view, shown
+with examples).
+
 ## Why no MCP server
 
 MCP's main advantage is discoverability — the agent sees the tool without
