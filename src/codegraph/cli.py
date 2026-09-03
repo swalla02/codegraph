@@ -14,6 +14,7 @@ from codegraph.maintenance import gc, plan_hooks
 from codegraph.query.diff import MissingRevisionError, diff_report
 from codegraph.query.effects import effects_report
 from codegraph.query.impact import impact_report
+from codegraph.query.islands import islands_report
 from codegraph.render import render_json, render_text
 from codegraph.resolve import find_symbol
 from codegraph.store import WORKTREE, Store
@@ -164,6 +165,31 @@ def _cmd_impact(args: argparse.Namespace) -> int:
             limit=args.limit,
             include_low=args.all,
         )
+        print(render_json(report) if args.json else render_text(report))
+        return 0
+    finally:
+        store.close()
+
+
+def _cmd_islands(args: argparse.Namespace) -> int:
+    """Report the connected components of the revision's call graph.
+
+    Takes no symbol, so the `0`/`1`/`2` exit convention `resolve`,
+    `impact` and `effects` share -- which is entirely about resolving a
+    name to one node id -- has nothing to resolve and cannot apply. This
+    command exits `0` on a report (an empty repository included: "no
+    symbols" is a real answer, not a failure) and `1` only on a bad
+    `--rev`, matching `status`/`index`.
+    """
+    root = Path(args.path).resolve()
+    store, indexer = open_workspace(root)
+    try:
+        try:
+            indexer.reconcile(args.rev)
+        except gitio.GitError:
+            print(f"revision not found: {args.rev}", file=sys.stderr)
+            return 1
+        report = islands_report(store, args.rev, limit=args.limit)
         print(render_json(report) if args.json else render_text(report))
         return 0
     finally:
@@ -351,6 +377,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     impact_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     impact_parser.set_defaults(handler=_cmd_impact)
+
+    islands_parser = subparsers.add_parser(
+        "islands",
+        help="Report the connected components of the call graph",
+        description=(
+            "Split the revision's CALLS edges, read as undirected, into connected"
+            " components. An island is a set of symbols that share some call"
+            " relationship with each other and none with anything outside it. It is"
+            " NOT a reachability result: a one-symbol island is not dead code, only a"
+            " symbol whose calls in or out the resolver did not record -- dunders,"
+            " decorators, framework dispatch and entry points leave no call site."
+        ),
+    )
+    islands_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    islands_parser.add_argument("--rev", default=WORKTREE, help="Revision to query")
+    islands_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum rows to keep, total across islands and singletons (default: 20)",
+    )
+    islands_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    islands_parser.set_defaults(handler=_cmd_islands)
 
     diff_parser = subparsers.add_parser(
         "diff", help="Report what changed between two revisions"

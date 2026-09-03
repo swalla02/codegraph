@@ -51,15 +51,35 @@ Reach for codegraph:
    result sets are truncated with a `truncated` flag rather than dumped in
    full.
 
+`codegraph islands` answers a question the other commands cannot: the
+global shape of the graph. It splits the revision's `CALLS` edges, read as
+**undirected**, into connected components — an *island* is a set of symbols
+that share some call relationship, in either direction and however
+indirect, with each other and with nothing outside it. It takes no symbol,
+so the exit-code convention above does not apply to it: `0` for a report
+(including on a repository with no Python in it), `1` only for a bad
+`--rev`.
+
+**An island is not a reachability result, and a one-symbol island is not
+dead code.** It is computed from the call edges the resolver recorded, and
+plenty of code is invoked by a mechanism that leaves no call site in the
+source at all: dunders (`__delitem__` runs on every `del d[k]`),
+decorators, framework dispatch, ABC overrides, packaging entry points. On
+psf/requests, `AuthBase.__call__`, `BaseAdapter.__init__` and
+`CaseInsensitiveDict.__delitem__` are each an island of one and none of
+them is unused. Read an island as "this region shares no call edge with
+that one", never as "nothing uses this".
+
 `codegraph diff [<base>..<head>]` reports what a branch actually changed —
 symbols added/removed/changed by content hash (never by line number) plus
 any side effect that newly became reachable. With no argument it diffs
 `merge-base(default branch, HEAD)` against the worktree, which is what you
 want when asked "what did this branch change".
 
-All of `resolve`, `impact`, `effects`, and `diff` accept `--path <dir>` to
-run against a different repository root, and `impact`/`effects`/`diff` accept
-`--json` for machine-readable output instead of the default text.
+All of `resolve`, `impact`, `effects`, `islands`, and `diff` accept
+`--path <dir>` to run against a different repository root, and
+`impact`/`effects`/`islands`/`diff` accept `--json` for machine-readable
+output instead of the default text.
 
 ## The anti-pattern this displaces
 
@@ -103,6 +123,24 @@ the full set and how confident it is in each edge.
   — `HIGH`/`MEDIUM`/`LOW` reflects how certain the resolver is that the call
   really targets this symbol (e.g. a dynamic dispatch site is weaker
   evidence than a direct, unambiguous call).
+- `islands`' summary reads `symbols: 807 · islands: 172 · largest: 628 ·
+  singletons: 167 · basis: undirected CALLS edges` (the real figures for
+  psf/requests). `symbols` excludes the synthetic `path::<module>` node
+  each file gets: those carry connectivity — a module-scope call is
+  sometimes the only thing tying a helper to the rest of the graph — but
+  they are not symbols anyone wrote, so they are never members and never
+  rows. `INHERITS` edges deliberately do not join an island, which keeps a
+  symbol's island exactly equal to the set of nodes an unlimited-hop
+  `impact` or `effects` walk could reach.
+- An `islands` row summarizes a whole component rather than listing it:
+  its `id` and `location` are the island's most-called member, and
+  `detail` reads `size N across M files; also <two more members>`. Islands
+  of exactly one are collected into a single `singletons` group — one
+  group of 167 rows on psf/requests, not 167 groups of one — and each such
+  row's `detail` reads `size 1, no resolved call in either direction`,
+  which is a statement about the recorded edges and not about the symbol.
+  `--limit N` (default 20) is a total budget across both groups, islands
+  first, exactly as `impact` budgets dependents ahead of tests.
 - Each `effects` row's `detail` reads `<KIND> <CONFIDENCE> via <chain>` —
   the chain is the call path from the queried symbol down to the concrete
   call site; `location` is that call site's `file:line`, clickable evidence
