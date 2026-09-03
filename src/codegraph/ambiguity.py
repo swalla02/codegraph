@@ -48,6 +48,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
+from codegraph.resolve import CONSTRUCTOR, breadth_first
 from codegraph.store import Store
 
 #: Prefix for the synthetic per-name node ids `hub_edges` routes through.
@@ -90,12 +91,53 @@ class Ambiguity:
         #: The inverse, for the pointwise direction. A node id present here
         #: is by construction a member of `by_name[name_of[node_id]]`.
         self.name_of: dict[str, str] = {}
+        classes: list[str] = []
+        node_ids: set[str] = set()
         for row in connection.execute(
-            "SELECT id, qualname FROM nodes WHERE rev=? AND name_binding='live'", (rev,)
+            "SELECT id, qualname, kind FROM nodes WHERE rev=? AND name_binding='live'", (rev,)
         ):
             name = last_segment(row["qualname"])
             self.by_name.setdefault(name, []).append(row["id"])
             self.name_of[row["id"]] = name
+            node_ids.add(row["id"])
+            if row["kind"] == "class":
+                classes.append(row["id"])
+
+        #: class node id -> the `__init__` that instantiating it runs.
+        #:
+        #: `resolve.with_constructors` adds this edge for every class the
+        #: resolver actually distinguished, but an all-LOW fan-out is not
+        #: materialized at all now, and a fan-out CAN be entirely classes --
+        #: `box.Widget()` with two `Widget` classes in the repo. Without this,
+        #: merging query-time expansion with the constructor edge lost that
+        #: `__init__` link on both paths at once: deferred at index time, and
+        #: absent from the expansion. Query-time expansion has to produce
+        #: exactly what index time would have, or the two disagree about the
+        #: same graph.
+        self.constructor_of: dict[str, str] = {}
+        self._constructor_owner: dict[str, str] = {}
+        if classes:
+            inherits: dict[str, list[str]] = {}
+            for row in connection.execute(
+                "SELECT src, dst FROM edges WHERE rev=? AND kind='INHERITS'"
+                " AND confidence='HIGH'",
+                (rev,),
+            ):
+                inherits.setdefault(row["src"], []).append(row["dst"])
+            for class_id in classes:
+                # Same breadth-first walk, and the same HIGH-only base filter,
+                # that `resolve.constructor_target` uses. Subclass overrides are
+                # deliberately not candidates there and are not here: `Cls()`
+                # names the exact class being instantiated.
+                for owner in breadth_first(class_id, inherits):
+                    candidate = f"{owner}.{CONSTRUCTOR}"
+                    if candidate in node_ids:
+                        self.constructor_of[class_id] = candidate
+                        #: The inverse, so the REVERSE walk can find the class
+                        #: name that reaches this `__init__`. See
+                        #: `reaching_names`.
+                        self._constructor_owner[candidate] = class_id
+                        break
 
         # Distinct source nodes per name, not raw rows: one function calling
         # `item.save()` twice writes two ambiguous rows for one relationship,
@@ -126,6 +168,31 @@ class Ambiguity:
         self._base_sets: dict[str, frozenset[str]] = {n: frozenset(s) for n, s in bases.items()}
 
     # -- pointwise -------------------------------------------------------
+    def reaching_names(self, node_id: str) -> tuple[str, ...]:
+        """Every name an ambiguous reference could use to reach `node_id`.
+
+        Usually just the node's own last segment. A constructor is the
+        exception and the reason this exists: `box.Widget()` reaches
+        `Widget.__init__`, but the reference's name is `Widget`, so looking
+        `__init__` up finds nothing.
+
+        Forward (`candidates`) and reverse (`callers`) MUST agree about the
+        same graph. They did not when constructor expansion was added to one
+        and not the other: the expansion offered `Widget.__init__` as a
+        candidate while the reverse walk reported it as having no callers, so
+        `impact` on it came back empty on a graph that could reach it. Every
+        confidence this project has got wrong has been some version of that --
+        a claim derived from one graph and traversed on another.
+        """
+        own = self.name_of.get(node_id)
+        via_class = self._constructor_owner.get(node_id)
+        names = [] if own is None else [own]
+        if via_class is not None:
+            owner_name = self.name_of.get(via_class)
+            if owner_name is not None and owner_name not in names:
+                names.append(owner_name)
+        return tuple(names)
+
     def callers(self, node_id: str) -> list[str]:
         """Every node with an ambiguous call that could mean `node_id`.
 
@@ -133,17 +200,23 @@ class Ambiguity:
         binding (`name_of` holds live nodes only, exactly as the resolver's
         own index does), or a name nothing calls ambiguously.
         """
-        name = self.name_of.get(node_id)
-        if name is None:
-            return []
-        return self.call_refs.get(name, [])
+        names = self.reaching_names(node_id)
+        if len(names) == 1:
+            return self.call_refs.get(names[0], [])
+        found: set[str] = set()
+        for name in names:
+            found.update(self.call_refs.get(name, ()))
+        return sorted(found)
 
     def inheritors(self, node_id: str) -> list[str]:
         """The same, for ambiguous base-class references."""
-        name = self.name_of.get(node_id)
-        if name is None:
-            return []
-        return self.base_refs.get(name, [])
+        names = self.reaching_names(node_id)
+        if len(names) == 1:
+            return self.base_refs.get(names[0], [])
+        found: set[str] = set()
+        for name in names:
+            found.update(self.base_refs.get(name, ()))
+        return sorted(found)
 
     def caller_count(self, node_id: str, also: set[str]) -> int:
         """How many DISTINCT nodes call `node_id`, counting `also` -- the
@@ -154,16 +227,36 @@ class Ambiguity:
         crowded name the ambiguous set has thousands of members and the
         materialized one has a handful.
         """
-        name = self.name_of.get(node_id)
-        calls = self._call_sets.get(name, frozenset()) if name is not None else frozenset()
-        bases = self._base_sets.get(name, frozenset()) if name is not None else frozenset()
+        names = self.reaching_names(node_id)
+        if len(names) == 1:
+            calls = self._call_sets.get(names[0], frozenset())
+            bases = self._base_sets.get(names[0], frozenset())
+        else:
+            # Rare (constructors only), so the extra allocation is fine here
+            # and the fast path above stays allocation-free.
+            calls = frozenset().union(*(self._call_sets.get(n, frozenset()) for n in names or [""]))
+            bases = frozenset().union(*(self._base_sets.get(n, frozenset()) for n in names or [""]))
         derived = len(calls) + sum(1 for src in bases if src not in calls)
         return derived + sum(1 for src in also if src not in calls and src not in bases)
 
     def candidates(self, raw_name: str) -> list[str]:
         """Everything an ambiguous reference to `raw_name` could mean --
-        the resolver's LOW candidate set, recomputed."""
-        return self.by_name.get(last_segment(raw_name), [])
+        the resolver's LOW candidate set, recomputed, plus the `__init__` any
+        class among them would run.
+
+        The constructor half mirrors `resolve.with_constructors`, which does
+        the same for references the resolver could distinguish. Both paths have
+        to describe the same graph.
+        """
+        found = self.by_name.get(last_segment(raw_name), [])
+        if not found:
+            return found
+        extra = [
+            self.constructor_of[node_id]
+            for node_id in found
+            if node_id in self.constructor_of and self.constructor_of[node_id] not in found
+        ]
+        return found + extra if extra else found
 
     # -- whole-graph ------------------------------------------------------
     def hub_edges(self) -> Iterator[tuple[str, str]]:

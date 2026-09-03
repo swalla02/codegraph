@@ -192,7 +192,7 @@ def _cmd_islands(args: argparse.Namespace) -> int:
         except gitio.GitError:
             print(f"revision not found: {args.rev}", file=sys.stderr)
             return 1
-        report = islands_report(store, args.rev, limit=args.limit)
+        report = islands_report(store, args.rev, indexer.config, limit=args.limit)
         print(render_json(report) if args.json else render_text(report))
         return 0
     finally:

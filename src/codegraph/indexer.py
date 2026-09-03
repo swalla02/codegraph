@@ -563,6 +563,7 @@ class Indexer:
                         node["line_end"],
                         node["body_hash"],
                         node["name_binding"],
+                        node["decorators"],
                     )
                 )
             rows.append(
@@ -576,11 +577,12 @@ class Indexer:
                     1,
                     module_hashes.get(sha) or sha,
                     "live",
+                    "",
                 )
             )
         connection.executemany(
             "INSERT OR REPLACE INTO nodes(rev, id, path, qualname, kind, line_start,"
-            " line_end, body_hash, name_binding) VALUES(?,?,?,?,?,?,?,?,?)",
+            " line_end, body_hash, name_binding, decorators) VALUES(?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
         return shadowed

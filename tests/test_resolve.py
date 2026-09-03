@@ -775,3 +775,116 @@ def test_an_imported_definition_still_shadows_the_builtin(repo, write):
     indexer.reconcile("HEAD")
     assert ("app.py::caller", "lib.py::set", "HIGH") in edges(store)
     store.close()
+
+
+def test_instantiating_a_class_calls_its_own_constructor(repo, write):
+    """`Cls()` runs `Cls.__init__`, and no source line anywhere spells that
+    name -- so without an implied edge the constructor of every class in the
+    repository has zero callers. #27 measured the result on psf/requests:
+    `adapters.py::BaseAdapter.__init__` reported as an island of one."""
+    write(
+        "a.py",
+        "class Thing:\n    def __init__(self):\n        self.x = 1\n\n\n"
+        "def build():\n    return Thing()\n",
+        commit="constructor",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("a.py::build", "a.py::Thing", "HIGH") in edges(store)
+    assert ("a.py::build", "a.py::Thing.__init__", "HIGH") in edges(store)
+    store.close()
+
+
+def test_instantiating_a_class_calls_the_constructor_it_inherits(repo, write):
+    """A subclass that defines no `__init__` runs its base's, so the edge has
+    to follow the MRO rather than stopping at the class named. This is the
+    shape that matters in practice: a base holding the only `__init__` and
+    every subclass relying on it."""
+    write(
+        "a.py",
+        "class Base:\n    def __init__(self, tag):\n        self.tag = tag\n\n\n"
+        "class Middle(Base):\n    pass\n\n\n"
+        "class Leaf(Middle):\n    def run(self):\n        return self.tag\n\n\n"
+        "def build():\n    return Leaf('x')\n",
+        commit="inherited constructor",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("a.py::build", "a.py::Base.__init__", "HIGH") in edges(store)
+    store.close()
+
+
+def test_the_nearest_constructor_in_the_mro_wins(repo, write):
+    """The base's `__init__` is shadowed by the subclass's own, exactly as
+    Python's attribute lookup shadows it -- one constructor edge, not both."""
+    write(
+        "a.py",
+        "class Base:\n    def __init__(self):\n        pass\n\n\n"
+        "class Child(Base):\n    def __init__(self):\n        pass\n\n\n"
+        "def build():\n    return Child()\n",
+        commit="shadowed constructor",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = edges(store)
+    assert ("a.py::build", "a.py::Child.__init__", "HIGH") in found
+    assert ("a.py::build", "a.py::Base.__init__", "HIGH") not in found
+    store.close()
+
+
+def test_a_class_with_no_constructor_anywhere_implies_no_edge(repo, write):
+    """`Thing()` on a class that neither defines nor inherits an `__init__`
+    runs `object.__init__`, which is not a repository symbol. Inventing an
+    edge to some same-named `__init__` elsewhere in the tree would be the
+    over-approximation bias pointing at a definition Python never reaches."""
+    write(
+        "a.py",
+        "class Other:\n    def __init__(self):\n        pass\n\n\n"
+        "class Thing:\n    pass\n\n\n"
+        "def build():\n    return Thing()\n",
+        commit="no constructor",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert not [dst for src, dst, _ in edges(store) if src == "a.py::build" and "__init__" in dst]
+    store.close()
+
+
+def test_an_ambiguous_constructor_still_reaches_the_init_it_would_run(repo, write):
+    """A LOW guess at which class a bare name means stays a LOW guess about
+    which `__init__` runs -- but it must still be reachable.
+
+    `box.Widget()` is an all-LOW fan-out made entirely of classes, so since #25
+    it is not materialized at all. Merging #25 with the constructor edge lost
+    this link on both paths at once: deferred at index time, and missing from
+    the query-time expansion, which only knew about name matches. Query-time
+    expansion has to produce exactly what index time would have.
+
+    The confidence half of the original property is pinned through `impact`,
+    which is where a user actually reads it: the reported dependent must be LOW,
+    never laundered into something stronger by the implied edge.
+    """
+    write("one.py", "class Widget:\n    def __init__(self):\n        pass\n")
+    write("two.py", "class Widget:\n    def __init__(self):\n        pass\n")
+    write("use.py", "def build(box):\n    return box.Widget()\n", commit="ambiguous")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+
+    stored = store.connection.execute(
+        "SELECT COUNT(*) AS n FROM edges WHERE rev='HEAD' AND kind='CALLS'"
+    ).fetchone()["n"]
+    assert stored == 0, "the fixture stopped exercising the unmaterialized path"
+
+    offered = set(Ambiguity(store, "HEAD").candidates("box.Widget"))
+    assert offered == {
+        "one.py::Widget",
+        "two.py::Widget",
+        "one.py::Widget.__init__",
+        "two.py::Widget.__init__",
+    }
+
+    report = impact_report(store, "HEAD", "one.py::Widget.__init__", include_low=True)
+    found = {(row.id, row.detail) for group in report.groups for row in group.rows}
+    assert any(node_id == "use.py::build" for node_id, _ in found)
+    assert all("LOW" in detail for node_id, detail in found if node_id == "use.py::build")
+    store.close()
