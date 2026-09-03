@@ -105,16 +105,18 @@ _CONFIG_STUB = '''# codegraph configuration -- https://github.com/swalla02/codeg
 # source_roots = ["", "src"]
 
 
-# How many equally-weak candidates one call site may name before codegraph
-# records it once as ambiguous instead of as that many low-confidence edges.
-# A call like `item.save()` that names nothing importable, nothing
-# module-local, and nothing reachable through `self` falls back to matching
-# `save` against every definition in the repository. On django that was 971
-# candidates for a single call site, and 96.6% of the whole graph was that kind
-# of guess -- the edge table grew with the square of the repository. Nothing is
-# discarded at the cap: the one ambiguous record makes the same claim the N
-# edges did. Raise it to get the full cross product back; 0 disables the cap.
-# ambiguity_limit = 25
+# There is deliberately no setting here for the bare-name fan-out. A call like
+# `item.save()` that names nothing importable, nothing module-local and nothing
+# reachable through `self` falls back to matching `save` against every
+# definition in the repository -- 971 candidates for a single call site on
+# django. That set is not stored: it is exactly "every definition named save",
+# which the graph already holds, so codegraph records the call once and expands
+# it when a query asks. How many of them you want to see is a property of the
+# question, so it is `codegraph impact --limit N` (and `--all`), per query,
+# rather than a setting that changes the graph for every future question.
+#
+# `ambiguity_limit` used to live here. It is still accepted and now does
+# nothing; remove it.
 
 
 # Effect overrides, merged over the built-in catalog. The built-ins only know

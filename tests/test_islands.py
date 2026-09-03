@@ -273,3 +273,55 @@ def test_islands_json_output_is_machine_readable(repo, write, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["summary"]["islands"] == 1
     assert payload["groups"][0]["title"] == "islands"
+
+
+# -- the bare-name fan-out joins islands even though it is not in `edges` ----
+#
+# The report's central claim is that an island bounds what an unlimited-hop
+# `impact` or `effects` walk could ever touch. Since #25 both of those expand
+# the ambiguous references the graph does not store, so this has to as well or
+# the claim stops being true -- it would report a boundary as uncrossable that
+# a walk crosses.
+
+
+def test_an_ambiguous_call_joins_the_symbols_it_could_mean(repo, write):
+    """`thing.save()` matches both `save` definitions and is stored as one
+    `unresolved` row, not as two edges. All three symbols are still one
+    island, because `impact` can walk from any of them to any other."""
+    write("one.py", "class One:\n    def save(self):\n        pass\n", commit="1")
+    write("two.py", "class Two:\n    def save(self):\n        pass\n", commit="2")
+    write("caller.py", "def go(thing):\n    thing.save()\n", commit="c")
+    store = build(repo)
+
+    stored = store.connection.execute(
+        "SELECT COUNT(*) AS n FROM edges WHERE rev='HEAD' AND kind='CALLS'"
+    ).fetchone()["n"]
+    assert stored == 0, "the fixture stopped exercising the unmaterialized path"
+
+    report = islands_report(store, "HEAD")
+    assert report.summary["largest"] == 3
+    joined = [row for row in rows(report, "islands")]
+    assert len(joined) == 1
+    assert set(named_ids(joined[0])) == {
+        "one.py::One.save",
+        "two.py::Two.save",
+        "caller.py::go",
+    }
+    store.close()
+
+
+def test_a_hub_is_never_a_member_of_the_island_it_joins(repo, write):
+    """The per-name hub the expansion routes through is a device, not a
+    symbol -- exactly like `path::<module>`. Counting one would invent an
+    island member nobody wrote, and inflate `symbols` past the node count."""
+    write("one.py", "class One:\n    def save(self):\n        pass\n", commit="1")
+    write("two.py", "class Two:\n    def save(self):\n        pass\n", commit="2")
+    write("caller.py", "def go(thing):\n    thing.save()\n", commit="c")
+    store = build(repo)
+    report = islands_report(store, "HEAD")
+    assert all("\x00" not in node_id for node_id in named(report))
+    non_module_nodes = store.connection.execute(
+        "SELECT COUNT(*) AS n FROM nodes WHERE rev='HEAD' AND kind != 'module'"
+    ).fetchone()["n"]
+    assert report.summary["symbols"] == non_module_nodes
+    store.close()

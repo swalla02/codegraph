@@ -70,16 +70,66 @@ def test_tests_are_bucketed_separately(repo, write):
     store.close()
 
 
-def test_low_confidence_counted_but_not_listed(repo, write):
+def group(report, title):
+    return {row.id for g in report.groups if g.title == title for row in g.rows}
+
+
+def test_low_confidence_is_named_but_never_read_as_confirmed_impact(repo, write):
+    """A LOW caller must not sit among the dependents the report stands
+    behind -- and it must not be reduced to a number either. Before #25 this
+    printed `low_confidence_hidden: 1` and gave the reader no way to find out
+    whether that 1 was noise or the caller that mattered."""
     write("one.py", "class One:\n    def shared(self):\n        pass\n", commit="1")
     write("two.py", "class Two:\n    def shared(self):\n        pass\n", commit="2")
     write("caller.py", "def go(thing):\n    thing.shared()\n", commit="c")
     store = build(repo)
     report = impact_report(store, "HEAD", "one.py::One.shared")
-    assert "caller.py::go" not in listed(report)
-    assert report.summary["low_confidence_hidden"] >= 1
+    assert "caller.py::go" not in group(report, "dependents")
+    assert "caller.py::go" not in group(report, "tests")
+    assert "caller.py::go" in group(report, "low_confidence")
+    # It is on the page, so it is not hidden.
+    assert report.summary["low_confidence_hidden"] == 0
+    # ...and it is not counted as impact the report stands behind.
+    assert report.summary["symbols"] == 0
     with_low = impact_report(store, "HEAD", "one.py::One.shared", include_low=True)
-    assert "caller.py::go" in listed(with_low)
+    assert "caller.py::go" in group(with_low, "dependents")
+    assert with_low.summary["symbols"] == 1
+    store.close()
+
+
+def test_more_low_confidence_callers_than_the_sample_are_counted_as_hidden(repo, write):
+    """The sample is a sample. Past it the count comes back -- but it now
+    counts only what is genuinely NOT on the page."""
+    for i in range(12):
+        write(f"c{i}.py", f"def go{i}(thing):\n    thing.shared()\n", commit=f"c{i}")
+    write("one.py", "class One:\n    def shared(self):\n        pass\n", commit="1")
+    write("two.py", "class Two:\n    def shared(self):\n        pass\n", commit="2")
+    store = build(repo)
+    report = impact_report(store, "HEAD", "one.py::One.shared")
+    shown = group(report, "low_confidence")
+    assert len(shown) == 5
+    assert report.summary["low_confidence_hidden"] == 12 - 5
+    store.close()
+
+
+def test_the_low_confidence_sample_never_costs_a_dependent_its_row(repo, write):
+    """`--limit N` means N production dependents. Making the hidden count
+    actionable must not be paid for out of the budget the confident callers
+    were promised."""
+    write("one.py", "def shared():\n    pass\n", commit="1")
+    write("two.py", "class Two:\n    def shared(self):\n        pass\n", commit="2")
+    write("guess.py", "def guess(thing):\n    thing.shared()\n", commit="g")
+    write(
+        "sure.py",
+        "from one import shared\n\n\n"
+        + "\n\n".join(f"def sure{i}():\n    shared()" for i in range(3))
+        + "\n",
+        commit="s",
+    )
+    store = build(repo)
+    report = impact_report(store, "HEAD", "one.py::shared", limit=3)
+    assert group(report, "dependents") == {f"sure.py::sure{i}" for i in range(3)}
+    assert group(report, "low_confidence") == {"guess.py::guess"}
     store.close()
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 WORKTREE = "WORKTREE"
 
@@ -113,16 +113,26 @@ CREATE TABLE IF NOT EXISTS effects (
 CREATE TABLE IF NOT EXISTS imports (
     rev TEXT NOT NULL, importer_path TEXT NOT NULL, module TEXT NOT NULL
 );
--- A call site that produced no edge, and why. `reason` is 'unknown' when no
--- candidate was found at all, or 'ambiguous' when too many equally-weak ones
--- were (see config.DEFAULT_AMBIGUITY_LIMIT); `candidates` carries the count the
--- ambiguous case declined to enumerate, and is 0 for 'unknown'. Separating the
--- two matters because they are opposite problems: 'unknown' means the resolver
--- is blind to something, 'ambiguous' means it sees too much. 'builtin' is
--- neither: a call the resolver understood and deliberately did not link to a
--- repo symbol, kept out of the gap count so the real gaps stay visible.
+-- A reference that produced no edge, and why.
+--
+-- 'unknown' means no candidate was found at all -- the resolver is blind to
+-- something. 'builtin' means a call the resolver understood and deliberately
+-- did not link to a repo symbol, kept out of the gap count so the real gaps
+-- stay visible. 'ambiguous' is the opposite of 'unknown': the resolver saw
+-- too much. The last-resort step matches a bare name against every live
+-- definition in the revision, and when more than one answers, that fan-out is
+-- recorded HERE, once, instead of as N low-confidence edges.
+--
+-- That is not a truncation. The candidate set is `every live node whose
+-- qualname's last segment is this name`, which the `nodes` table already
+-- holds, so `ambiguity.py` recomputes it exactly at query time from
+-- (`src`, `raw_name`) -- see #25. `candidates` is the count as of indexing,
+-- kept for reporting only; nothing reads it to decide anything. `src` is the
+-- node the reference was made from, and is the one thing about the reference
+-- that is NOT derivable from the name index.
 CREATE TABLE IF NOT EXISTS unresolved (
     rev TEXT NOT NULL,
+    src TEXT NOT NULL DEFAULT '',
     path TEXT NOT NULL,
     line INTEGER NOT NULL,
     raw_name TEXT NOT NULL,
@@ -136,6 +146,10 @@ CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(rev, src);
 CREATE INDEX IF NOT EXISTS idx_imports_module ON imports(rev, module);
 CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(rev, qualname);
 CREATE INDEX IF NOT EXISTS idx_effects_node ON effects(rev, node_id);
+-- Query-time ambiguity expansion reads every ambiguous row for a revision
+-- in one pass; without this it is a full scan of a table that also holds
+-- the (much larger) 'unknown' and 'builtin' rows.
+CREATE INDEX IF NOT EXISTS idx_unresolved_reason ON unresolved(rev, reason);
 """
 
 _IGNORE_TEXT = "*\n"

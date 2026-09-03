@@ -43,6 +43,18 @@ course coupled -- `INHERITS` exists so the resolver can do method
 resolution, and the coupling reaches `impact` through the CALLS edges that
 resolution produces, which is where it belongs.
 
+*The bare-name fan-out counts, and it is not in `edges`.* Since #25 the
+resolver does not materialize a call whose name matches more than one
+definition; `ambiguity.py` expands it on demand instead. This report
+has to include it, or its central claim -- that an island bounds what an
+unlimited-hop `impact` or `effects` walk could ever touch -- stops being
+true, since both of those expand it too. It is folded in through the same
+per-name hub nodes `effects/propagate.py` uses: for connectivity, unioning
+`src` with `HUB(save)` and `HUB(save)` with every definition named `save`
+puts exactly the same set of symbols in one component as the N x M direct
+edges would, for O(N + M) rather than O(N x M). Hubs are treated exactly
+like the module nodes below -- connectivity, never membership.
+
 *Synthetic `path::<module>` nodes connect islands but are never members.*
 Their edges are real: a module-scope call (`_init()` at the foot of
 `status_codes.py`) is the only thing tying that file's helper to the rest
@@ -68,6 +80,7 @@ from __future__ import annotations
 
 from collections import Counter
 
+from codegraph.ambiguity import Ambiguity
 from codegraph.render import Group, Report, Row, budget
 from codegraph.store import Store
 
@@ -139,6 +152,14 @@ def islands_report(store: Store, rev: str, limit: int = 20) -> Report:
     for src, dst in pairs:
         components.union(src, dst)
     fan_in = Counter(dst for _, dst in pairs)
+
+    # The unmaterialized bare-name fan-out, through per-name hubs. Hub pairs
+    # join components but are deliberately kept out of `fan_in`: a hub is not
+    # a caller, and letting one stand in for its whole reference set would
+    # rank a name's definitions by how ambiguous the name is rather than by
+    # how much of the graph actually reaches them.
+    for src, dst in Ambiguity(store, rev).hub_edges():
+        components.union(src, dst)
 
     grouped: dict[str, list[str]] = {}
     for node_id in members:

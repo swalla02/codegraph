@@ -311,8 +311,13 @@ def test_the_config_stub_documents_every_setting_and_effect_kind(repo):
     assert main(["init", "--path", str(repo)]) == 0
 
     text = (repo / CONFIG_NAME).read_text()
-    for setting in ("source_roots", "ambiguity_limit", "[[effect]]"):
+    for setting in ("source_roots", "[[effect]]"):
         assert setting in text
+    # ...but never a deprecated one as something to uncomment. `ambiguity_limit`
+    # is mentioned only to say it does nothing (#25); handing a new project a
+    # knob that is on its way out is worse than not documenting it.
+    assert "# ambiguity_limit = " not in text
+    assert "ambiguity_limit` used to live here" in text
     for kind in EFFECT_KINDS:
         assert kind in text, f"effect kind {kind} is undocumented in {CONFIG_NAME}"
 

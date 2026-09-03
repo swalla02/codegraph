@@ -12,6 +12,7 @@ distinct callers a node has.
 
 from __future__ import annotations
 
+from codegraph.ambiguity import Ambiguity
 from codegraph.resolve import HIGH, LOW, MEDIUM
 from codegraph.store import Store
 
@@ -28,28 +29,43 @@ def score(hop: int, confidence: str, salience_value: float) -> float:
     return (1.0 / hop) * _CONFIDENCE_WEIGHT[confidence] * (1.0 + salience_value)
 
 
-def fan_in(store: Store, rev: str, node_id: str) -> int:
+def fan_in(store: Store, rev: str, node_id: str, ambiguity: Ambiguity | None = None) -> int:
     """Count of DISTINCT callers of `node_id` -- never raw edge rows, since
     the `edges` table can hold more than one row for the same (src, dst)
     pair. `salience` folds this into its composite score; callers that need
     the raw fan-in itself (e.g. to test whether a node is a true entry
     point, `fan_in == 0`) should call this directly rather than
     reverse-engineering it out of `salience`'s combined value, which a
-    public, well-called node can also cross via its other two terms alone."""
-    row = store.connection.execute(
-        "SELECT COUNT(DISTINCT src) AS n FROM edges WHERE rev=? AND dst=?", (rev, node_id)
-    ).fetchone()
-    return row["n"]
+    public, well-called node can also cross via its other two terms alone.
+
+    With an `ambiguity`, the bare-name callers the graph does not store are
+    counted too -- unioned by source id rather than added, since a caller
+    that both imports a symbol and calls it by bare name elsewhere is still
+    one caller. Without one this counts materialized edges only, which is
+    what a caller holding no expansion for the revision can honestly say.
+    """
+    sources = {
+        row["src"]
+        for row in store.connection.execute(
+            "SELECT DISTINCT src FROM edges WHERE rev=? AND dst=?", (rev, node_id)
+        )
+    }
+    if ambiguity is not None:
+        sources.update(ambiguity.callers(node_id))
+        sources.update(ambiguity.inheritors(node_id))
+    return len(sources)
 
 
-def salience(store: Store, rev: str, node_id: str) -> float:
+def salience(
+    store: Store, rev: str, node_id: str, ambiguity: Ambiguity | None = None
+) -> float:
     """How much a node deserves attention on its own merits: 0.5 if it has
     no callers of its own (an entry point), 0.3 if its qualname's last
     segment is not private (does not start with `_`), plus a fan-in term
     capped at `_FAN_IN_CAP` distinct callers."""
     connection = store.connection
 
-    callers = fan_in(store, rev, node_id)
+    callers = fan_in(store, rev, node_id, ambiguity)
 
     value = 0.0
     if callers == 0:
