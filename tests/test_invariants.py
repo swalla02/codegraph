@@ -589,3 +589,38 @@ def test_a_definition_added_elsewhere_updates_another_files_edges(repo, write):
     assert targets() == {"one.py::One.save", "two.py::Two.save"}
     assert dump_graph(store, WORKTREE) == cold_dump(repo, WORKTREE)
     store.close()
+
+
+def test_rebuild_rebuilds_layer_2_not_just_the_parse_cache(repo, write):
+    """`--rebuild` used to clear only the `blobs` cache. The tree and the
+    fingerprint were untouched, so the reconcile that followed took the
+    unchanged-tree fast path and served Layer 2 from the previous build --
+    the flag re-parsed everything and changed nothing. See #30.
+
+    Deleting the edges by hand is the whole point: it makes the stored graph
+    provably wrong, so a `--rebuild` that returns it to the cold-rebuild
+    answer can only have re-resolved. A no-op `--rebuild` leaves them gone.
+    """
+    from codegraph.cli import main
+
+    write("lib.py", "def helper():\n    return 1\n")
+    write(
+        "app.py",
+        "from lib import helper\n\n\ndef caller():\n    return helper()\n",
+        commit="two",
+    )
+    store = Store.open(repo)
+    Indexer(repo, store, GitTreeSource(repo)).reconcile(WORKTREE)
+    expected = dump_graph(store, WORKTREE)
+    assert expected["edges"], "the fixture stopped producing any edges to lose"
+
+    store.connection.execute("DELETE FROM edges WHERE rev=?", (WORKTREE,))
+    store.connection.commit()
+    assert dump_graph(store, WORKTREE)["edges"] == []
+    store.close()
+
+    assert main(["index", "--rebuild", "--quiet", "--path", str(repo)]) == 0
+
+    store = Store.open(repo)
+    assert dump_graph(store, WORKTREE) == expected
+    store.close()
