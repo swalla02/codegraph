@@ -147,7 +147,11 @@ def test_calls_on_non_flattenable_receivers_are_still_recorded():
     and `d["k"].m()` must all still produce a `call` ref, carrying the
     attribute name (marked with the synthetic `<attr>.` prefix so it is
     routed past the HIGH-confidence resolver steps rather than falsely
-    matched as an imported/module-local/self name)."""
+    matched as an imported/module-local/self name).
+
+    `super().go()` is the one exception and now carries `<super>.` instead: it
+    is not an unknown receiver, it names the enclosing class's base, and the
+    resolver can settle it at HIGH. Everything else here really is unknown."""
     source = (
         b"class Base:\n"
         b"    def go(self):\n        pass\n\n\n"
@@ -162,12 +166,13 @@ def test_calls_on_non_flattenable_receivers_are_still_recorded():
     result = parse_blob(source)
     raw = {r.raw_name for r in result.refs if r.ref_kind == "call"}
     assert raw >= {
-        "<attr>.go",
+        "<super>.go",
         "<attr>.charge",
         "<attr>.run",
         "<attr>.fire",
         "<attr>.m",
     }
+    assert "<attr>.go" not in raw, "super() must not be filed as an unknown receiver"
 
 
 def test_call_with_no_attribute_at_all_is_recorded_under_a_placeholder():

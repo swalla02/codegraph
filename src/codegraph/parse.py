@@ -11,7 +11,7 @@ import copy
 import hashlib
 from dataclasses import dataclass, field
 
-PARSER_VERSION = "2"
+PARSER_VERSION = "3"
 
 _DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
@@ -127,6 +127,29 @@ def _body_hash(node: ast.AST) -> str:
     # ast.dump omits lineno/col_offset unless include_attributes=True, so this
     # hash is invariant to where the definition sits in the file.
     return hashlib.blake2b(ast.dump(node).encode(), digest_size=16).hexdigest()
+
+
+#: Synthetic receiver for a `super()` call, mirroring `<attr>`/`<dynamic>`.
+#: `<` cannot appear in a Python identifier, so this can never collide with a
+#: real dotted call.
+SUPER = "<super>"
+
+
+def _is_super_call(node: ast.expr) -> bool:
+    """Is `node` a bare `super()` call?
+
+    Only the zero-argument form. The explicit `super(Cls, self)` form names a
+    starting class that may not be the enclosing one, so resolving it as if it
+    were would be a guess dressed as a fact -- it keeps falling through to
+    `<attr>`.
+    """
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "super"
+        and not node.args
+        and not node.keywords
+    )
 
 
 _PASS = ast.Pass()
@@ -344,9 +367,26 @@ class _Collector(ast.NodeVisitor):
             # (e.g. `handlers[i]()`) has nothing to key on and is recorded
             # under a synthetic placeholder instead, purely so the COUNT is
             # never silently lost.
-            name = (
-                f"<attr>.{node.func.attr}" if isinstance(node.func, ast.Attribute) else "<dynamic>"
-            )
+            if isinstance(node.func, ast.Attribute) and _is_super_call(node.func.value):
+                # `super().__init__()` is not an unknown receiver. It names the
+                # enclosing class's base, which the resolver already knows, so
+                # keeping it apart from `<attr>.` is the difference between a
+                # certainty and a 1-in-N guess.
+                #
+                # Before this, `super().__init__()` flattened to
+                # `<attr>.__init__` and fell to the repo-wide name match: 26
+                # candidates per call site on psf/requests, all LOW, exactly
+                # one right. So `impact BaseAdapter.__init__` reported
+                # `symbols: 0` by default and 157 dependents with `--all` --
+                # for the highest-blast-radius edit there is, since adding a
+                # required argument to a base `__init__` breaks every subclass.
+                name = f"{SUPER}.{node.func.attr}"
+            else:
+                name = (
+                    f"<attr>.{node.func.attr}"
+                    if isinstance(node.func, ast.Attribute)
+                    else "<dynamic>"
+                )
         elif name == "open":
             name = _open_call_marker(node)
         self.refs.append(

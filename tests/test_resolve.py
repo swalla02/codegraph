@@ -159,14 +159,22 @@ def test_external_call_is_unresolved_not_an_edge(repo, write):
     store.close()
 
 
-def test_super_call_resolves_weakly_by_name_not_dropped(repo, write):
-    """Regression for F2: `super().helper()`'s receiver (`super()`) isn't a
-    flattenable Name/Attribute chain, so `visit_Call` used to drop the ref
-    entirely -- no edge, no `unresolved` row. `helper` is unique in this
-    repo (unlike the overriding method's own name), so the existing
-    repo-wide by-last-segment step should now weakly resolve it at MEDIUM,
-    exactly as `test_unique_method_name_is_medium_confidence` does for
-    `thing.unique_op()`."""
+def test_super_call_resolves_to_the_base_at_high_confidence(repo, write):
+    """`super().helper()` names the enclosing class's base. That is one of the
+    most certain calls Python has -- the starting class is the one the call is
+    written in, and the lookup skips it -- so it resolves at HIGH.
+
+    It used to be MEDIUM here and LOW on any real repo. The receiver is not a
+    flattenable Name/Attribute chain, so the parser filed it under the
+    unknown-receiver marker and it fell to the repo-wide name match: on
+    psf/requests that was 26 candidates per call site, all LOW, exactly one
+    right, so `impact BaseAdapter.__init__` reported `symbols: 0` by default.
+    Which is the worst possible shape, since adding a required argument to a
+    base `__init__` breaks every subclass.
+
+    Supersedes the F2 regression this test used to pin (the ref must not be
+    dropped): resolving it at HIGH is strictly stronger than not losing it.
+    """
     write(
         "base.py",
         "class Base:\n    def helper(self):\n        pass\n",
@@ -180,7 +188,7 @@ def test_super_call_resolves_weakly_by_name_not_dropped(repo, write):
     )
     store, indexer = build(repo)
     indexer.reconcile("HEAD")
-    assert ("child.py::Child.go", "base.py::Base.helper", "MEDIUM") in edges(store)
+    assert ("child.py::Child.go", "base.py::Base.helper", "HIGH") in edges(store)
     store.close()
 
 
@@ -887,4 +895,67 @@ def test_an_ambiguous_constructor_still_reaches_the_init_it_would_run(repo, writ
     found = {(row.id, row.detail) for group in report.groups for row in group.rows}
     assert any(node_id == "use.py::build" for node_id, _ in found)
     assert all("LOW" in detail for node_id, detail in found if node_id == "use.py::build")
+    store.close()
+
+
+def test_super_skips_the_class_the_call_is_written_in(repo, write):
+    """`super()` walks strictly upwards. `super().__init__()` inside
+    `Child.__init__` must reach the base's `__init__`, never `Child`'s own --
+    the whole point of the call is to reach the one it overrides."""
+    write("base.py", "class Base:\n    def __init__(self):\n        self.x = 1\n")
+    write(
+        "child.py",
+        "from base import Base\n\n\n"
+        "class Child(Base):\n"
+        "    def __init__(self):\n"
+        "        super().__init__()\n",
+        commit="two",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    targets = {dst for src, dst, _ in edges(store) if src == "child.py::Child.__init__"}
+    assert "base.py::Base.__init__" in targets
+    assert "child.py::Child.__init__" not in targets, "super() resolved to itself"
+    store.close()
+
+
+def test_super_does_not_reach_a_subclass_override(repo, write):
+    """The one place this differs from `self.X`. `self.area()` may run a
+    subclass's override because `self` may be an instance of a subclass;
+    `super().area()` exists precisely to bypass overrides, so a subclass's
+    version must never be a candidate."""
+    write(
+        "chain.py",
+        "class Base:\n    def area(self):\n        return 0\n"
+        "\n\n"
+        "class Mid(Base):\n"
+        "    def area(self):\n"
+        "        return super().area()\n"
+        "\n\n"
+        "class Leaf(Mid):\n    def area(self):\n        return 2\n",
+        commit="chain",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    targets = {dst for src, dst, _ in edges(store) if src == "chain.py::Mid.area"}
+    assert targets == {"chain.py::Base.area"}
+
+
+def test_the_explicit_two_argument_super_is_not_claimed_as_certain(repo, write):
+    """`super(Other, self)` names a starting class that need not be the
+    enclosing one, so resolving it as though it were would be a guess dressed
+    as a fact. It keeps falling through to the weak path instead."""
+    write("base.py", "class Base:\n    def helper(self):\n        pass\n")
+    write(
+        "child.py",
+        "from base import Base\n\n\n"
+        "class Child(Base):\n"
+        "    def go(self):\n"
+        "        super(Child, self).helper()\n",
+        commit="two",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = {(dst, conf) for src, dst, conf in edges(store) if src == "child.py::Child.go"}
+    assert ("base.py::Base.helper", "HIGH") not in found
     store.close()
