@@ -691,3 +691,92 @@ def test_an_imported_definition_still_shadows_the_builtin(repo, write):
     indexer.reconcile("HEAD")
     assert ("app.py::caller", "lib.py::set", "HIGH") in edges(store)
     store.close()
+
+
+def test_instantiating_a_class_calls_its_own_constructor(repo, write):
+    """`Cls()` runs `Cls.__init__`, and no source line anywhere spells that
+    name -- so without an implied edge the constructor of every class in the
+    repository has zero callers. #27 measured the result on psf/requests:
+    `adapters.py::BaseAdapter.__init__` reported as an island of one."""
+    write(
+        "a.py",
+        "class Thing:\n    def __init__(self):\n        self.x = 1\n\n\n"
+        "def build():\n    return Thing()\n",
+        commit="constructor",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("a.py::build", "a.py::Thing", "HIGH") in edges(store)
+    assert ("a.py::build", "a.py::Thing.__init__", "HIGH") in edges(store)
+    store.close()
+
+
+def test_instantiating_a_class_calls_the_constructor_it_inherits(repo, write):
+    """A subclass that defines no `__init__` runs its base's, so the edge has
+    to follow the MRO rather than stopping at the class named. This is the
+    shape that matters in practice: a base holding the only `__init__` and
+    every subclass relying on it."""
+    write(
+        "a.py",
+        "class Base:\n    def __init__(self, tag):\n        self.tag = tag\n\n\n"
+        "class Middle(Base):\n    pass\n\n\n"
+        "class Leaf(Middle):\n    def run(self):\n        return self.tag\n\n\n"
+        "def build():\n    return Leaf('x')\n",
+        commit="inherited constructor",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("a.py::build", "a.py::Base.__init__", "HIGH") in edges(store)
+    store.close()
+
+
+def test_the_nearest_constructor_in_the_mro_wins(repo, write):
+    """The base's `__init__` is shadowed by the subclass's own, exactly as
+    Python's attribute lookup shadows it -- one constructor edge, not both."""
+    write(
+        "a.py",
+        "class Base:\n    def __init__(self):\n        pass\n\n\n"
+        "class Child(Base):\n    def __init__(self):\n        pass\n\n\n"
+        "def build():\n    return Child()\n",
+        commit="shadowed constructor",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = edges(store)
+    assert ("a.py::build", "a.py::Child.__init__", "HIGH") in found
+    assert ("a.py::build", "a.py::Base.__init__", "HIGH") not in found
+    store.close()
+
+
+def test_a_class_with_no_constructor_anywhere_implies_no_edge(repo, write):
+    """`Thing()` on a class that neither defines nor inherits an `__init__`
+    runs `object.__init__`, which is not a repository symbol. Inventing an
+    edge to some same-named `__init__` elsewhere in the tree would be the
+    over-approximation bias pointing at a definition Python never reaches."""
+    write(
+        "a.py",
+        "class Other:\n    def __init__(self):\n        pass\n\n\n"
+        "class Thing:\n    pass\n\n\n"
+        "def build():\n    return Thing()\n",
+        commit="no constructor",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert not [dst for src, dst, _ in edges(store) if src == "a.py::build" and "__init__" in dst]
+    store.close()
+
+
+def test_a_constructor_edge_is_no_more_confident_than_the_class_edge(repo, write):
+    """A LOW guess at which class a bare name means stays a LOW guess about
+    which `__init__` runs. The implied edge restates the class edge's claim
+    and must not launder it into a stronger one."""
+    write("one.py", "class Widget:\n    def __init__(self):\n        pass\n")
+    write("two.py", "class Widget:\n    def __init__(self):\n        pass\n")
+    write("use.py", "def build(box):\n    return box.Widget()\n", commit="ambiguous")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = edges(store)
+    assert ("use.py::build", "one.py::Widget", "LOW") in found
+    assert ("use.py::build", "one.py::Widget.__init__", "LOW") in found
+    assert ("use.py::build", "two.py::Widget.__init__", "LOW") in found
+    store.close()

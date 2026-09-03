@@ -110,7 +110,7 @@ slower on a cold cache.
 | `codegraph resolve <name>` | Fuzzy-match a name (trailing name, qualname, or full node id) to node ids. |
 | `codegraph effects <symbol> [--json]` | Report every side-effect kind reachable from a symbol, each with a witness chain down to the causing `file:line`. |
 | `codegraph impact <symbol> [--hops N] [--limit N] [--all] [--json]` | Report the ranked dependents of a symbol — everything a change to it could break. |
-| `codegraph islands [--rev REV] [--limit N] [--json]` | Report the connected components of the revision's `CALLS` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them. Structure only — an island of one is *not* a dead-code finding (see below). |
+| `codegraph islands [--rev REV] [--limit N] [--json]` | Report the connected components of the revision's `CALLS` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
 | `codegraph diff [<base>..<head>] [--json]` | Report what changed between two revisions by content hash, never by line number: symbols added/removed/changed, plus any side effect newly reachable. Defaults to `merge-base(default branch, HEAD)..WORKTREE` — "what has this branch changed so far." |
 | `codegraph gc [--keep REV]` | Prune the Layer 1 parse cache down to what `HEAD`, the worktree, and any `--keep`-named revisions still reference. Never touches the graph itself, so it can only make a future answer slower to rebuild, never wrong. |
 | `codegraph init` | Make this repository's coding agents aware of codegraph: an `AGENTS.md` section, the `@AGENTS.md` bridge into an existing `CLAUDE.md`, and a commented `codegraph.toml` stub. Idempotent; never overwrites content it did not write; never touches `.git/`. |
@@ -123,19 +123,43 @@ slower on a cold cache.
 into connected components. That the call graph is *not* connected is real
 structure, not a defect: a service boundary, a config-gated region, and
 code nothing references all show up as separate islands. On psf/requests
-it reports 807 symbols in 172 islands, the biggest holding 628 of them and
-167 being islands of exactly one.
+it reports 807 symbols in 154 islands, the biggest holding 646 of them and
+149 being islands of exactly one.
 
-It deliberately stops there. **An island is not a reachability result, and
-a one-symbol island is not dead code.** Membership comes from the call
-edges the resolver recorded, and a great deal of Python is invoked by
-mechanisms that leave no call site in the source: dunders (`__delitem__`
-runs on every `del d[k]`), decorators, framework dispatch, ABC overrides,
-packaging entry points. `AuthBase.__call__`, `BaseAdapter.__init__` and
-`CaseInsensitiveDict.__delitem__` are each an island of one on requests,
-and not one of them is unused. Read a row as "this region shares no call
-edge with that one" and nothing more; classifying *why* an island exists
-is future work, and it needs edges this graph does not record yet.
+**An island is not a reachability result, and a one-symbol island is not
+dead code.** Membership comes from the call edges the resolver recorded,
+and a great deal of Python is invoked by mechanisms that leave no call site
+in the source: dunders (`__delitem__` runs on every `del d[k]`),
+decorators, framework dispatch, ABC overrides, packaging entry points.
+`AuthBase.__call__` and `CaseInsensitiveDict.__delitem__` are each an
+island of one on requests, and neither is unused.
+
+So each island is labelled with what can be said about why it stands
+apart, and no label is ever a claim that code is dead:
+
+- **`implicit: dunder, decorator, test, override, nested, import`** — a
+  mechanism found among the island's members by which something could reach
+  it without a call site. Not proof that it runs; counter-evidence to
+  "nothing reaches this". 125 of requests' 154 islands carry at least one.
+- **`boundary: NETWORK`** — a path inside the island leaves the process.
+  The handler lives in another repository, so the island boundary *is* the
+  service boundary. That is signal, not a false positive. `NETWORK` is
+  deliberately the only effect kind that marks one: a socket call leaving
+  the process is a structural fact, whereas coupling two functions through
+  a database means reading SQL and tracking a schema, which is a different
+  tool.
+- **`no implicit-invocation mechanism recognised`** — the remainder, 29
+  islands on requests, and still a statement about the tool rather than
+  about the code. Most of them are the library's own public surface
+  (`get_dict`, `dict_from_cookiejar`), called by users of the package and
+  by the stdlib — neither of which is in the tree.
+
+One thing that moved the numbers is worth naming separately, because it was
+a plain bug rather than a limit of static analysis: `Cls()` resolves to the
+class and nothing in the source ever spells `Cls.__init__`, so constructors
+had no incoming edge at all. Implying that edge (following the MRO for an
+inherited one) folded 18 of requests' 172 islands into the rest of the
+graph.
 
 `resolve`, `impact`, and `effects` share one exit-code convention for
 resolving `<symbol>` to a node id: `0` = a single unambiguous match, `1` =

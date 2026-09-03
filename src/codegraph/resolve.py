@@ -145,6 +145,25 @@ class ResolveContext:
     descendant_cache: dict[str, list[str]] = field(default_factory=dict)
 
 
+def breadth_first(start: str, adjacency: dict[str, list[str]]) -> list[str]:
+    """Breadth-first walk from `start` over `adjacency`, cycle-safe.
+
+    Module level rather than a method because two different walks need it:
+    the resolver's MRO/override walks over `bases`/`subclasses`, and
+    `_inherited_constructor` below, which is not resolution of a name at
+    all and so does not belong to a `Resolver`.
+    """
+    order, seen, queue = [], {start}, [start]
+    while queue:
+        current = queue.pop(0)
+        order.append(current)
+        for nxt in adjacency.get(current, ()):
+            if nxt not in seen:
+                seen.add(nxt)
+                queue.append(nxt)
+    return order
+
+
 class Resolver(Protocol):
     def resolve_call(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
         """Return `(node_id, confidence)` candidates for `ref`; [] if unresolved."""
@@ -252,29 +271,16 @@ class AstResolver:
         return ctx.qualname_index.get((class_path, f"{class_qualname}.{attribute}"))
 
     @staticmethod
-    def _walk(start: str, adjacency: dict[str, list[str]]) -> list[str]:
-        """Breadth-first walk from `start` over `adjacency`, cycle-safe."""
-        order, seen, queue = [], {start}, [start]
-        while queue:
-            current = queue.pop(0)
-            order.append(current)
-            for nxt in adjacency.get(current, ()):
-                if nxt not in seen:
-                    seen.add(nxt)
-                    queue.append(nxt)
-        return order
-
-    @classmethod
-    def _mro(cls, start: str, ctx: ResolveContext) -> list[str]:
+    def _mro(start: str, ctx: ResolveContext) -> list[str]:
         """The class and its known bases, nearest first."""
-        return cls._walk(start, ctx.bases)
+        return breadth_first(start, ctx.bases)
 
-    @classmethod
-    def _descendants(cls, start: str, ctx: ResolveContext) -> list[str]:
+    @staticmethod
+    def _descendants(start: str, ctx: ResolveContext) -> list[str]:
         """Every known subclass of `start`, transitively (excluding `start`)."""
         cached = ctx.descendant_cache.get(start)
         if cached is None:
-            cached = cls._walk(start, ctx.subclasses)[1:]
+            cached = breadth_first(start, ctx.subclasses)[1:]
             ctx.descendant_cache[start] = cached
         return cached
 
@@ -384,6 +390,10 @@ class _SymbolTable:
             self.name_index.setdefault(row["qualname"].rpartition(".")[2], []).append(row["id"])
             if row["kind"] == "class":
                 class_ids[key] = row["id"]
+
+        #: Live class nodes, by id -- the test `_constructor_target` applies
+        #: to a resolved call before treating it as an instantiation.
+        self.class_node_ids: frozenset[str] = frozenset(class_ids.values())
 
         self.enclosing_class: dict[str, str] = {}
         for row in live_rows:
@@ -514,6 +524,76 @@ def split_by_ambiguity_limit(
     return [hit for hit in hits if hit[1] != LOW], len(weak)
 
 
+#: The method a call to a class actually runs. `Cls()` resolves to the class
+#: node, and nothing in the source ever writes `Cls.__init__`, so without the
+#: edge below a constructor has no incoming call at all -- on psf/requests that
+#: left `src/requests/adapters.py::BaseAdapter.__init__` an island of exactly
+#: one. #27 records this as a plain bug rather than a limit of static analysis:
+#: the caller IS in the source, it just spells the callee's name as the class's.
+CONSTRUCTOR = "__init__"
+
+
+def constructor_target(
+    class_id: str, table: _SymbolTable, bases: dict[str, list[str]]
+) -> str | None:
+    """The `__init__` that `class_id()` runs, or None if it neither defines
+    nor inherits one.
+
+    The walk is the same breadth-first approximation of the MRO that
+    `AstResolver._through_self` already resolves an inherited method with,
+    and is deliberately the same: the class a name is declared on is what a
+    reader looking the call up would find. It is not a C3 linearization, so
+    under multiple inheritance the branch reached first can differ from the
+    one Python picks -- but every candidate it can return is a real
+    `__init__` on a real base, and the alternative is the missing edge this
+    exists to fix.
+
+    Subclass overrides are deliberately NOT candidates, which is the one
+    place this differs from `_through_self`. `self.x()` may run a subclass's
+    override because `self` may be an instance of a subclass; `Cls()` names
+    the exact class being instantiated, so its `__init__` is looked up on
+    `Cls` and its bases and nowhere else.
+    """
+    for owner in breadth_first(class_id, bases):
+        path, _, qualname = owner.partition("::")
+        found = table.qualname_index.get((path, f"{qualname}.{CONSTRUCTOR}"))
+        if found:
+            return found
+    return None
+
+
+def with_constructors(
+    hits: list[tuple[str, str]],
+    table: _SymbolTable,
+    bases: dict[str, list[str]],
+    cache: dict[str, str | None],
+) -> list[tuple[str, str]]:
+    """`hits`, plus the `__init__` each class among them would run.
+
+    Applied AFTER `split_by_ambiguity_limit`, so a reference whose LOW tail
+    the cap declined to enumerate cannot be re-expanded through the back
+    door -- the constructor edges follow exactly the class edges that are
+    actually materialized.
+
+    A constructor edge carries the confidence of the class edge implying it.
+    It makes the same claim ("this call site may instantiate this class")
+    and `Cls()` running `Cls.__init__` adds no uncertainty of its own, so
+    weakening it would understate an edge that is certain given the class.
+    """
+    extra: list[tuple[str, str]] = []
+    seen = {node_id for node_id, _ in hits}
+    for node_id, confidence in hits:
+        if node_id not in table.class_node_ids:
+            continue
+        if node_id not in cache:
+            cache[node_id] = constructor_target(node_id, table, bases)
+        target = cache[node_id]
+        if target is not None and target not in seen:
+            seen.add(target)
+            extra.append((target, confidence))
+    return hits + extra if extra else hits
+
+
 def _load_bases(connection: sqlite3.Connection, rev: str) -> dict[str, list[str]]:
     """Rebuild the class hierarchy from already-materialized INHERITS edges.
 
@@ -633,6 +713,10 @@ def resolve_revision(
     # runs once per class for the whole revision rather than once per reference.
     descendant_cache: dict[str, list[str]] = {}
 
+    # `Cls()` -> `Cls.__init__` is the same lookup for every call site that
+    # names the same class, and on django that is tens of thousands of them.
+    constructor_cache: dict[str, str | None] = {}
+
     call_refs = _refs_by_path(store, rev, "call", scan_paths)
     for path in target_paths:
         ctx = table.context(rev, path, bases, subclasses, descendant_cache)
@@ -640,6 +724,7 @@ def resolve_revision(
             src = _source_id(ref, table, path)
             hits = resolver.resolve_call(ref, ctx)
             kept, ambiguous_count = split_by_ambiguity_limit(hits, limit)
+            kept = with_constructors(kept, table, bases, constructor_cache)
             for node_id, confidence in kept:
                 edge_rows.append(
                     (rev, src, node_id, "CALLS", confidence, PROVENANCE, path, ref.line)
