@@ -59,6 +59,12 @@ def test_impact_with_bad_rev_reports_cleanly(repo, capsys):
     assert err.strip() == "revision not found: nosuchrev"
 
 
+def test_islands_with_bad_rev_reports_cleanly(repo, capsys):
+    assert main(["islands", "--path", str(repo), "--rev", "nosuchrev"]) == 1
+    err = capsys.readouterr().err
+    assert err.strip() == "revision not found: nosuchrev"
+
+
 def test_install_hooks_outside_git_repo_reports_cleanly(tmp_path, capsys):
     assert main(["install-hooks", "--path", str(tmp_path)]) == 1
     err = capsys.readouterr().err

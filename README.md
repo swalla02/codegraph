@@ -110,16 +110,40 @@ slower on a cold cache.
 | `codegraph resolve <name>` | Fuzzy-match a name (trailing name, qualname, or full node id) to node ids. |
 | `codegraph effects <symbol> [--json]` | Report every side-effect kind reachable from a symbol, each with a witness chain down to the causing `file:line`. |
 | `codegraph impact <symbol> [--hops N] [--limit N] [--all] [--json]` | Report the ranked dependents of a symbol — everything a change to it could break. |
+| `codegraph islands [--rev REV] [--limit N] [--json]` | Report the connected components of the revision's `CALLS` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them. Structure only — an island of one is *not* a dead-code finding (see below). |
 | `codegraph diff [<base>..<head>] [--json]` | Report what changed between two revisions by content hash, never by line number: symbols added/removed/changed, plus any side effect newly reachable. Defaults to `merge-base(default branch, HEAD)..WORKTREE` — "what has this branch changed so far." |
 | `codegraph gc [--keep REV]` | Prune the Layer 1 parse cache down to what `HEAD`, the worktree, and any `--keep`-named revisions still reference. Never touches the graph itself, so it can only make a future answer slower to rebuild, never wrong. |
 | `codegraph init` | Make this repository's coding agents aware of codegraph: an `AGENTS.md` section, the `@AGENTS.md` bridge into an existing `CLAUDE.md`, and a commented `codegraph.toml` stub. Idempotent; never overwrites content it did not write; never touches `.git/`. |
 | `codegraph guide` | Print the agent-facing workflow to stdout — the same text the plugin ships as `SKILL.md`, so the short `AGENTS.md` section can defer to it rather than inline it. |
 | `codegraph install-hooks` | Install `post-commit`/`post-checkout`/`post-merge` git hooks that warm the cache in the background. Purely an optimization — every query reconciles the working tree itself regardless (see below), so results are identical whether or not a hook ever fires. |
 
+### What an island is, and is not
+
+`codegraph islands` treats call edges as undirected and splits the graph
+into connected components. That the call graph is *not* connected is real
+structure, not a defect: a service boundary, a config-gated region, and
+code nothing references all show up as separate islands. On psf/requests
+it reports 807 symbols in 172 islands, the biggest holding 628 of them and
+167 being islands of exactly one.
+
+It deliberately stops there. **An island is not a reachability result, and
+a one-symbol island is not dead code.** Membership comes from the call
+edges the resolver recorded, and a great deal of Python is invoked by
+mechanisms that leave no call site in the source: dunders (`__delitem__`
+runs on every `del d[k]`), decorators, framework dispatch, ABC overrides,
+packaging entry points. `AuthBase.__call__`, `BaseAdapter.__init__` and
+`CaseInsensitiveDict.__delitem__` are each an island of one on requests,
+and not one of them is unused. Read a row as "this region shares no call
+edge with that one" and nothing more; classifying *why* an island exists
+is future work, and it needs edges this graph does not record yet.
+
 `resolve`, `impact`, and `effects` share one exit-code convention for
 resolving `<symbol>` to a node id: `0` = a single unambiguous match, `1` =
 nothing matched, `2` = more than one match (every candidate is printed; pick
 the right one and re-run with the full node id).
+
+`islands` takes no symbol, so that convention does not apply to it: it
+exits `0` for a report and `1` only for a revision it cannot resolve.
 
 All commands accept `--path <dir>` to run against a different repository
 root (default: the current directory).
