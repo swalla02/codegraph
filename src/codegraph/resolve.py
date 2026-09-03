@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from codegraph.config import Config
-from codegraph.parse import ParsedRef
+from codegraph.parse import SUPER, ParsedRef
 from codegraph.store import Store
 
 HIGH, MEDIUM, LOW = "HIGH", "MEDIUM", "LOW"
@@ -179,7 +179,13 @@ class AstResolver:
     """
 
     def resolve_call(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
-        for step in (self._imported, self._module_local, self._through_self, self._by_last_segment):
+        for step in (
+            self._imported,
+            self._module_local,
+            self._through_super,
+            self._through_self,
+            self._by_last_segment,
+        ):
             hits = step(ref, ctx)
             if hits:
                 return hits
@@ -214,6 +220,38 @@ class AstResolver:
             return []
         node_id = ctx.qualname_index.get((ctx.path, ref.raw_name))
         return [(node_id, HIGH)] if node_id else []
+
+    # -- step 2b: super().X through the enclosing class's bases -------------
+    def _through_super(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
+        """`super().X()` -- the enclosing class's inherited `X`, at HIGH.
+
+        This is one of the most certain calls Python has: the starting class is
+        the one the call is written in, and the lookup skips it. It was LOW
+        because `parse.py` used to flatten `super()` to the unknown-receiver
+        marker, so it fell to the repo-wide name match -- 26 candidates per site
+        on psf/requests, all LOW, exactly one right.
+
+        Unlike `_through_self`, subclass overrides are NOT candidates.
+        `super()` walks strictly upwards; a subclass override is what it exists
+        to bypass.
+
+        The base walk is the same breadth-first approximation of the MRO used
+        everywhere else in this module, and starts at the bases rather than the
+        class itself -- `super().__init__()` inside `Child.__init__` must not
+        resolve to `Child.__init__`.
+        """
+        head, _, attribute = ref.raw_name.partition(".")
+        if head != SUPER or not attribute or "." in attribute:
+            return []
+        owner = ctx.qualname_index.get((ctx.path, ref.from_qualname))
+        start = ctx.enclosing_class.get(owner) if owner else None
+        if start is None:
+            return []
+        for class_id in breadth_first(start, ctx.bases)[1:]:
+            found = self._method_on(class_id, attribute, ctx)
+            if found:
+                return [(found, HIGH)]
+        return []
 
     # -- step 3: self.X through the class, its bases, and its overrides ----
     def _through_self(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
