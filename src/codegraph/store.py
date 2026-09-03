@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 WORKTREE = "WORKTREE"
 
@@ -89,6 +89,14 @@ CREATE TABLE IF NOT EXISTS nodes (
     line_end INTEGER NOT NULL,
     body_hash TEXT NOT NULL,
     name_binding TEXT NOT NULL,
+    -- Comma-joined decorator names, copied through from `blob_nodes`. A
+    -- decorator runs at definition time and can register, wrap or replace
+    -- the thing it decorates, which is one of the ways a symbol is invoked
+    -- with no call site naming it anywhere (#27); `query/islands.py` reads
+    -- this to say so. Layer 2 carries it rather than joining back to Layer
+    -- 1 because a node id encodes `shadow_index` and `blob_nodes` does not,
+    -- so the join key would have to reconstruct the id format by hand.
+    decorators TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (rev, id)
 );
 CREATE TABLE IF NOT EXISTS edges (
