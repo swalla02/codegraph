@@ -94,7 +94,29 @@ def prepare(target: Target, work: Path, source_root: Path | None) -> Path:
         shutil.copytree(source, repo, symlinks=True)
     else:
         _run(["git", "clone", "-q", "--depth", "50", target.url, str(repo)])
+    _warn_if_dirty(repo)
     return repo
+
+
+def _warn_if_dirty(repo: Path) -> None:
+    """Say so, loudly, when the tree about to be measured is not its HEAD.
+
+    The trace executes the files on disk and `index` reads the same worktree,
+    so the two always agree -- but a number quoted from a tree with somebody's
+    leftover edit in it is not reproducible, and this went unnoticed once
+    (a stray `_codegraph_probe` in a flask clone from earlier feasibility
+    work). Not fatal: `--source-root` may legitimately point at a repository
+    with work in progress.
+    """
+    dirty = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    if dirty:
+        print(f"WARNING: {repo} is not clean; the score describes THIS tree, not HEAD:")
+        print(dirty)
 
 
 def make_venv(target: Target, repo: Path, work: Path) -> Path:

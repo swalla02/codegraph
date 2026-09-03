@@ -283,8 +283,8 @@ implements. It is a regression guard wearing a benchmark's clothes.
 `bench/` is the real measurement (#35). It runs a target repository's **own
 test suite** under `sys.monitoring`, records every `(caller, callee)` pair that
 actually executed, and scores the static graph against it. A call the tests
-made is a call that exists, so a traced edge codegraph does not have is a real
-gap — no labelling judgement involved.
+made is a call that exists, so a traced edge missing from the static graph is a
+real gap — no labelling judgement involved.
 
 ```sh
 uv run python -m bench.run requests          # clones, or --source-root DIR to copy a clone
@@ -348,7 +348,7 @@ own tests. Unconditional precision is therefore not measurable this way, and
 the benchmark does not print a number for it. What is defensible: among static
 HIGH edges whose **two endpoints both executed at least once**, how many did
 the trace observe? 0.99 on requests, 0.86 on flask. That says the HIGH edges
-that could have been checked were taken; it does not say codegraph invents no
+that could have been checked were taken; it does not say the resolver invents no
 edges.
 
 ### The one filter that decides whether the number is honest
