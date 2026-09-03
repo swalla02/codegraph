@@ -4,8 +4,9 @@ import subprocess
 
 import pytest
 
-from codegraph.config import DEFAULT_AMBIGUITY_LIMIT
+from codegraph.ambiguity import Ambiguity
 from codegraph.indexer import GitTreeSource, Indexer
+from codegraph.query.impact import impact_report
 from codegraph.store import WORKTREE, Store
 from tests.conftest import git
 
@@ -296,11 +297,17 @@ def test_graph_size_grows_with_the_repo_not_with_its_square(repo, write, tmp_pat
     growth = large / small
     # 4x the files. Linear growth is 4x; quadratic is 16x. The bound is loose on
     # purpose -- it is a growth-RATE guard, not a size target, and must not be
-    # tightened into a benchmark.
+    # tightened into a benchmark. (Since #25 the quadratic term is not stored at
+    # all rather than capped, so the real ratio is 4.0; the guard stays where it
+    # was so that regressing to EITHER the cap or the cross product trips it.)
     assert growth < 6.0, f"{small} -> {large} edges for 4x the files ({growth:.1f}x growth)"
 
 
-def test_no_single_reference_is_expanded_past_the_ambiguity_limit(repo, write):
+def test_no_reference_is_expanded_into_the_bare_name_cross_product(repo, write):
+    """#6 capped this at 25 edges per call site. #25 removed the cap and the
+    reason for it together: the fan-out is `name_index[name]`, so storing any
+    of it stores nothing new. 60 same-named definitions, 60 call sites, and
+    the quadratic term is not in the table at any size."""
     duck_typed_repo(repo, write, 60)
     store = Store.open(repo)
     Indexer(repo, store, GitTreeSource(repo)).reconcile("HEAD")
@@ -310,7 +317,42 @@ def test_no_single_reference_is_expanded_past_the_ambiguity_limit(repo, write):
     ).fetchall()
     assert rows, "no edges at all — the fixture stopped exercising anything"
     worst = max(row["n"] for row in rows)
-    assert worst <= DEFAULT_AMBIGUITY_LIMIT, f"a single call site produced {worst} edges"
+    assert worst == 1, f"a single call site produced {worst} edges"
+    low = store.connection.execute(
+        "SELECT COUNT(*) AS n FROM edges WHERE rev='HEAD' AND confidence='LOW'"
+    ).fetchone()["n"]
+    assert low == 0, f"{low} bare-name fan-out edges were materialized"
+    store.close()
+
+
+def test_a_call_site_past_any_cap_still_reaches_impact(repo, write):
+    """The property #25 exists for, end to end. 60 candidates is well past the
+    cap that used to exist, so before this the call site contributed NOTHING to
+    `impact` -- and the graph still must not store it."""
+    duck_typed_repo(repo, write, 60)
+    store = Store.open(repo)
+    Indexer(repo, store, GitTreeSource(repo)).reconcile("HEAD")
+
+    report = impact_report(store, "HEAD", "m0.py::C0.save", limit=100, include_low=True)
+    callers = {row.id for group in report.groups for row in group.rows}
+    assert {f"m{i}.py::persist{i}" for i in range(60)} <= callers
+
+    stored = store.connection.execute(
+        "SELECT COUNT(*) AS n FROM edges WHERE rev='HEAD' AND dst='m0.py::C0.save'"
+    ).fetchone()["n"]
+    assert stored == 0, "the answer came from the edge table, not from the expansion"
+    store.close()
+
+
+def test_the_default_report_names_the_strongest_of_them_rather_than_counting(repo, write):
+    """`low_confidence_hidden: 60` is not an answer. The reader gets rows."""
+    duck_typed_repo(repo, write, 60)
+    store = Store.open(repo)
+    Indexer(repo, store, GitTreeSource(repo)).reconcile("HEAD")
+    report = impact_report(store, "HEAD", "m0.py::C0.save")
+    named = {row.id for g in report.groups if g.title == "low_confidence" for row in g.rows}
+    assert named, "the report went back to a bare count"
+    assert all(name.endswith("persist" + name.split("::")[0][1:-3]) for name in named)
     store.close()
 
 
@@ -522,12 +564,23 @@ def test_a_definition_added_elsewhere_updates_another_files_edges(repo, write):
     indexer.reconcile(WORKTREE)
 
     def targets():
-        return {
+        """Everything `caller`'s one call could mean -- materialized edges
+        AND the bare-name fan-out the graph deliberately does not store
+        (#25), which is where the answer moves to the moment a second
+        `save` exists and the name stops being unique."""
+        materialized = {
             row["dst"]
             for row in store.connection.execute(
                 "SELECT dst FROM edges WHERE rev=? AND src='caller.py::caller'", (WORKTREE,)
             )
         }
+        ambiguity = Ambiguity(store, WORKTREE)
+        derived = {
+            node_id
+            for node_id in ambiguity.candidates("item.save")
+            if "caller.py::caller" in ambiguity.callers(node_id)
+        }
+        return materialized | derived
 
     assert targets() == {"one.py::One.save"}
 

@@ -195,26 +195,28 @@ a root). `[[effect]]` entries merge over the built-in catalog by pattern;
 the nine effect kinds (`DB_WRITE`, `DB_READ`, `NETWORK`, `PROCESS`,
 `FS_WRITE`, `FS_READ`, `ENV_READ`, `GLOBAL_MUTATE`, `NONDETERMINISM`).
 
-`ambiguity_limit` (default `25`, `0` to disable) bounds the last-resort
-resolution step. When a call like `item.save()` names nothing importable,
-nothing module-local, and nothing reachable through `self`, the resolver
-falls back to matching `save` against every definition in the repository.
-On a small codebase that is a handful of candidates and a useful
-over-approximation. On django it was 971 for a single call site, and 96.6%
-of the whole graph was that kind of guess — the edge table grew with the
-*square* of the repository. Past this many equally-weak candidates the call
-is recorded once as ambiguous, with the name and the count, instead of as N
-edges. Nothing is discarded to improve precision: the N edges and the one
-record make the same claim, and a `HIGH` or `MEDIUM` hit — one the resolver
-actually distinguished — is never collapsed. Raise it if you want the full
-cross product back.
+There is no setting for the bare-name fan-out, and that is deliberate.
+When a call like `item.save()` names nothing importable, nothing
+module-local, and nothing reachable through `self`, the resolver falls back
+to matching `save` against every definition in the repository — a handful
+on a small codebase, 971 for a single call site on django. None of that is
+stored. The candidate set *is* "every live definition named `save`", which
+the graph already holds, so the call is recorded once and the set is
+recomputed whenever a query asks for it. Materializing it stored nothing new
+at a cost that grew with the *square* of the repository: 2.09M of django's
+2.16M edges were that one kind of guess.
 
-```toml
-ambiguity_limit = 25
-```
+Which also settles where the bound belongs. Whether 971 candidates is too
+many is a property of the question, not of the graph: `impact` wants them
+ranked and cut off at `--limit`, `effects` wants pure reachability through
+them, `diff` wants none of them. So it is `--limit`, per query, and no
+future question is bound by a number you picked once at index time.
 
-It lives at the repository root, not inside `.codegraph/`, because it is
-hand-written configuration meant to be committed and shared, whereas
+`ambiguity_limit` used to be that number. It is still read, warns when set,
+and no longer affects anything; remove it. See issue #25.
+
+`codegraph.toml` lives at the repository root, not inside `.codegraph/`,
+because it is hand-written configuration meant to be committed and shared, whereas
 `.codegraph/` self-ignores and holds only derived cache: config is tracked,
 everything derived is disposable.
 

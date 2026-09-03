@@ -280,7 +280,9 @@ class Indexer:
                 return None
         return set(dirty)
 
-    def _propagation_inputs(self, rev: str, paths: set[str]) -> tuple[frozenset, frozenset]:
+    def _propagation_inputs(
+        self, rev: str, paths: set[str]
+    ) -> tuple[frozenset, frozenset, frozenset]:
         """What `propagate` would see differently if these paths changed.
 
         Deliberately projected: `evidence_line` is excluded because propagation
@@ -288,7 +290,7 @@ class Indexer:
         change in what that call means.
         """
         if not paths:
-            return frozenset(), frozenset()
+            return frozenset(), frozenset(), frozenset()
         connection = self.store.connection
         marks = ",".join("?" * len(paths))
         args = (rev, *sorted(paths))
@@ -300,6 +302,19 @@ class Indexer:
                 args,
             )
         )
+        # The ambiguous references are half of propagation's LOW subgraph
+        # and are NOT in `edges` (#25). Leaving them out here would let a
+        # narrowed reconcile that changed only which names a file calls
+        # ambiguously decide propagation had nothing to do, and keep serving
+        # effects derived from the previous revision's fan-out.
+        ambiguous = frozenset(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT src, raw_name, ref_kind FROM unresolved"
+                f" WHERE rev=? AND reason='ambiguous' AND path IN ({marks})",
+                args,
+            )
+        )
         direct = frozenset(
             tuple(row)
             for row in connection.execute(
@@ -308,7 +323,7 @@ class Indexer:
                 args,
             )
         )
-        return edges, direct
+        return edges, ambiguous, direct
 
     def _symbol_signature(self, blob_sha: str) -> frozenset[tuple]:
         """What a blob DECLARES, ignoring what any of it does.
@@ -355,11 +370,13 @@ class Indexer:
         `Catalog.fingerprint` was written for exactly this and had no caller
         until now.
         """
+        # `ambiguity_limit` used to be pinned here and no longer is: since
+        # #25 it changes nothing about the graph, so making it invalidate a
+        # materialized revision would be a rebuild bought with nothing.
         parts = (
             PARSER_VERSION,
             catalog.fingerprint(),
             ",".join(self.config.source_roots),
-            str(self.config.ambiguity_limit),
         )
         return hashlib.blake2b("\x00".join(parts).encode(), digest_size=16).hexdigest()
 

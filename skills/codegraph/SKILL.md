@@ -124,14 +124,26 @@ the full set and how confident it is in each edge.
   `effects_reachable` is a **list of effect-kind strings**, not a count —
   in `--json` output it is a real JSON array; in text it is rendered as a
   comma-separated list (`DB_WRITE, PROCESS`), or `none` when the symbol
-  reaches nothing, never Python's list repr. `low_confidence_hidden`
-  counts `LOW`-confidence dependents that are held back from the
-  `dependents` and `tests` groups by default — the resolver's least
-  certain guesses are real information, but they should not read as
-  confirmed impact. Pass `--all` to include them in the listed rows.
+  reaches nothing, never Python's list repr.
+- `LOW`-confidence dependents never enter `dependents` or `tests` — the
+  resolver's least certain guesses are real information, but they should
+  not read as confirmed impact, and they are left out of `symbols`,
+  `modules` and `entry_points` for the same reason. They are not reduced
+  to a number either: the strongest few are listed in their own
+  `low_confidence` group, and `low_confidence_hidden` counts only the ones
+  that did not fit. Pass `--all` to merge the whole set into the main
+  groups instead.
+- Many of those `LOW` rows are not in the stored graph at all. A call like
+  `item.save()` that names nothing importable, nothing module-local and
+  nothing reachable through `self` matches every definition named `save`
+  in the repository — up to 971 of them on django — and codegraph records
+  the call once rather than storing that cross product, expanding it when
+  a query asks. So `impact` can name callers that no edge in the database
+  names, and `--limit` is the only bound on how many.
 - `impact --limit N` caps the *total* rows kept across `dependents` and
   `tests` combined at `N` (default 40) — not `N` each — so the printed
-  report never exceeds its documented budget.
+  report never exceeds its documented budget. The `low_confidence` sample
+  is budgeted separately and never eats into it.
 - `diff`'s summary reads `new_effects: <kind list or none> ·
   added: N · removed: N · changed: N · base: <sha> · head: <rev>`.
   `new_effects` covers every symbol newly reachable at `head`, whether it

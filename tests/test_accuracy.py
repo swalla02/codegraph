@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from codegraph.ambiguity import Ambiguity
 from codegraph.indexer import GitTreeSource, Indexer
 from codegraph.store import Store
 
@@ -22,7 +23,23 @@ LABELS = Path(__file__).parent / "fixtures" / "labelled_calls.json"
 
 
 def measure_accuracy(store, rev, labels):
-    """labels: [{"src": node_id, "expected": [node_id, ...]}]"""
+    """labels: [{"src": node_id, "expected": [node_id, ...]}]
+
+    Measures the resolver's ANSWER, which since #25 is not all in `edges`.
+
+    A reference whose candidates are an all-LOW fan-out is deliberately not
+    materialized -- it is recorded once in `unresolved` and expanded at query
+    time, which is what `impact` and `effects` actually read. Scoring `edges`
+    alone would have graded the storage layer rather than the resolver, and it
+    showed: recall read 0.86 while the two `item.save()` targets it was
+    supposedly missing were both being returned by every real query.
+
+    No label was touched to fix that number. The union below is the same one
+    `query/impact.py` performs, so this harness and the commands it stands in
+    for read the same graph -- which is the property that keeps the score
+    meaningful at all.
+    """
+    ambiguity = Ambiguity(store, rev)
     true_positive = predicted = actual = 0
     for label in labels:
         got = {
@@ -32,6 +49,12 @@ def measure_accuracy(store, rev, labels):
                 (rev, label["src"]),
             )
         }
+        for row in store.connection.execute(
+            "SELECT raw_name FROM unresolved WHERE rev=? AND src=? AND reason='ambiguous'"
+            " AND ref_kind='call'",
+            (rev, label["src"]),
+        ):
+            got.update(ambiguity.candidates(row["raw_name"]))
         expected = set(label["expected"])
         true_positive += len(got & expected)
         predicted += len(got)

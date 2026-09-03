@@ -496,32 +496,27 @@ def _source_id(ref: ParsedRef, table: _SymbolTable, path: str) -> str:
     return table.qualname_index.get((path, ref.from_qualname), candidates[-1][0])
 
 
-def split_by_ambiguity_limit(
-    hits: list[tuple[str, str]], limit: int
-) -> tuple[list[tuple[str, str]], int]:
-    """Split a resolver's candidates into the ones to materialize and the count
-    of low-confidence ones being collapsed instead.
+def is_derivable_fanout(hits: list[tuple[str, str]]) -> bool:
+    """Is this candidate set the bare-name fan-out, recomputable from the
+    name index alone?
 
-    The over-approximation bias says a candidate is never dropped to improve
-    precision, and this does not drop one: when a bare name matches hundreds of
-    definitions, the N edges and the single "ambiguous, N candidates" record
-    make exactly the same claim. Enumerating it is what is being declined, not
-    asserting it -- and enumerating it is quadratic in repo size while saying
-    nothing a reader could act on.
+    True exactly when every candidate is LOW, which happens exactly when the
+    last-resort step (`_by_last_segment`) matched a bare name against more
+    than one live definition. Every other step returns HIGH or MEDIUM: an
+    imported name, a module-local name, a `self.X` hit and its overrides, and
+    a last-segment match with a single answer all name something the resolver
+    actually distinguished, and all get an edge.
 
-    Only LOW candidates are ever collapsed. A HIGH or MEDIUM hit means the
-    resolver actually distinguished something, and is always materialized --
-    including alongside a collapsed LOW set, so a call site with one confident
-    answer and a long ambiguous tail keeps the answer.
-
-    `limit <= 0` disables the cap entirely.
+    A LOW set does not. It is `name_index[name]` verbatim -- a set the `nodes`
+    table already determines -- so materializing it stores nothing the graph
+    did not already contain, at a cost quadratic in repository size (2.09M of
+    django's 2.16M edges, 96.6%, before #6). It is recorded once in
+    `unresolved` with `reason='ambiguous'` instead, and `ambiguity.py`
+    reconstructs it on demand. Nothing is dropped and nothing is capped: the
+    bound on how many of them a *reader* sees is `--limit`, a property of the
+    question, not of the graph. See #25.
     """
-    if limit <= 0 or len(hits) <= limit:
-        return hits, 0
-    weak = [hit for hit in hits if hit[1] == LOW]
-    if len(weak) <= limit:
-        return hits, 0
-    return [hit for hit in hits if hit[1] != LOW], len(weak)
+    return bool(hits) and all(confidence == LOW for _, confidence in hits)
 
 
 #: The method a call to a class actually runs. `Cls()` resolves to the class
@@ -570,10 +565,12 @@ def with_constructors(
 ) -> list[tuple[str, str]]:
     """`hits`, plus the `__init__` each class among them would run.
 
-    Applied AFTER `split_by_ambiguity_limit`, so a reference whose LOW tail
-    the cap declined to enumerate cannot be re-expanded through the back
-    door -- the constructor edges follow exactly the class edges that are
-    actually materialized.
+    Applied only to hits that are actually materialized, so a reference whose
+    LOW fan-out was deferred to query time (see `is_derivable_fanout`) cannot
+    be re-expanded through the back door -- the constructor edges follow
+    exactly the class edges the graph really holds. In practice an all-LOW
+    fan-out has no class to construct anyway: `Cls()` resolves through an
+    import or a module-local name, never through the bare-name fallback.
 
     A constructor edge carries the confidence of the class edge implying it.
     It makes the same claim ("this call site may instantiate this class")
@@ -630,13 +627,13 @@ def resolve_revision(
     trusts it. Passing `None` rewrites the whole revision, which cannot leave a
     stale edge behind under any circumstances.
 
-    `config.ambiguity_limit` bounds how many indistinguishable LOW candidates a
-    single reference will be expanded into; past it the reference is recorded
-    once in `unresolved` as ambiguous. See `split_by_ambiguity_limit`.
+    The bare-name fan-out is never written to `edges`: a reference whose only
+    candidates are LOW is recorded once in `unresolved` as ambiguous, carrying
+    the source node, the name, and the count, and is expanded at query time
+    instead. See `is_derivable_fanout` and `ambiguity.py`.
     """
     resolver = resolver or AstResolver()
     connection = store.connection
-    limit = config.ambiguity_limit
     table = _SymbolTable(store, rev, config)
 
     if only_paths is None:
@@ -683,12 +680,15 @@ def resolve_revision(
             src = _source_id(ref, table, path)
             # A base named by a bare, repo-wide-ambiguous name fans out exactly
             # like a call does, and on a large repo it is the larger half of the
-            # blowup. Capping it cannot affect the MRO: only HIGH links feed
-            # `bases`, and the cap only ever collapses LOW ones.
-            kept, ambiguous_count = split_by_ambiguity_limit(
-                resolver.resolve_call(ref, ctx), limit
-            )
-            for node_id, confidence in kept:
+            # blowup. Deferring it cannot affect the MRO: only HIGH links feed
+            # `bases`, and only an all-LOW set is deferred.
+            hits = resolver.resolve_call(ref, ctx)
+            if is_derivable_fanout(hits):
+                ambiguous_rows.append(
+                    (rev, src, path, ref.line, ref.raw_name, "base", "ambiguous", len(hits))
+                )
+                continue
+            for node_id, confidence in hits:
                 edge_rows.append(
                     (rev, src, node_id, "INHERITS", confidence, PROVENANCE, path, ref.line)
                 )
@@ -697,10 +697,6 @@ def resolve_revision(
                 # the walk falls through to the repo-wide name match anyway.
                 if confidence == HIGH and only_paths is None:
                     bases.setdefault(src, []).append(node_id)
-            if ambiguous_count:
-                ambiguous_rows.append(
-                    (rev, path, ref.line, ref.raw_name, "base", "ambiguous", ambiguous_count)
-                )
 
     # The hierarchy is complete now, so it can be inverted once: `self.X`
     # needs to see downwards (overrides in subclasses) as well as upwards.
@@ -723,27 +719,39 @@ def resolve_revision(
         for ref in call_refs.get(path, ()):
             src = _source_id(ref, table, path)
             hits = resolver.resolve_call(ref, ctx)
-            kept, ambiguous_count = split_by_ambiguity_limit(hits, limit)
-            kept = with_constructors(kept, table, bases, constructor_cache)
-            for node_id, confidence in kept:
+            if is_derivable_fanout(hits):
+                # Not an edge and not a gap: the answer, held in the one form
+                # that does not grow with the square of the repository. See
+                # `is_derivable_fanout`.
+                #
+                # No constructor edge is added here. `with_constructors` below
+                # only ever fires on a hit the resolver actually distinguished
+                # -- `Cls()` resolves through an import or a module-local name,
+                # never through the bare-name fallback -- so an all-LOW fan-out
+                # has no class in it to construct.
+                ambiguous_rows.append(
+                    (rev, src, path, ref.line, ref.raw_name, "call", "ambiguous", len(hits))
+                )
+                continue
+            for node_id, confidence in with_constructors(hits, table, bases, constructor_cache):
                 edge_rows.append(
                     (rev, src, node_id, "CALLS", confidence, PROVENANCE, path, ref.line)
                 )
-            if ambiguous_count:
-                ambiguous_rows.append(
-                    (rev, path, ref.line, ref.raw_name, "call", "ambiguous", ambiguous_count)
-                )
-            elif is_builtin_call(ref):
+            if is_builtin_call(ref):
                 # Recorded, but not as a gap. A builtin is a reference the
                 # resolver understood and deliberately did not link to a repo
                 # symbol -- counting it as "unresolved" buries the real gaps
                 # under a large constant. Still written, so the choice is
                 # visible rather than silent.
-                builtin_rows.append((rev, path, ref.line, ref.raw_name, "call", "builtin", 0))
+                builtin_rows.append(
+                    (rev, src, path, ref.line, ref.raw_name, "call", "builtin", 0)
+                )
             elif not hits:
                 # Never dropped: the ref stays in `blob_refs` for effect
                 # detection, and the gap is counted as a health signal.
-                unresolved_rows.append((rev, path, ref.line, ref.raw_name, "call", "unknown", 0))
+                unresolved_rows.append(
+                    (rev, src, path, ref.line, ref.raw_name, "call", "unknown", 0)
+                )
 
     connection.executemany(
         "INSERT INTO edges(rev, src, dst, kind, confidence, provenance, callsite_path,"
@@ -751,8 +759,8 @@ def resolve_revision(
         edge_rows,
     )
     connection.executemany(
-        "INSERT INTO unresolved(rev, path, line, raw_name, ref_kind, reason, candidates)"
-        " VALUES(?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO unresolved(rev, src, path, line, raw_name, ref_kind, reason,"
+        " candidates) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
         unresolved_rows + ambiguous_rows + builtin_rows,
     )
     # Counted over the whole revision, not over this pass: a narrowed rewrite

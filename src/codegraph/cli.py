@@ -34,7 +34,10 @@ def _print_stats(stats) -> None:
     print(f"blobs: {stats.blobs_parsed} parsed, {stats.blobs_cached} cached")
     print(f"edges: {stats.edges}, unresolved: {stats.unresolved}")
     if stats.ambiguous:
-        print(f"ambiguous: {stats.ambiguous} reference(s) matched too many names to enumerate")
+        print(
+            f"ambiguous: {stats.ambiguous} bare-name reference(s), expanded at query time"
+            " (see `impact --all`)"
+        )
     if stats.parse_errors:
         print(f"parse errors: {stats.parse_errors}")
     if stats.shadowed:
@@ -367,13 +370,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--hops", type=int, default=3, help="Maximum hops to walk (default: 3)"
     )
     impact_parser.add_argument(
-        "--all", action="store_true", help="Include LOW-confidence dependents"
+        "--all",
+        action="store_true",
+        help="Merge LOW-confidence dependents into the main groups instead of sampling them",
     )
     impact_parser.add_argument(
         "--limit",
         type=int,
         default=40,
-        help="Maximum rows to keep, total across dependents and tests (default: 40)",
+        help=(
+            "Maximum rows to keep, total across dependents and tests (default: 40)."
+            " This is the bound on the bare-name fan-out too -- it is a property of"
+            " the question, not of the graph"
+        ),
     )
     impact_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     impact_parser.set_defaults(handler=_cmd_impact)

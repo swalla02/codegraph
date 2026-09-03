@@ -594,3 +594,61 @@ def test_a_project_override_still_matches_first_party_code(repo, write):
     store = build(repo)
     assert "DB_WRITE" in effect_kinds_at(store, "app/service.py::persist")
     store.close()
+
+
+# -- effects still flow through the fan-out the graph does not store --------
+#
+# Since #25 a bare-name call matching more than one definition writes no edge
+# at all. Propagation reconstructs that subgraph through one synthetic hub per
+# name (`ambiguity.hub_edges`), which is reachability-equivalent to the N x M
+# direct edges and linear rather than quadratic. Two things have to hold: the
+# effect still arrives, and the witness the user is shown is a chain of real
+# symbols they can open -- never the hub, which is not a symbol anyone wrote.
+
+
+def test_an_effect_reachable_only_through_an_ambiguous_call_still_arrives(repo, write):
+    write(
+        "one.py",
+        "import requests\n\n\nclass One:\n    def shared(self):\n        requests.get('u')\n",
+        commit="one",
+    )
+    write("two.py", "class Two:\n    def shared(self):\n        pass\n", commit="two")
+    write("caller.py", "def query(thing):\n    thing.shared()\n", commit="caller")
+    store = build(repo)
+
+    stored = store.connection.execute(
+        "SELECT COUNT(*) AS n FROM edges WHERE rev='HEAD' AND src='caller.py::query'"
+    ).fetchone()["n"]
+    assert stored == 0, "the fixture stopped exercising the unmaterialized path"
+    assert "NETWORK" in kinds(effects_report(store, "HEAD", "caller.py::query"))
+    store.close()
+
+
+def test_the_witness_through_an_ambiguous_call_names_only_real_symbols(repo, write):
+    write(
+        "one.py",
+        "import requests\n\n\nclass One:\n    def shared(self):\n        requests.get('u')\n",
+        commit="one",
+    )
+    write("two.py", "class Two:\n    def shared(self):\n        pass\n", commit="two")
+    write("caller.py", "def query(thing):\n    thing.shared()\n", commit="caller")
+    store = build(repo)
+    chain = witness_path(store, "HEAD", "caller.py::query", "NETWORK", "LOW")
+    assert chain == ["caller.py::query", "one.py::One.shared"]
+    store.close()
+
+
+def test_a_call_site_past_any_old_cap_still_carries_its_effect(repo, write):
+    """60 candidates is well past the cap #6 imposed, so before this the call
+    site propagated no effect at all -- the direction of the #25 change is a
+    gain in reachability, never a loss."""
+    for i in range(60):
+        write(f"m{i}.py", f"class C{i}:\n    def save(self):\n        return {i}\n")
+    write(
+        "m0.py",
+        "import requests\n\n\nclass C0:\n    def save(self):\n        requests.get('u')\n",
+    )
+    write("caller.py", "def persist(item):\n    return item.save()\n", commit="all")
+    store = build(repo)
+    assert "NETWORK" in kinds(effects_report(store, "HEAD", "caller.py::persist"))
+    store.close()

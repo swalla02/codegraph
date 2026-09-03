@@ -1,7 +1,11 @@
+from codegraph.ambiguity import Ambiguity
 from codegraph.cli import main
 from codegraph.indexer import GitTreeSource, Indexer
 from codegraph.query.impact import impact_report
-from codegraph.resolve import module_for_path, split_by_ambiguity_limit
+from codegraph.resolve import (
+    is_derivable_fanout,
+    module_for_path,
+)
 from codegraph.store import Store
 
 
@@ -100,14 +104,22 @@ def test_unique_method_name_is_medium_confidence(repo, write):
     store.close()
 
 
-def test_ambiguous_method_name_emits_low_edges_to_every_candidate(repo, write):
+def test_ambiguous_method_name_names_every_candidate_without_storing_one(repo, write):
+    """The over-approximation bias, relocated by #25: every candidate is still
+    reachable, none of them is an edge."""
     write("one.py", "class One:\n    def shared(self):\n        pass\n", commit="1")
     write("two.py", "class Two:\n    def shared(self):\n        pass\n", commit="2")
     write("caller.py", "def go(thing):\n    thing.shared()\n", commit="c")
     store, indexer = build(repo)
     indexer.reconcile("HEAD")
-    found = {(dst, conf) for src, dst, conf in edges(store) if src == "caller.py::go"}
-    assert found == {("one.py::One.shared", "LOW"), ("two.py::Two.shared", "LOW")}
+    assert not [dst for src, dst, _ in edges(store) if src == "caller.py::go"]
+    ambiguity = Ambiguity(store, "HEAD")
+    assert set(ambiguity.candidates("thing.shared")) == {
+        "one.py::One.shared",
+        "two.py::Two.shared",
+    }
+    assert ambiguity.callers("one.py::One.shared") == ["caller.py::go"]
+    assert ambiguity.callers("two.py::Two.shared") == ["caller.py::go"]
     store.close()
 
 
@@ -311,19 +323,24 @@ def test_status_reports_the_unresolved_count(repo, write, capsys):
     assert "unresolved: 1" in capsys.readouterr().out
 
 
-# -- the ambiguity cap -------------------------------------------------
+# -- the bare-name fan-out is derived, not stored ---------------------------
 #
 # The last-resort step matches a call's final dotted segment against every live
 # definition in the revision. Measured on django (2,930 files) that produced 971
 # candidates for a single call site and 2.09M LOW edges -- 96.6% of the graph --
-# because the candidate list grows with the repo. See issue #6.
+# because the candidate list grows with the repo (#6). #6 capped that at write
+# time; #25 established that the cap was in the wrong place, because the
+# candidate set is `name_index[name]` and the `nodes` table already determines
+# it. Nothing about it is stored now, at any size, and `ambiguity.py` recovers
+# it exactly. These tests pin both halves: the graph does not hold it, and a
+# query gets all of it back.
 
 
 def unresolved_rows(store, rev="HEAD"):
     return [
         dict(row)
         for row in store.connection.execute(
-            "SELECT path, line, raw_name, ref_kind, reason, candidates FROM unresolved"
+            "SELECT src, path, line, raw_name, ref_kind, reason, candidates FROM unresolved"
             " WHERE rev=? ORDER BY path, line",
             (rev,),
         )
@@ -339,33 +356,77 @@ def many_savers(count):
     return f"{classes}\n\n\ndef persist(item):\n    return item.save()\n"
 
 
-def test_ambiguity_under_the_limit_is_still_fully_enumerated(repo, write):
-    write("m.py", many_savers(3), commit="m")
-    write("codegraph.toml", "ambiguity_limit = 25\n", commit="cfg")
+def test_a_two_way_bare_name_call_is_not_materialized(repo, write):
+    """Two candidates is as ambiguous as 971 for storage purposes: the set is
+    `name_index['save']` either way, and the graph does not hold either."""
+    write("m.py", many_savers(2), commit="m")
     store, indexer = build(repo)
     stats = indexer.reconcile("HEAD")
-    assert stats.ambiguous == 0
-    assert {dst for src, dst, _ in edges(store) if src == "m.py::persist"} == {
-        f"m.py::C{i}.save" for i in range(3)
-    }
+    assert not [dst for src, dst, _ in edges(store) if src == "m.py::persist"]
+    assert stats.ambiguous == 1
     store.close()
 
 
-def test_ambiguity_over_the_limit_is_recorded_once_instead_of_enumerated(repo, write):
+def test_the_ambiguous_row_carries_everything_the_expansion_needs(repo, write):
     write("m.py", many_savers(6), commit="m")
-    write("codegraph.toml", "ambiguity_limit = 4\n", commit="cfg")
     store, indexer = build(repo)
     stats = indexer.reconcile("HEAD")
 
-    # Not enumerated...
     assert not [dst for src, dst, _ in edges(store) if src == "m.py::persist"]
-    # ...but not dropped either: the claim survives, with its size.
     ambiguous = [row for row in unresolved_rows(store) if row["reason"] == "ambiguous"]
     assert len(ambiguous) == 1
     assert ambiguous[0]["raw_name"] == "item.save"
     assert ambiguous[0]["ref_kind"] == "call"
     assert ambiguous[0]["candidates"] == 6
+    # `src` is the one thing about the reference the name index cannot
+    # rederive, so it is the one thing the row has to carry.
+    assert ambiguous[0]["src"] == "m.py::persist"
     assert stats.ambiguous == 1
+    store.close()
+
+
+def test_the_expansion_returns_exactly_what_the_resolver_would_have(repo, write):
+    """The property #25 is about: the answer is still reachable, and the graph
+    still does not contain it. 60 candidates is well past any cap that ever
+    existed."""
+    write("m.py", many_savers(60), commit="m")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+
+    assert not [dst for src, dst, _ in edges(store) if src == "m.py::persist"]
+    ambiguity = Ambiguity(store, "HEAD")
+    assert set(ambiguity.candidates("item.save")) == {f"m.py::C{i}.save" for i in range(60)}
+    for i in range(60):
+        assert ambiguity.callers(f"m.py::C{i}.save") == ["m.py::persist"]
+    store.close()
+
+
+def test_a_shadowed_definition_is_not_a_candidate_of_the_expansion(repo, write):
+    """The expansion rebuilds the resolver's LIVE name index, not every node
+    that ever had the name -- a shadowed definition can still be an edge target
+    by another route but never wins a name lookup."""
+    write(
+        "m.py",
+        "class C:\n    def save(self):\n        return 1\n\n\n"
+        "class C:\n    def save(self):\n        return 2\n\n\n"
+        "class D:\n    def save(self):\n        return 3\n\n\n"
+        "def persist(item):\n    return item.save()\n",
+        commit="m",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    ambiguity = Ambiguity(store, "HEAD")
+    candidates = ambiguity.candidates("item.save")
+    assert set(candidates) == {"m.py::C.save", "m.py::D.save"}
+    shadowed = [
+        row["id"]
+        for row in store.connection.execute(
+            "SELECT id FROM nodes WHERE rev='HEAD' AND name_binding != 'live'"
+        )
+    ]
+    assert shadowed, "the fixture stopped producing a shadowed definition"
+    for node_id in shadowed:
+        assert ambiguity.callers(node_id) == []
     store.close()
 
 
@@ -373,7 +434,6 @@ def test_ambiguous_is_counted_separately_from_unknown(repo, write):
     """They are opposite failures -- blind vs. dazzled -- and collapsing them
     into one number makes the health signal unreadable."""
     write("m.py", many_savers(6) + "\n\ndef gone():\n    no_such_name_anywhere()\n", commit="m")
-    write("codegraph.toml", "ambiguity_limit = 4\n", commit="cfg")
     store, indexer = build(repo)
     stats = indexer.reconcile("HEAD")
     assert stats.ambiguous == 1
@@ -385,15 +445,14 @@ def test_ambiguous_is_counted_separately_from_unknown(repo, write):
 
 def test_a_crowded_name_does_not_weaken_a_call_that_resolves_confidently(repo, write):
     """`AstResolver` stops at the first step that matches, so a module-local
-    call never reaches the last-resort step at all -- the cap must not change
-    that just because the name is crowded elsewhere in the repo."""
+    call never reaches the last-resort step at all -- deferring the fan-out must
+    not change that just because the name is crowded elsewhere in the repo."""
     write("crowd.py", many_savers(6), commit="crowd")
     write(
         "m.py",
         "def save():\n    return 0\n\n\ndef caller():\n    return save()\n",
         commit="m",
     )
-    write("codegraph.toml", "ambiguity_limit = 2\n", commit="cfg")
     store, indexer = build(repo)
     indexer.reconcile("HEAD")
     # module-local, so HIGH -- it never reaches the last-resort step at all
@@ -401,10 +460,10 @@ def test_a_crowded_name_does_not_weaken_a_call_that_resolves_confidently(repo, w
     store.close()
 
 
-def test_ambiguous_base_class_is_capped_without_disturbing_the_mro(repo, write):
+def test_an_ambiguous_base_class_is_deferred_without_disturbing_the_mro(repo, write):
     """Bases fan out exactly like calls (on django they were the larger half of
-    the blowup), but only HIGH links feed the MRO walk and the cap only ever
-    collapses LOW ones -- so inheritance resolution is unchanged."""
+    the blowup), but only HIGH links feed the MRO walk and only an all-LOW set
+    is deferred -- so inheritance resolution is unchanged."""
     write("crowd.py", "\n\n".join(f"class Base{i}:\n    pass" for i in range(6)), commit="crowd")
     write("dup.py", "\n\n".join(f"class C{i}:\n    class Base:\n        pass" for i in range(6)),
           commit="dup")
@@ -413,7 +472,11 @@ def test_ambiguous_base_class_is_capped_without_disturbing_the_mro(repo, write):
         "from crowd import Base0\n\n\nclass Child(Base0):\n    pass\n",
         commit="child",
     )
-    write("codegraph.toml", "ambiguity_limit = 3\n", commit="cfg")
+    write(
+        "guess.py",
+        "\n\n".join(f"class Guess{i}(Base):\n    pass" for i in range(2)),
+        commit="guess",
+    )
     store, indexer = build(repo)
     indexer.reconcile("HEAD")
     inherits = {
@@ -422,45 +485,66 @@ def test_ambiguous_base_class_is_capped_without_disturbing_the_mro(repo, write):
             "SELECT src, dst, confidence FROM edges WHERE rev='HEAD' AND kind='INHERITS'"
         )
     }
-    # The import makes this one certain, so the cap cannot touch it.
+    # The import makes this one certain, so the fan-out rule cannot touch it.
     assert ("child.py::Child", "crowd.py::Base0", "HIGH") in inherits
+    # The bare `Base` matches six nested classes and is deferred instead.
+    assert not [dst for src, dst, _ in inherits if src.startswith("guess.py::")]
+    base_rows = [
+        row
+        for row in unresolved_rows(store)
+        if row["reason"] == "ambiguous" and row["ref_kind"] == "base"
+    ]
+    assert len(base_rows) == 2
+    ambiguity = Ambiguity(store, "HEAD")
+    assert ambiguity.inheritors("dup.py::C0.Base") == [
+        "guess.py::Guess0",
+        "guess.py::Guess1",
+    ]
+    # ...and a base reference is NOT a call: `impact` walks CALLS only.
+    assert ambiguity.callers("dup.py::C0.Base") == []
     store.close()
 
 
-def test_ambiguity_limit_zero_disables_the_cap(repo, write):
+def test_a_deprecated_ambiguity_limit_warns_rather_than_changing_the_graph(repo, write, capsys):
+    """The migration promise: an existing codegraph.toml keeps working, says so
+    once, and gets the same graph as one without the setting."""
     write("m.py", many_savers(6), commit="m")
-    write("codegraph.toml", "ambiguity_limit = 0\n", commit="cfg")
+    store, indexer = build(repo)
+    baseline = indexer.reconcile("HEAD").ambiguous
+    store.close()
+
+    write("codegraph.toml", "ambiguity_limit = 100\n", commit="cfg")
+    capsys.readouterr()
     store, indexer = build(repo)
     stats = indexer.reconcile("HEAD")
-    assert stats.ambiguous == 0
-    assert len([dst for src, dst, _ in edges(store) if src == "m.py::persist"]) == 6
+    assert "ambiguity_limit is deprecated" in capsys.readouterr().err
+    assert stats.ambiguous == baseline
+    assert not [dst for src, dst, _ in edges(store) if src == "m.py::persist"]
     store.close()
 
 
-def test_split_by_ambiguity_limit_keeps_strong_candidates_alongside_a_collapsed_tail():
+def test_no_ambiguity_limit_at_all_still_works(repo, write, capsys):
+    write("m.py", many_savers(6), commit="m")
+    write("codegraph.toml", 'source_roots = ["", "src"]\n', commit="cfg")
+    store, indexer = build(repo)
+    stats = indexer.reconcile("HEAD")
+    assert "deprecated" not in capsys.readouterr().err
+    assert stats.ambiguous == 1
+    store.close()
+
+
+def test_is_derivable_fanout_only_claims_a_set_the_resolver_could_not_tell_apart():
     """`AstResolver` returns the first matching step's hits, so today a result is
     either confident or entirely LOW and this mix cannot arise from it. The
     `Resolver` protocol is a documented swap-in seam, though, and a smarter
-    engine can return both -- the cap must collapse only the part it cannot
-    distinguish, never the part it can."""
-    hits = [("a.py::x", "HIGH"), ("b.py::y", "MEDIUM")] + [
-        (f"c.py::z{i}", "LOW") for i in range(6)
-    ]
-    kept, collapsed = split_by_ambiguity_limit(hits, 4)
-    assert kept == [("a.py::x", "HIGH"), ("b.py::y", "MEDIUM")]
-    assert collapsed == 6
-
-
-def test_split_by_ambiguity_limit_counts_only_the_weak_candidates():
-    """A long list of candidates the resolver could actually tell apart is not
-    ambiguity, and must not be collapsed however long it is."""
-    hits = [(f"a.py::x{i}", "HIGH") for i in range(50)]
-    assert split_by_ambiguity_limit(hits, 4) == (hits, 0)
-
-
-def test_split_by_ambiguity_limit_leaves_a_list_at_exactly_the_limit_alone():
-    hits = [(f"a.py::x{i}", "LOW") for i in range(4)]
-    assert split_by_ambiguity_limit(hits, 4) == (hits, 0)
+    engine can return both -- a set holding anything the resolver DID
+    distinguish is not the derivable fan-out and must still be materialized."""
+    weak = [(f"c.py::z{i}", "LOW") for i in range(6)]
+    assert is_derivable_fanout(weak)
+    assert not is_derivable_fanout([("a.py::x", "HIGH"), *weak])
+    assert not is_derivable_fanout([("b.py::y", "MEDIUM"), *weak])
+    assert not is_derivable_fanout([(f"a.py::x{i}", "HIGH") for i in range(50)])
+    assert not is_derivable_fanout([])
 
 
 # -- self.X finds overrides, not just the inherited declaration -------------
@@ -766,17 +850,41 @@ def test_a_class_with_no_constructor_anywhere_implies_no_edge(repo, write):
     store.close()
 
 
-def test_a_constructor_edge_is_no_more_confident_than_the_class_edge(repo, write):
+def test_an_ambiguous_constructor_still_reaches_the_init_it_would_run(repo, write):
     """A LOW guess at which class a bare name means stays a LOW guess about
-    which `__init__` runs. The implied edge restates the class edge's claim
-    and must not launder it into a stronger one."""
+    which `__init__` runs -- but it must still be reachable.
+
+    `box.Widget()` is an all-LOW fan-out made entirely of classes, so since #25
+    it is not materialized at all. Merging #25 with the constructor edge lost
+    this link on both paths at once: deferred at index time, and missing from
+    the query-time expansion, which only knew about name matches. Query-time
+    expansion has to produce exactly what index time would have.
+
+    The confidence half of the original property is pinned through `impact`,
+    which is where a user actually reads it: the reported dependent must be LOW,
+    never laundered into something stronger by the implied edge.
+    """
     write("one.py", "class Widget:\n    def __init__(self):\n        pass\n")
     write("two.py", "class Widget:\n    def __init__(self):\n        pass\n")
     write("use.py", "def build(box):\n    return box.Widget()\n", commit="ambiguous")
     store, indexer = build(repo)
     indexer.reconcile("HEAD")
-    found = edges(store)
-    assert ("use.py::build", "one.py::Widget", "LOW") in found
-    assert ("use.py::build", "one.py::Widget.__init__", "LOW") in found
-    assert ("use.py::build", "two.py::Widget.__init__", "LOW") in found
+
+    stored = store.connection.execute(
+        "SELECT COUNT(*) AS n FROM edges WHERE rev='HEAD' AND kind='CALLS'"
+    ).fetchone()["n"]
+    assert stored == 0, "the fixture stopped exercising the unmaterialized path"
+
+    offered = set(Ambiguity(store, "HEAD").candidates("box.Widget"))
+    assert offered == {
+        "one.py::Widget",
+        "two.py::Widget",
+        "one.py::Widget.__init__",
+        "two.py::Widget.__init__",
+    }
+
+    report = impact_report(store, "HEAD", "one.py::Widget.__init__", include_low=True)
+    found = {(row.id, row.detail) for group in report.groups for row in group.rows}
+    assert any(node_id == "use.py::build" for node_id, _ in found)
+    assert all("LOW" in detail for node_id, detail in found if node_id == "use.py::build")
     store.close()

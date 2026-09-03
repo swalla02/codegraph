@@ -49,13 +49,27 @@ depends on this: the graph a confidence was derived from and the graph the
 witness BFS traverses must stay identical, tier-eligibility rule included.
 
 This module never queries the effect `Catalog`: it only reads `effects`
-rows `detect_direct` already wrote, and `edges`.
+rows `detect_direct` already wrote, `edges`, and the ambiguous references
+`edges` deliberately does not hold.
+
+That last part is the #25 seam. The bare-name fan-out is not materialized,
+so the LOW subgraph here is `edges` plus `query/ambiguity.Ambiguity`'s hub
+expansion: `src -> HUB(name) -> every definition named name`. Both things
+computed over it -- `_reverse_reachable`'s closure and `witness_path`'s
+BFS -- are pure reachability, and routing N x M pairs through one hub node
+preserves reachability exactly while costing O(N + M). The hubs are
+synthetic, so they are dropped from the rows written and stripped out of
+any witness chain that passes through one. Note the direction of the
+change: a call site the old ambiguity cap refused to enumerate propagated
+NO effect at all, so this strictly gains reachability rather than losing
+it.
 """
 
 from __future__ import annotations
 
 from collections import deque
 
+from codegraph.ambiguity import Ambiguity, is_hub
 from codegraph.resolve import CONFIDENCE_RANK, HIGH, LOW, MEDIUM, stronger
 from codegraph.store import Store
 
@@ -93,6 +107,13 @@ def propagate(store: Store, rev: str) -> int:
         for tier in _TIERS:
             if _RANK[tier] <= rank:
                 reverse_by_tier[tier].setdefault(dst, set()).add(src)
+
+    # The unmaterialized half, LOW by definition and therefore only ever in
+    # the LOW subgraph. Endpoints are valid by construction (both sides come
+    # from this revision's `nodes`), so they skip the node_ids filter above;
+    # the hubs themselves are dropped when rows are written.
+    for src, dst in Ambiguity(store, rev).hub_edges():
+        reverse_by_tier[LOW].setdefault(dst, set()).add(src)
 
     direct_by_node: dict[str, dict[str, str]] = {}
     direct_nodes_by_kind: dict[str, set[str]] = {}
@@ -139,6 +160,10 @@ def propagate(store: Store, rev: str) -> int:
 
     rows: list[tuple] = []
     for node_id, kinds in node_confidence.items():
+        if is_hub(node_id):
+            # A hub is a routing device, not a symbol: it carries the
+            # reachability of every reference to one name and owns none of it.
+            continue
         own_direct = direct_by_node.get(node_id, {})
         for kind, confidence in kinds.items():
             if kind in own_direct:
@@ -214,6 +239,12 @@ def witness_path(store: Store, rev: str, node_id: str, kind: str, confidence: st
         if _RANK[conf] < target_rank:
             continue
         calls.setdefault(src, []).append(dst)
+    if target_rank == _RANK[LOW]:
+        # The same LOW subgraph `propagate` assigned the confidence over --
+        # it has to be, or this BFS could come back empty for a triple
+        # `propagate` really produced. See the module docstring.
+        for src, dst in Ambiguity(store, rev).hub_edges():
+            calls.setdefault(src, []).append(dst)
 
     visited = {node_id}
     parent: dict[str, str] = {}
@@ -230,6 +261,9 @@ def witness_path(store: Store, rev: str, node_id: str, kind: str, confidence: st
                 while chain[-1] != node_id:
                     chain.append(parent[chain[-1]])
                 chain.reverse()
-                return chain
+                # A hub stands in for one direct bare-name call, so dropping
+                # it leaves a chain of real symbols, each link of which is a
+                # LOW call the resolver genuinely recorded.
+                return [step for step in chain if not is_hub(step)]
             queue.append(nxt)
     return []

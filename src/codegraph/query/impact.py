@@ -16,20 +16,44 @@ inflate `rank.salience`'s fan-in term.
 Rows whose path starts with `tests/` or whose qualname's last segment
 starts with `test_` are split into their own `tests` group -- a change
 breaking a test is worth knowing, but it should never crowd out production
-callers in the ranked list. `LOW`-confidence dependents are counted in the
-summary but held back from both groups unless `include_low` is set: the
-resolver's least certain guesses are real information, but they should not
-read as confirmed impact by default.
+callers in the ranked list.
+
+`LOW`-confidence dependents get a third group of their own. They must not
+read as confirmed impact, so they never enter `dependents` or `tests`
+unless `include_low` is set -- but a bare `low_confidence_hidden: 235`
+was worse than useless: it told the reader something was there and gave
+them no way to find out whether it was 235 pieces of noise or the one
+caller that mattered, when this module had already ranked them and could
+simply have said. So the strongest few are printed, in a group labelled
+for what they are, on a budget of their own that cannot eat into the
+production callers'. `low_confidence_hidden` now counts only what is
+genuinely not on the page, and `--all` (`include_low`) still merges the
+whole set into the main groups. See #25.
+
+The LOW set itself is not read from `edges`. The bare-name fan-out is
+never materialized (see `ambiguity.py`); it is expanded here, at
+each hop of the walk, through the same live name index the resolver used.
+That makes this report strictly more complete than the stored graph: a
+call site matching 971 definitions contributed *nothing* to `impact`
+before, because the graph declined to enumerate it.
 """
 
 from __future__ import annotations
 
+from codegraph.ambiguity import Ambiguity
 from codegraph.query.rank import fan_in, salience, score
 from codegraph.render import Group, Report, Row, budget
 from codegraph.resolve import CONFIDENCE_RANK, HIGH, LOW, stronger, weaker
 from codegraph.store import Store
 
 _RANK = CONFIDENCE_RANK
+
+#: How many LOW-confidence dependents the default report names before
+#: falling back to a count. Small on purpose: the point is to let a reader
+#: judge whether the hidden set is noise, not to list it -- `--all` does
+#: that. Kept off the `dependents`/`tests` budget entirely, so turning a
+#: bare count into an answer can never cost a production caller its row.
+_LOW_SAMPLE = 5
 
 
 def _reverse_edges(store: Store, rev: str) -> dict[str, dict[str, str]]:
@@ -50,8 +74,27 @@ def _reverse_edges(store: Store, rev: str) -> dict[str, dict[str, str]]:
     return reverse
 
 
+def _predecessors(
+    reverse: dict[str, dict[str, str]], ambiguity: Ambiguity, node_id: str
+) -> dict[str, str]:
+    """Every caller of `node_id`, materialized and derived alike, at the
+    strongest confidence any of them claims.
+
+    The derived half is the bare-name fan-out the graph deliberately does
+    not store, expanded here for this one node -- always LOW, and never
+    strengthening a materialized edge that already reaches the same caller.
+    """
+    callers = dict(reverse.get(node_id, {}))
+    for src in ambiguity.callers(node_id):
+        callers.setdefault(src, LOW)
+    return callers
+
+
 def _walk(
-    reverse: dict[str, dict[str, str]], node_id: str, max_hops: int
+    reverse: dict[str, dict[str, str]],
+    ambiguity: Ambiguity,
+    node_id: str,
+    max_hops: int,
 ) -> dict[str, tuple[int, str]]:
     """Reverse BFS from `node_id`: node -> (hop, path confidence), each node
     recorded once at its shortest hop, with the strongest confidence
@@ -65,7 +108,7 @@ def _walk(
         next_level: dict[str, str] = {}
         for current in current_level:
             path_confidence = level_confidence[current]
-            for src, edge_confidence in reverse.get(current, {}).items():
+            for src, edge_confidence in _predecessors(reverse, ambiguity, current).items():
                 if src in visited:
                     continue
                 candidate = weaker(path_confidence, edge_confidence)
@@ -96,8 +139,9 @@ def impact_report(
     """Everything reachable from `node_id` by walking CALLS edges backward,
     ranked by `rank.score` and split into `dependents` and `tests` groups."""
     connection = store.connection
+    ambiguity = Ambiguity(store, rev)
     reverse = _reverse_edges(store, rev)
-    found = _walk(reverse, node_id, max_hops)
+    found = _walk(reverse, ambiguity, node_id, max_hops)
 
     node_info: dict[str, tuple[str, str, int]] = {}
     if found:
@@ -110,7 +154,7 @@ def impact_report(
 
     dependent_rows: list[Row] = []
     test_rows: list[Row] = []
-    low_confidence_hidden = 0
+    low_rows: list[Row] = []
     entry_points = 0
     modules: set[str] = set()
 
@@ -122,21 +166,26 @@ def impact_report(
             continue
         path, qualname, line_start = info
 
-        if confidence == LOW and not include_low:
-            low_confidence_hidden += 1
-            continue
-
-        salience_value = salience(store, rev, dependent_id)
-        if fan_in(store, rev, dependent_id) == 0:
-            entry_points += 1
-        modules.add(path)
-
+        salience_value = salience(store, rev, dependent_id, ambiguity)
         row = Row(
             id=dependent_id,
             location=f"{path}:{line_start}",
             detail=f"hop {hop}, {confidence} confidence",
             score=score(hop, confidence, salience_value),
         )
+
+        if confidence == LOW and not include_low:
+            # Ranked, but kept out of the counted `symbols`/`modules`
+            # totals and out of `entry_points`: those describe impact the
+            # report is willing to stand behind, and the whole reason this
+            # group exists separately is that a LOW row is not that.
+            low_rows.append(row)
+            continue
+
+        if fan_in(store, rev, dependent_id, ambiguity) == 0:
+            entry_points += 1
+        modules.add(path)
+
         if _is_test(path, qualname):
             test_rows.append(row)
         else:
@@ -154,6 +203,17 @@ def impact_report(
             groups.append(Group("tests", kept_tests))
         truncated = truncated or tests_truncated
 
+    # The LOW group is budgeted LAST and separately, on `_LOW_SAMPLE` rather
+    # than on whatever is left of `limit`: it exists to make the count
+    # actionable, not to compete with the callers the report is confident
+    # about. `--limit 5` still means five production dependents.
+    low_confidence_hidden = len(low_rows)
+    if low_rows:
+        kept_low, _ = budget(low_rows, min(_LOW_SAMPLE, limit))
+        if kept_low:
+            groups.append(Group("low_confidence", kept_low))
+            low_confidence_hidden -= len(kept_low)
+
     effects_reachable = sorted(
         {
             row["kind"]
@@ -167,6 +227,9 @@ def impact_report(
         "symbols": len(dependent_rows) + len(test_rows),
         "modules": len(modules),
         "entry_points": entry_points,
+        # Only what is NOT on the page. `low_confidence` above holds the
+        # strongest of them, so 0 here now means "all of them are listed",
+        # not "there were none" -- the group's presence says which.
         "low_confidence_hidden": low_confidence_hidden,
         "effects_reachable": effects_reachable,
     }
