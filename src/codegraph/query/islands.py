@@ -185,6 +185,50 @@ def _is_dunder(leaf: str) -> bool:
     return len(leaf) > 4 and leaf.startswith("__") and leaf.endswith("__")
 
 
+#: Directory names that mean "everything below here is the test tree".
+#: `tests/` is the common one, `test/` the other spelling, and both are
+#: matched at ANY depth so a package-internal `src/pkg/tests/` subpackage
+#: counts too.
+_TEST_DIRS = ("tests", "test")
+
+
+def _is_test_module(stem: str) -> bool:
+    """pytest's default `python_files = test_*.py *_test.py`, on a file stem.
+
+    The one place that rule is spelled out. `_is_test_entry_point` and
+    `is_test_path` are both built on it so they cannot come to disagree
+    about what a test file is -- they differ only in how much MORE than the
+    stem each accepts, which is the part that is actually a judgement call.
+    """
+    return stem.startswith("test_") or stem.endswith("_test")
+
+
+def is_test_path(path: str) -> bool:
+    """Is this file part of the test tree?
+
+    Broader than `_is_test_entry_point` on purpose, and the two answer
+    different questions. That one asks "would pytest COLLECT this symbol",
+    which has to be strict because over-matching there explains away every
+    unreferenced helper in the test tree. This one asks "is this FILE test
+    code", where a fixture in `conftest.py` and a plain helper in
+    `tests/support.py` are as much test code as a collected `test_foo`, and
+    none of them is a production caller.
+
+    Four shapes, because four are in the wild: pytest's own file stems
+    (shared with `_is_test_entry_point` through `_is_test_module`),
+    `conftest.py`, and a `tests/` or `test/` directory at any depth --
+    which covers both a top-level test tree and a package-internal `tests`
+    subpackage. `query/orphans.py` reads this to decide whether a caller is
+    a test; it is deliberately NOT what splits `impact`'s report groups
+    (`impact._is_test`), which is presentation rather than a claim.
+    """
+    directories, _, filename = path.rpartition("/")
+    stem = filename.removesuffix(".py")
+    if stem == "conftest" or _is_test_module(stem):
+        return True
+    return any(part in _TEST_DIRS for part in directories.split("/"))
+
+
 def _is_test_entry_point(path: str, qualname: str) -> bool:
     """Would pytest collect this under its default configuration?
 
@@ -192,13 +236,12 @@ def _is_test_entry_point(path: str, qualname: str) -> bool:
     `python_functions = test*`, and collection only reaches module-level
     functions and the methods of a collected class -- so the qualname has
     to be one or two segments and a `<locals>` definition never qualifies.
-    Spelling the rule out rather than reusing `impact._is_test` is
-    deliberate: that one splits report groups and is happy to over-match on
-    any `tests/` path, whereas over-matching here would silently explain
-    away every unreferenced helper in the test tree.
+    Being stricter than `is_test_path` above is deliberate: over-matching
+    here would silently explain away every unreferenced helper in the test
+    tree.
     """
     stem = path.rpartition("/")[2].removesuffix(".py")
-    if not (stem.startswith("test_") or stem.endswith("_test")):
+    if not _is_test_module(stem):
         return False
     parts = qualname.split(".")
     if len(parts) == 1:
@@ -437,4 +480,4 @@ def islands_report(
     return Report(summary=summary, groups=groups, truncated=truncated)
 
 
-__all__ = ["islands_report"]
+__all__ = ["is_test_path", "islands_report"]

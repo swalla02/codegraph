@@ -15,6 +15,7 @@ from codegraph.query.diff import MissingRevisionError, diff_report
 from codegraph.query.effects import effects_report
 from codegraph.query.impact import impact_report
 from codegraph.query.islands import islands_report
+from codegraph.query.orphans import orphans_report
 from codegraph.render import render_json, render_text
 from codegraph.resolve import find_symbol
 from codegraph.store import WORKTREE, Store
@@ -205,6 +206,41 @@ def _cmd_islands(args: argparse.Namespace) -> int:
             print(f"revision not found: {args.rev}", file=sys.stderr)
             return 1
         report = islands_report(store, args.rev, indexer.config, limit=args.limit)
+        print(render_json(report) if args.json else render_text(report))
+        return 0
+    finally:
+        store.close()
+
+
+def _cmd_orphans(args: argparse.Namespace) -> int:
+    """Report functions whose every recorded caller is a test.
+
+    Global like `islands`, so it shares `islands`' exit convention rather
+    than the `0`/`1`/`2` one the symbol-taking commands use: `0` on a report
+    (an empty one included -- "nothing matched the filters" is a real
+    answer), `1` only on a `--rev` that will not resolve.
+
+    The indexer's tree source is passed straight through, because the last
+    filter reads the revision's source text: see `query/orphans.py` for why
+    that filter is not optional and has no flag.
+    """
+    root = Path(args.path).resolve()
+    store, indexer = open_workspace(root)
+    try:
+        try:
+            indexer.reconcile(args.rev)
+        except gitio.GitError:
+            print(f"revision not found: {args.rev}", file=sys.stderr)
+            return 1
+        report = orphans_report(
+            store,
+            args.rev,
+            indexer.source,
+            indexer.config,
+            limit=args.limit,
+            include_public=args.include_public,
+            include_decorated=args.include_decorated,
+        )
         print(render_json(report) if args.json else render_text(report))
         return 0
     finally:
@@ -421,6 +457,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     islands_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     islands_parser.set_defaults(handler=_cmd_islands)
+
+    orphans_parser = subparsers.add_parser(
+        "orphans",
+        help="Report functions whose every recorded caller is a test",
+        description=(
+            "Find the shape of a bug the other commands cannot: a function that is"
+            " defined, tested, and never called by anything outside the test tree."
+            " Such a function is NOT a one-symbol island -- its test calls it -- so"
+            " `islands` structurally cannot surface it. Candidates are private by"
+            " name, undecorated, defined outside the test tree, and never mentioned"
+            " by name anywhere in the source text; that last filter is what keeps a"
+            " callback handed to a library out of the list, and it has no off"
+            " switch. This is NOT a dead-code report: a name resolved at runtime"
+            " leaves nothing for either half of it to find. Read the rows, then read"
+            " the functions."
+        ),
+    )
+    orphans_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    orphans_parser.add_argument("--rev", default=WORKTREE, help="Revision to query")
+    orphans_parser.add_argument(
+        "--limit", type=int, default=20, help="Maximum rows to keep (default: 20)"
+    )
+    orphans_parser.add_argument(
+        "--include-public",
+        action="store_true",
+        help=(
+            "Keep functions without a leading underscore. Off by default: a public"
+            " function called only by tests is usually the package's own surface,"
+            " called by code that is not in this repository"
+        ),
+    )
+    orphans_parser.add_argument(
+        "--include-decorated",
+        action="store_true",
+        help=(
+            "Keep decorated functions. Off by default: a decorator can register or"
+            " replace what it decorates, so the call site is inside the framework"
+        ),
+    )
+    orphans_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    orphans_parser.set_defaults(handler=_cmd_orphans)
 
     diff_parser = subparsers.add_parser(
         "diff", help="Report what changed between two revisions"
