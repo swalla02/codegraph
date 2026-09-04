@@ -959,3 +959,195 @@ def test_the_explicit_two_argument_super_is_not_claimed_as_certain(repo, write):
     found = {(dst, conf) for src, dst, conf in edges(store) if src == "child.py::Child.go"}
     assert ("base.py::Base.helper", "HIGH") not in found
     store.close()
+
+
+# -- #38: package re-exports ---------------------------------------------------
+
+
+def test_package_reexport_resolves_to_where_the_name_is_defined(repo, write):
+    """`pkg.Thing` where `pkg/__init__.py` says `from .app import Thing`.
+
+    This is the shape of almost every public API in Python, and it used to
+    resolve to nothing: `_lookup_dotted` found the module `pkg`, looked for a
+    qualname `Thing` defined in `__init__.py`, did not find one, and gave up.
+    The reference then fell to the repo-wide bare-name step -- LOW, and hidden
+    from `impact` by default -- so the part of a framework's graph codegraph
+    was least confident about was its entry points. See #38.
+
+    HIGH, because `from .app import Thing` is an exact recorded fact about the
+    source text: it is the same evidence the single-hop imported-name step has
+    always claimed HIGH for, read in another file.
+    """
+    write("pkg/__init__.py", "from .app import Thing\n")
+    write("pkg/app.py", "class Thing:\n    def run(self):\n        pass\n")
+    write("use.py", "import pkg\n\n\ndef go():\n    pkg.Thing()\n", commit="reexport")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("use.py::go", "pkg/app.py::Thing", "HIGH") in edges(store)
+    store.close()
+
+
+def test_reexported_class_is_an_inherits_edge_at_high(repo, write):
+    """The reported case verbatim: `class CustomFlask(flask.Flask)`.
+
+    A base reference goes through the same resolver, so the fix has to show up
+    as a HIGH INHERITS edge -- which matters twice over, because only HIGH
+    INHERITS links feed the MRO walk that resolves `self.X` in every subclass.
+    """
+    write("flask/__init__.py", "from .app import Flask\n")
+    write("flask/app.py", "class Flask:\n    def run(self):\n        pass\n")
+    write("use.py", "import flask\n\n\nclass CustomFlask(flask.Flask):\n    pass\n", commit="base")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    rows = {
+        tuple(row)
+        for row in store.connection.execute(
+            "SELECT src, dst, confidence FROM edges WHERE rev='HEAD' AND kind='INHERITS'"
+        )
+    }
+    assert ("use.py::CustomFlask", "flask/app.py::Flask", "HIGH") in rows
+    store.close()
+
+
+def test_reexport_under_an_alias_is_followed(repo, write):
+    """`from .app import Thing as Widget` binds `pkg.Widget`, and the import
+    map already records the alias, so the rewrite has to go through the alias's
+    target rather than through the name as written at the call site."""
+    write("pkg/__init__.py", "from .app import Thing as Widget\n")
+    write("pkg/app.py", "def thing():\n    pass\n\n\nclass Thing:\n    pass\n")
+    write("use.py", "import pkg\n\n\ndef go():\n    pkg.Widget()\n", commit="alias")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("use.py::go", "pkg/app.py::Thing", "HIGH") in edges(store)
+    store.close()
+
+
+def test_a_two_hop_reexport_chain_is_followed(repo, write):
+    """`pkg/__init__.py` re-exports from `pkg/middle.py`, which re-exports from
+    `pkg/deep.py`. Each hop is an exact recorded import, so the conjunction is
+    one too and the tier does not decay with depth."""
+    write("pkg/__init__.py", "from .middle import Thing\n")
+    write("pkg/middle.py", "from .deep import Thing\n")
+    write("pkg/deep.py", "class Thing:\n    pass\n")
+    write("use.py", "import pkg\n\n\ndef go():\n    pkg.Thing()\n", commit="chain")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("use.py::go", "pkg/deep.py::Thing", "HIGH") in edges(store)
+    store.close()
+
+
+def test_a_reexport_cycle_terminates(repo, write):
+    """`pkg/__init__.py` imports `Thing` from `pkg.other`, which imports
+    `Thing` back from `pkg`. Nothing defines it, so the honest answer is no
+    edge -- the point of the test is that the walk returns at all.
+
+    The `seen` set is what guarantees that: a cycle necessarily reproduces a
+    dotted name already tried. `REEXPORT_HOPS` is a second, looser guard.
+    """
+    write("pkg/__init__.py", "from .other import Thing\n")
+    write("pkg/other.py", "from pkg import Thing\n")
+    write("use.py", "import pkg\n\n\ndef go():\n    pkg.Thing()\n", commit="cycle")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert not [edge for edge in edges(store) if edge[0] == "use.py::go"]
+    store.close()
+
+
+def test_a_local_definition_beats_a_reexport_of_the_same_name(repo, write):
+    """`pkg/__init__.py` both imports a `Thing` and defines its own.
+
+    The definition in the file is what a reader looking `pkg.Thing` up would
+    find, so it wins -- the same rule `constructor_target` applies to a method
+    declared on a class and on its base. A re-export must never shadow a real
+    local definition, or the fix would trade one wrong answer for another.
+    """
+    write("pkg/__init__.py", "from .app import Thing\n\n\nclass Thing:\n    pass\n")
+    write("pkg/app.py", "class Thing:\n    pass\n")
+    write("use.py", "import pkg\n\n\ndef go():\n    pkg.Thing()\n", commit="shadow")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    targets = {dst for src, dst, _ in edges(store) if src == "use.py::go"}
+    assert "pkg/__init__.py::Thing" in targets
+    assert "pkg/app.py::Thing" not in targets
+    store.close()
+
+
+def test_a_name_the_package_does_not_reexport_is_not_invented(repo, write):
+    """`pkg.Thing` where `pkg/__init__.py` neither defines nor imports `Thing`.
+
+    Following an import is only sound because the import is written down. When
+    it is not, there is nothing to follow, and the reference must keep falling
+    through to the weak bare-name path exactly as it does today -- one
+    plausible definition elsewhere in the repo is a MEDIUM guess, not a HIGH
+    fact, and the fix must not launder it into one.
+    """
+    write("pkg/__init__.py", "from .app import Other\n")
+    write("pkg/app.py", "class Other:\n    pass\n")
+    write("elsewhere.py", "class Thing:\n    pass\n")
+    write("use.py", "import pkg\n\n\ndef go():\n    pkg.Thing()\n", commit="missing")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = {(dst, conf) for src, dst, conf in edges(store) if src == "use.py::go"}
+    assert ("elsewhere.py::Thing", "HIGH") not in found
+    assert ("elsewhere.py::Thing", "MEDIUM") in found, "the weak path must still see it"
+    store.close()
+
+
+def test_a_star_import_is_not_followed(repo, write):
+    """`from .app import *` is deliberately not expanded.
+
+    Which names it binds depends on `__all__`, which is not recorded and which
+    real packages compute at runtime (`__all__ = [...] + other.__all__`).
+    Guessing "everything without a leading underscore" would claim HIGH for
+    names that may not be exported at all, so a name reachable only through a
+    star import keeps falling through to the weak path. Over-claiming here is
+    worse than not handling it.
+    """
+    write("pkg/__init__.py", "from .app import *\n")
+    write("pkg/app.py", "class Thing:\n    pass\n")
+    write("use.py", "import pkg\n\n\ndef go():\n    pkg.Thing()\n", commit="star")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = {(dst, conf) for src, dst, conf in edges(store) if src == "use.py::go"}
+    assert ("pkg/app.py::Thing", "HIGH") not in found
+    # Not dropped either: the bare-name step still sees the one `Thing`.
+    assert ("pkg/app.py::Thing", "MEDIUM") in found
+    store.close()
+
+
+def test_the_qualname_after_a_reexported_name_rides_along(repo, write):
+    """`pkg.Thing.run()` where `pkg/__init__.py` says `from .app import Thing`.
+
+    The rewrite has to carry the segments AFTER the re-exported name: `Thing`
+    becomes `pkg.app.Thing`, and `run` is still `run` on whatever `Thing`
+    turned out to be. Dropping the tail resolves the call to the class instead
+    of to the method on it -- a confidently wrong edge, which is worse than the
+    LOW guess it replaces. (An earlier version of this test used
+    `pkg.helpers.build()` through a re-exported submodule and was VACUOUS: the
+    ordinary longest-module-prefix lookup answers that one before the re-export
+    step ever runs, so dropping the tail did not fail it.)
+    """
+    write("pkg/__init__.py", "from .app import Thing\n")
+    write("pkg/app.py", "class Thing:\n    @staticmethod\n    def run():\n        pass\n")
+    write("use.py", "import pkg\n\n\ndef go():\n    pkg.Thing.run()\n", commit="tail")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    targets = {(dst, conf) for src, dst, conf in edges(store) if src == "use.py::go"}
+    assert ("pkg/app.py::Thing.run", "HIGH") in targets
+    assert not any(dst == "pkg/app.py::Thing" for dst, _ in targets), "the tail was dropped"
+    store.close()
+
+
+def test_from_package_import_name_also_follows_the_reexport(repo, write):
+    """`from pkg import Thing` is the other half of the same gap, and by volume
+    the bigger one: the alias map records the target as `pkg.Thing`, which is
+    the identical dotted name `pkg.Thing` at a call site produces, so both
+    forms were unresolvable for the same reason and both are fixed by the same
+    step."""
+    write("pkg/__init__.py", "from .app import Thing\n")
+    write("pkg/app.py", "class Thing:\n    pass\n")
+    write("use.py", "from pkg import Thing\n\n\ndef go():\n    Thing()\n", commit="fromimport")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("use.py::go", "pkg/app.py::Thing", "HIGH") in edges(store)
+    store.close()

@@ -79,6 +79,18 @@ def is_builtin_call(ref: ParsedRef) -> bool:
 #: `src` for a reference made at module scope, which owns no node of its own.
 MODULE_SCOPE = "<module>"
 
+#: How many re-export hops `AstResolver._lookup_dotted` will follow.
+#:
+#: A chain is real -- `a/__init__.py` re-exports from `a/b.py`, which
+#: re-exports from `a/c.py` -- but short: flask's whole public API is one hop,
+#: and the deepest chain actually walked across the benchmark targets is two.
+#: This bound is a cost and sanity guard with room to spare, NOT the
+#: termination guarantee: that is the `seen` set in `_lookup_dotted`, since a
+#: cycle necessarily reproduces a dotted name already tried. Every other walk
+#: in this module (`breadth_first`, and `_mro`/`_descendants` on top of it) is
+#: cycle-safe the same way.
+REEXPORT_HOPS = 8
+
 
 def module_for_path(path: str, source_roots: tuple[str, ...]) -> str:
     """'src/pay/service.py' -> 'pay.service'; 'pay/__init__.py' -> 'pay'."""
@@ -136,6 +148,10 @@ class ResolveContext:
     qualname_index: dict[tuple[str, str], str]  # (path, qualname) -> node id, live only
     name_index: dict[str, list[str]]  # bare name -> node ids, live only
     import_map: dict[str, str]  # local alias -> dotted target
+    #: EVERY path's alias map, not just this file's. Following a package
+    #: re-export means reading what ANOTHER file imports: `flask.Flask` is
+    #: answered by `src/flask/__init__.py`'s `from .app import Flask`.
+    import_maps: dict[str, dict[str, str]]
     bases: dict[str, list[str]]  # class node id -> base class node ids
     enclosing_class: dict[str, str] = field(default_factory=dict)  # node id -> class node id
     subclasses: dict[str, list[str]] = field(default_factory=dict)  # inverse of `bases`
@@ -201,8 +217,64 @@ class AstResolver:
         node_id = self._lookup_dotted(dotted, ctx)
         return [(node_id, HIGH)] if node_id else []
 
+    @classmethod
+    def _lookup_dotted(cls, dotted: str, ctx: ResolveContext) -> str | None:
+        """A dotted name -> the definition it names, following re-exports.
+
+        A module attribute can be a name the module merely *imported*, and for
+        a package `__init__.py` that is the normal case: `flask.Flask` is not
+        defined in `src/flask/__init__.py`, it is bound there by
+        `from .app import Flask`. Looking only for a definition (step one
+        below) answered 218 of flask's 1039 ambiguous references with nothing
+        -- the package's entire public API, the most-written form of every
+        import a library user makes. See #38.
+
+        So each round does two things, in this order:
+
+        1. is the remaining qualname DEFINED in the module the prefix names?
+        2. if not, is it IMPORTED there? Rewrite the dotted name through that
+           import and go round again.
+
+        Definition first is what keeps a re-export from shadowing a real local
+        definition: an `__init__.py` that both defines `Foo` and imports a
+        different `Foo` resolves to the one a reader looking it up in that file
+        would find, which is the same rule `constructor_target` follows for a
+        method. (Python itself would give the later binding, but `nodes` holds
+        definitions, not assignment order, and preferring the definition is the
+        conservative half of that disagreement -- it never invents a target in
+        another file.)
+
+        The claim stays HIGH, because it is the same evidence step one already
+        claims HIGH for: `from .app import Flask` is an exact recorded fact
+        about the source text, not an inference over it. Nothing is guessed --
+        no MRO approximation, no instance type, no repo-wide name search -- and
+        a chain of hops is a conjunction of such facts, so depth does not
+        weaken it: three exact facts are not less certain than one. What could
+        still be wrong is that the module rebinds the name at runtime, and that
+        is exactly as true of the single-hop imported-name step which has been
+        HIGH since the start; this adds no new kind of doubt, it reads the same
+        kind of statement in a different file. The hop bound therefore never
+        produces a weaker answer: exhausting it produces NO answer, and the
+        reference falls through to the weak bare-name path it takes today.
+        """
+        seen = {dotted}
+        for _ in range(REEXPORT_HOPS + 1):
+            node_id = cls._lookup_defined(dotted, ctx)
+            if node_id:
+                return node_id
+            followed = cls._follow_reexport(dotted, ctx)
+            # `followed in seen` is the cycle guard: a re-export cycle
+            # (`a/__init__.py` imports X from `a.b`, `a/b.py` imports X from
+            # `a`) necessarily reproduces a dotted name already tried, so this
+            # terminates it before the hop bound does.
+            if followed is None or followed in seen:
+                return None
+            seen.add(followed)
+            dotted = followed
+        return None
+
     @staticmethod
-    def _lookup_dotted(dotted: str, ctx: ResolveContext) -> str | None:
+    def _lookup_defined(dotted: str, ctx: ResolveContext) -> str | None:
         """Split `a.b.c` at every module/qualname boundary, longest module first."""
         parts = dotted.split(".")
         for split in range(len(parts) - 1, 0, -1):
@@ -212,6 +284,44 @@ class AstResolver:
             node_id = ctx.qualname_index.get((path, ".".join(parts[split:])))
             if node_id:
                 return node_id
+        return None
+
+    @staticmethod
+    def _follow_reexport(dotted: str, ctx: ResolveContext) -> str | None:
+        """`flask.Flask.run` -> `flask.app.Flask.run`, via one import statement.
+
+        Same longest-module-prefix split as `_lookup_defined`, but the first
+        segment after the prefix is looked up in that module's *import* map
+        instead of its definitions, and any further segments ride along
+        untouched (`Flask.run` is `run` on whatever `Flask` turns out to be).
+
+        `from .x import *` is deliberately NOT followed. `build_import_maps`
+        records it under the literal name `*`, which no attribute access can
+        ever spell, so a star import simply contributes nothing here. Expanding
+        it would mean deciding which of the starred module's names are public,
+        and that is governed by `__all__` -- which this codebase does not
+        record and which real packages build at runtime
+        (`__all__ = [...] + other.__all__`). Guessing "every name not starting
+        with an underscore" would claim HIGH for names that may not be exported
+        at all, so a name reachable only through a star import keeps falling
+        through to the weak path, exactly as it does today.
+
+        `__all__` is otherwise irrelevant to this lookup, which is worth saying
+        because it looks like it should matter: `__all__` gates `from pkg
+        import *` and nothing else. `flask.Flask` reads a module attribute, and
+        the attribute is there because the import bound it, whether or not
+        `__all__` mentions it.
+        """
+        parts = dotted.split(".")
+        for split in range(len(parts) - 1, 0, -1):
+            path = ctx.module_to_path.get(".".join(parts[:split]))
+            if path is None:
+                continue
+            name, *tail = parts[split:]
+            target = ctx.import_maps.get(path, {}).get(name)
+            if target is None:
+                continue
+            return ".".join([target, *tail])
         return None
 
     # -- step 2: a name defined in the same module ------------------------
@@ -457,6 +567,7 @@ class _SymbolTable:
             qualname_index=self.qualname_index,
             name_index=self.name_index,
             import_map=self.import_maps[path],
+            import_maps=self.import_maps,
             bases=bases,
             enclosing_class=self.enclosing_class,
             subclasses=subclasses if subclasses is not None else {},
