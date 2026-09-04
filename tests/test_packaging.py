@@ -30,7 +30,13 @@ def test_skill_has_frontmatter_and_covers_triggers():
 
 def test_skill_documents_every_shipped_command():
     text = (ROOT / "skills" / "codegraph" / "SKILL.md").read_text()
-    for command in ["codegraph resolve", "codegraph impact", "codegraph effects", "codegraph diff"]:
+    for command in [
+        "codegraph resolve",
+        "codegraph impact",
+        "codegraph effects",
+        "codegraph orphans",
+        "codegraph diff",
+    ]:
         assert command in text
 
 
