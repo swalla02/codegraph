@@ -93,16 +93,52 @@ stands apart, and each row carries the label:
   — called by users of the package and by the stdlib, neither of which is in
   the tree. **Do not read this bucket as dead code.**
 
+`codegraph orphans` answers the one question every other command needs the
+answer to before you can ask it. `resolve`, `impact` and `effects` all take a
+symbol, so they need you to already suspect the bug. `orphans` takes none: it
+asks a bug's *shape* — **which functions have callers, all of which are
+tests?** That is a helper that was written, tested, and never wired up, so
+the feature silently does not exist while its test passes (#37). `islands`
+cannot find it: the test's call is a real edge, so the function is not a
+one-symbol island.
+
+Reach for it when asked "is there anything wrong in here", "is this dead",
+"what is not wired up", or after inheriting an unfamiliar repository. It is
+also the check to run after adding a helper and its test — if your new
+function appears, you forgot to call it.
+
+Candidates are additionally private by name, undecorated, defined outside
+the test tree, and **not mentioned by name anywhere in the source text**.
+That last filter has no off switch: a static call graph cannot see a
+function passed as a value, so without it a live `signal.signal` handler and
+a `subprocess` `preexec_fn` head the list. `--include-public` and
+`--include-decorated` relax the other two; the summary counts what each
+filter removed (`functions` → `test_callers_only` → `candidates` →
+`name_referenced` → `reported`), so you can see the funnel rather than trust
+it.
+
+**`orphans` is NOT a dead-code report, and neither its rows nor you should
+say it is.** Its claim is about codegraph's knowledge: no caller outside the
+test tree was recorded, and the name does not appear in the source text. A
+name resolved at runtime — `getattr`, a registry, a `pyproject.toml` entry
+point, a template — leaves nothing for either half of it to find, and the
+`caveat` field in every summary says so. On the project it was built for, 2
+of 5 rows were real defects and the other 3 were deliberate (two back-compat
+shims and an import probe that is meant to be test-only). Read the rows,
+then read the functions; never delete on the strength of a row. Like
+`islands` it takes no symbol, so it exits `0` for a report — including an
+empty one — and `1` only for a bad `--rev`.
+
 `codegraph diff [<base>..<head>]` reports what a branch actually changed —
 symbols added/removed/changed by content hash (never by line number) plus
 any side effect that newly became reachable. With no argument it diffs
 `merge-base(default branch, HEAD)` against the worktree, which is what you
 want when asked "what did this branch change".
 
-All of `resolve`, `impact`, `effects`, `islands`, and `diff` accept
-`--path <dir>` to run against a different repository root, and
-`impact`/`effects`/`islands`/`diff` accept `--json` for machine-readable
-output instead of the default text.
+All of `resolve`, `impact`, `effects`, `islands`, `orphans` and `diff`
+accept `--path <dir>` to run against a different repository root, and
+`impact`/`effects`/`islands`/`orphans`/`diff` accept `--json` for
+machine-readable output instead of the default text.
 
 ## The anti-pattern this displaces
 
@@ -132,7 +168,11 @@ the full set and how confident it is in each edge.
   to a number either: the strongest few are listed in their own
   `low_confidence` group, and `low_confidence_hidden` counts only the ones
   that did not fit. Pass `--all` to merge the whole set into the main
-  groups instead.
+  groups instead — which the summary now says out loud: a nonzero
+  `low_confidence_hidden` is printed with `show_hidden: --all` beside it,
+  because a count of what you cannot see is half an answer (#37). The count
+  stays an integer in `--json`; the hint is a separate field and appears
+  only when something is actually hidden.
 - Many of those `LOW` rows are not in the stored graph at all. A call like
   `item.save()` that names nothing importable, nothing module-local and
   nothing reachable through `self` matches every definition named `save`
@@ -180,6 +220,14 @@ the full set and how confident it is in each edge.
   and not about the symbol. `--limit N` (default 20) is a total budget
   across both groups, islands first, exactly as `impact` budgets dependents
   ahead of tests.
+- `orphans`' summary reads `functions: 812 · test_callers_only: 280 ·
+  candidates: 10 · name_referenced: 5 · reported: 5 · basis: ... ·
+  caveat: ...` — the funnel, in order, so each filter's work is visible.
+  `functions` counts the ones considered at all (outside the test tree,
+  under a source root); `name_referenced` is how many candidates the
+  source-text scan removed. Every row's `detail` names the tests that call
+  it, which is where to start reading: the test says what the function was
+  supposed to be for.
 - Each `effects` row's `detail` reads `<KIND> <CONFIDENCE> via <chain>` —
   the chain is the call path from the queried symbol down to the concrete
   call site; `location` is that call site's `file:line`, clickable evidence

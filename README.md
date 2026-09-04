@@ -111,6 +111,7 @@ slower on a cold cache.
 | `codegraph effects <symbol> [--json]` | Report every side-effect kind reachable from a symbol, each with a witness chain down to the causing `file:line`. |
 | `codegraph impact <symbol> [--hops N] [--limit N] [--all] [--json]` | Report the ranked dependents of a symbol — everything a change to it could break. |
 | `codegraph islands [--rev REV] [--limit N] [--json]` | Report the connected components of the revision's `CALLS` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
+| `codegraph orphans [--rev REV] [--limit N] [--include-public] [--include-decorated] [--json]` | Find functions whose every recorded caller is a test — defined, tested, and never invoked by the code that was supposed to invoke it. Such a function is *not* a one-symbol island, precisely because its test calls it, so `islands` structurally cannot surface it. Candidates are private by name, undecorated, defined outside the test tree, and never mentioned by name anywhere in the source text — that last filter has no off switch, because a static call graph cannot see a callback handed to a library. Not a dead-code report (see below). |
 | `codegraph diff [<base>..<head>] [--json]` | Report what changed between two revisions by content hash, never by line number: symbols added/removed/changed, plus any side effect newly reachable. Defaults to `merge-base(default branch, HEAD)..WORKTREE` — "what has this branch changed so far." |
 | `codegraph gc [--keep REV]` | Prune the Layer 1 parse cache down to what `HEAD`, the worktree, and any `--keep`-named revisions still reference. Never touches the graph itself, so it can only make a future answer slower to rebuild, never wrong. |
 | `codegraph init` | Make this repository's coding agents aware of codegraph: an `AGENTS.md` section, the `@AGENTS.md` bridge into an existing `CLAUDE.md`, and a commented `codegraph.toml` stub. Idempotent; never overwrites content it did not write; never touches `.git/`. |
@@ -161,13 +162,53 @@ had no incoming edge at all. Implying that edge (following the MRO for an
 inherited one) folded 18 of requests' 172 islands into the rest of the
 graph.
 
+### What `orphans` finds that nothing else can
+
+Every other query needs the symbol's name as input, which means already
+suspecting the bug. `orphans` asks a bug's *shape* instead: **which
+functions have callers, all of which are tests?** That is the signature of a
+helper that was written, tested, and then never wired up — `_get_mlx_info()`
+on a 948-file project, docstring'd "Surface MLX info in the doctor report",
+covered by `test_doctor_has_mlx_info`, and never reached by the command, so
+the feature silently did not exist and the test passed anyway (#37).
+
+`islands` cannot find that, structurally: the test's call is a real edge, so
+the function is not a one-symbol island. The thing that lets the bug survive
+review is the thing that hides it from the only global view.
+
+The filters are the command. On that project, "every caller is a test"
+alone answers **280** functions — a list nobody reads. Private by name and
+undecorated cuts it to **10**; "not mentioned by name anywhere in the source
+text" cuts it to **5**, of which **2 were real defects** (one is now merged
+upstream). 40% on a hand-reviewable list, in a repo with 19,960 tests.
+
+That last filter is not optional and has no flag, because a static call
+graph cannot see a function passed as a **value**. Without it the same
+project's list is headed by `_run_bash_sandbox.<locals>.preexec` (handed to
+`subprocess`'s `preexec_fn`) and `_handle_sigint` (registered through
+`signal.signal`), neither of which is dead. `blob_refs` cannot answer it —
+it records calls, not names used as values — so the filter is a documented
+grep over the revision's non-test source text, which over-matches on
+purpose: it can only remove a candidate, never invent one.
+
+**This is not a dead-code report, and no row says otherwise.** The claim is
+about codegraph's knowledge — no caller outside the test tree was recorded,
+and the name does not appear in the source text — and the blind spot is
+printed in the summary, with the rows, not left here. A name resolved at
+runtime (`getattr`, a registry, a `pyproject.toml` entry point, a template)
+leaves nothing for either half of this report to find. Three of those five
+survivors were deliberate: two documented back-compat shims and an import
+probe whose docstring says test-only is the point.
+
 `resolve`, `impact`, and `effects` share one exit-code convention for
 resolving `<symbol>` to a node id: `0` = a single unambiguous match, `1` =
 nothing matched, `2` = more than one match (every candidate is printed; pick
 the right one and re-run with the full node id).
 
-`islands` takes no symbol, so that convention does not apply to it: it
-exits `0` for a report and `1` only for a revision it cannot resolve.
+`islands` and `orphans` take no symbol, so that convention does not apply
+to either: they exit `0` for a report — an empty one included, since "nothing
+matched" is a real answer — and `1` only for a revision they cannot
+resolve.
 
 All commands accept `--path <dir>` to run against a different repository
 root (default: the current directory).

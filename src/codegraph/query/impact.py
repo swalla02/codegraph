@@ -28,7 +28,9 @@ simply have said. So the strongest few are printed, in a group labelled
 for what they are, on a budget of their own that cannot eat into the
 production callers'. `low_confidence_hidden` now counts only what is
 genuinely not on the page, and `--all` (`include_low`) still merges the
-whole set into the main groups. See #25.
+whole set into the main groups. See #25. A nonzero count carries
+`show_hidden: --all` beside it, because a count with no way to see what it
+counts is the same footgun one level down (#37).
 
 The LOW set itself is not read from `edges`. The bare-name fan-out is
 never materialized (see `ambiguity.py`); it is expanded here, at
@@ -231,6 +233,21 @@ def impact_report(
         # strongest of them, so 0 here now means "all of them are listed",
         # not "there were none" -- the group's presence says which.
         "low_confidence_hidden": low_confidence_hidden,
+        # ...and, when there IS something hidden, how to see it. A count of
+        # what is missing with no way to look at it is the footgun #37 names:
+        # answering "is anything still depending on this?" requires already
+        # knowing that `--all` exists, and the likeliest reader of a nonzero
+        # count here is the one who does not.
+        #
+        # Conditional, and spliced in right beside the count rather than
+        # appended: the summary line is dense enough that a permanent field
+        # for a number that is usually 0 would cost every other reader, and a
+        # hint that renders three fields away from the count it explains is
+        # not next to it in any sense the reader cares about. A separate
+        # string field rather than folding the flag into the value
+        # ("235 (--all)") because `low_confidence_hidden` is an int in
+        # `--json`, and machine-readable output is entitled to stay so.
+        **({"show_hidden": "--all"} if low_confidence_hidden else {}),
         "effects_reachable": effects_reachable,
     }
 

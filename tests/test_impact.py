@@ -3,6 +3,7 @@ import pytest
 from codegraph.indexer import GitTreeSource, Indexer
 from codegraph.query.impact import impact_report
 from codegraph.query.rank import salience, score
+from codegraph.render import render_text
 from codegraph.store import Store
 
 
@@ -109,6 +110,35 @@ def test_more_low_confidence_callers_than_the_sample_are_counted_as_hidden(repo,
     shown = group(report, "low_confidence")
     assert len(shown) == 5
     assert report.summary["low_confidence_hidden"] == 12 - 5
+    store.close()
+
+
+def test_a_hidden_count_says_how_to_see_what_it_is_hiding(repo, write):
+    """The second footgun #37 found: for a "is anything still depending on
+    this?" question the reader must remember `--all`, or the LOW dependents
+    sit in a group of their own and a hasty reader concludes there are none.
+
+    `low_confidence_hidden: 7` was the right instinct and half an answer --
+    it says something is missing and not how to look at it. The flag now
+    rides along with the count, and only with a NONZERO count: the summary
+    line is dense already, and a permanent extra field for a number that is
+    usually 0 would cost every other reader something.
+    """
+    for i in range(12):
+        write(f"c{i}.py", f"def go{i}(thing):\n    thing.shared()\n", commit=f"c{i}")
+    write("one.py", "class One:\n    def shared(self):\n        pass\n", commit="1")
+    write("two.py", "class Two:\n    def shared(self):\n        pass\n", commit="2")
+    store = build(repo)
+    report = impact_report(store, "HEAD", "one.py::One.shared")
+    assert report.summary["low_confidence_hidden"] == 7
+    assert report.summary["show_hidden"] == "--all"
+    assert "low_confidence_hidden: 7 \u00b7 show_hidden: --all" in render_text(report)
+
+    # Nothing hidden, nothing to say. The count stays, so 0 keeps meaning
+    # "all of them are listed"; the hint does not linger next to it.
+    everything = impact_report(store, "HEAD", "one.py::One.shared", include_low=True)
+    assert everything.summary["low_confidence_hidden"] == 0
+    assert "show_hidden" not in everything.summary
     store.close()
 
 
