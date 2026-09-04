@@ -11,7 +11,11 @@
     "pkg/duck_unique.py": "class Renderer:\n    def render(self):\n        return \"rendered\"\n\n\ndef show(widget):\n    return widget.render()\n",
     "pkg/duck_ambiguous.py": "class Document:\n    def save(self):\n        return \"document saved\"\n\n\nclass Settings:\n    def save(self):\n        return \"settings saved\"\n\n\ndef persist(item):\n    return item.save()\n",
     "pkg/shapes.py": "class Shape:\n    def area(self):\n        return 0\n\n    def describe(self):\n        return f\"area={self.area()}\"\n\n\nclass Square(Shape):\n    def __init__(self, side):\n        self.side = side\n\n    def area(self):\n        return self.side * self.side\n",
-    "pkg/construct.py": "from pkg.shapes import Square\n\n\nclass Vessel:\n    def __init__(self, size):\n        self.size = size\n\n\nclass Barrel(Vessel):\n    def capacity(self):\n        return self.size\n\n\ndef build_square():\n    return Square(2)\n\n\ndef build_barrel():\n    return Barrel(3)\n"
+    "pkg/construct.py": "from pkg.shapes import Square\n\n\nclass Vessel:\n    def __init__(self, size):\n        self.size = size\n\n\nclass Barrel(Vessel):\n    def capacity(self):\n        return self.size\n\n\ndef build_square():\n    return Square(2)\n\n\ndef build_barrel():\n    return Barrel(3)\n",
+    "pkg/api/__init__.py": "from pkg.api.impl import Engine\n",
+    "pkg/api/impl.py": "class Engine:\n    def __init__(self):\n        self.started = False\n",
+    "pkg/reexport.py": "import pkg.api\n\n\ndef build_engine():\n    return pkg.api.Engine()\n",
+    "pkg/other_engine.py": "class Engine:\n    def __init__(self):\n        self.kind = \"unrelated\"\n"
   },
   "calls": [
     {
@@ -76,6 +80,13 @@
       "expected": [
         "pkg/construct.py::Barrel",
         "pkg/construct.py::Vessel.__init__"
+      ]
+    },
+    {
+      "src": "pkg/reexport.py::build_engine",
+      "expected": [
+        "pkg/api/impl.py::Engine",
+        "pkg/api/impl.py::Engine.__init__"
       ]
     }
   ]

@@ -222,11 +222,21 @@ order and stops at the first that matches.
 | step | tier | example |
 |---|---|---|
 | the name is imported | HIGH | `from pay import charge` then `charge()` |
+| ...through a package re-export | HIGH | `pkg.Thing` where `pkg/__init__.py` says `from .app import Thing` |
 | the name is defined in this module | HIGH | a module-local `def charge` |
 | `super().X()` | HIGH | resolved through the enclosing class's bases, skipping the class itself |
 | `self.X()` | HIGH + MEDIUM | the inherited method at HIGH, every subclass override at MEDIUM |
 | `Cls()` | inherits the class edge's tier | plus an edge to the `__init__` it would run, found up the MRO |
 | a bare name matched against the whole repository | MEDIUM if unique, else LOW | `item.save()` where nothing says what `item` is |
+
+A re-export is followed because it is the *same* evidence as the row above it,
+read in another file: `from .app import Thing` is a recorded fact about the
+source text, not an inference over it, so a chain of them is a conjunction of
+facts and depth does not weaken the claim. Two things are deliberately not
+followed, because they would be inferences: `from .app import *` (which names
+it binds depends on `__all__`, which real packages compute at runtime), and a
+chain longer than `REEXPORT_HOPS`. Neither produces a weaker edge — both
+produce no edge, and the reference falls to the last step below.
 
 The last step is the one to be suspicious of. It is a guess by construction, and
 on a large repository one name can match hundreds of definitions, so those
@@ -391,8 +401,19 @@ is unit-tested there (`tests/test_bench_scorer.py`).
 | suite traced | `test_utils.py`, `test_structures.py` (240 tests) | `tests/` (494 tests) |
 | traced call edges (judgeable) | 115 | 2683 |
 | **recall** | **0.79** | **0.29** |
-| recall at HIGH/MEDIUM | 0.76 | 0.19 |
-| conditional precision | 0.99 (81/82) | 0.86 (206/239) |
+| recall at HIGH/MEDIUM | 0.76 | 0.25 |
+| conditional precision | 0.99 (82/83) | 0.93 (455/490) |
+
+Worth reading those two rows together, because #38 (following a package
+re-export, so `flask.Flask` resolves instead of degrading to an ambiguous bare
+name) moved them and left **recall flat**: 765 -> 776 judgeable edges found, so
+0.29 both before and after. It could not move much. Recall counts an edge the
+LOW bare-name fan-out would produce, and the fan-out already contained the
+right answer — buried among the wrong ones. What changed is which tier the
+answer is claimed at: recall at HIGH/MEDIUM 0.19 -> 0.25 (507 -> 673 edges) and
+conditional precision 0.86 -> 0.93. That is the whole point of the fix, and it
+is invisible in the headline number, which is a property of this benchmark
+worth knowing: **recall does not distinguish a fact from a lucky guess.**
 
 On `tests/test_utils.py` alone — the scope #35 recorded — requests is **0.93**
 recall, and all 6 misses are dunders invoked by syntax (`d[k]`, `for x in jar`,
@@ -404,13 +425,13 @@ trace, not a single number about codegraph.**
 flask is where a static resolver is supposed to do badly, and it does. Every
 miss is grouped by mechanism, and the grouping is the finding:
 
-| flask misses (1918 of 2683) | |
+| flask misses (1907 of 2683) | |
 |---|---|
-| target nested in another function (a view defined inside a test) | 564 |
+| target nested in another function (a view defined inside a test) | 561 |
 | reachable only through an out-of-repo frame | 552 |
 | target is decorated (`@app.route`, `@setupmethod`) | 523 |
 | target is a dunder, invoked by syntax or protocol | 223 |
-| target is a constructor — a real resolution gap | 21 |
+| target is a constructor — a real resolution gap | 13 |
 | target applied as a decorator by the source | 18 |
 | no implicit-invocation mechanism recognised | 15 |
 | call site attributed to another definition in the same file | 2 |
@@ -431,7 +452,7 @@ simply not cover it, and most of a library's surface is not exercised by its
 own tests. Unconditional precision is therefore not measurable this way, and
 the benchmark does not print a number for it. What is defensible: among static
 HIGH edges whose **two endpoints both executed at least once**, how many did
-the trace observe? 0.99 on requests, 0.86 on flask. That says the HIGH edges
+the trace observe? 0.99 on requests, 0.93 on flask. That says the HIGH edges
 that could have been checked were taken; it does not say the resolver invents no
 edges.
 
