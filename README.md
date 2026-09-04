@@ -123,7 +123,7 @@ slower on a cold cache.
 into connected components. That the call graph is *not* connected is real
 structure, not a defect: a service boundary, a config-gated region, and
 code nothing references all show up as separate islands. On psf/requests
-it reports 807 symbols in 154 islands, the biggest holding 646 of them and
+it reports 807 symbols in 153 islands, the biggest holding 647 of them and
 149 being islands of exactly one.
 
 **An island is not a reachability result, and a one-symbol island is not
@@ -140,7 +140,7 @@ apart, and no label is ever a claim that code is dead:
 - **`implicit: dunder, decorator, test, override, nested, import`** — a
   mechanism found among the island's members by which something could reach
   it without a call site. Not proof that it runs; counter-evidence to
-  "nothing reaches this". 125 of requests' 154 islands carry at least one.
+  "nothing reaches this". 124 of requests' 153 islands carry at least one.
 - **`boundary: NETWORK`** — a path inside the island leaves the process.
   The handler lives in another repository, so the island boundary *is* the
   service boundary. That is signal, not a false positive. `NETWORK` is
@@ -171,6 +171,38 @@ exits `0` for a report and `1` only for a revision it cannot resolve.
 
 All commands accept `--path <dir>` to run against a different repository
 root (default: the current directory).
+
+## Confidence, and what earns it
+
+Every edge carries HIGH, MEDIUM or LOW. The tier is not a score, it is a claim
+about *how the target was identified*, and the resolver tries the steps below in
+order and stops at the first that matches.
+
+| step | tier | example |
+|---|---|---|
+| the name is imported | HIGH | `from pay import charge` then `charge()` |
+| the name is defined in this module | HIGH | a module-local `def charge` |
+| `super().X()` | HIGH | resolved through the enclosing class's bases, skipping the class itself |
+| `self.X()` | HIGH + MEDIUM | the inherited method at HIGH, every subclass override at MEDIUM |
+| `Cls()` | inherits the class edge's tier | plus an edge to the `__init__` it would run, found up the MRO |
+| a bare name matched against the whole repository | MEDIUM if unique, else LOW | `item.save()` where nothing says what `item` is |
+
+The last step is the one to be suspicious of. It is a guess by construction, and
+on a large repository one name can match hundreds of definitions, so those
+candidates are not stored at all: the reference is recorded once and the
+candidates are recomputed when a query asks (see `--all`).
+
+Two deliberate refusals, both of which used to produce confident nonsense:
+
+- **A Python builtin is never matched against a repository symbol.** `set(x)`
+  used to become an edge to a class that happened to define a method called
+  `set`, and that phantom edge then carried an effect into a witness path.
+- **The built-in effect catalog only describes third-party code.** Analysing
+  `requests` itself, every internal call expanded into the `requests.*`
+  namespace and matched the catalog's own network rule, so the library's helpers
+  were reported as network calls and the real one was missed. A name belonging
+  to a module this repository defines skips the catalog; your own `[[effect]]`
+  rules still apply, since naming house abstractions is what they are for.
 
 ## `codegraph.toml`
 
@@ -256,14 +288,25 @@ are not in the same place:
   unchanged — same qualnames, same kinds, same live/shadowed bindings, same
   base classes. A body-only edit qualifies; adding, removing or renaming a
   definition does not, and falls back to a whole-revision rewrite, which cannot
-  leave a stale edge behind. Measured on django (2,930 files):
+  leave a stale edge behind.
 
-  | | before | now |
-  |---|---|---|
-  | reconcile with no changes (every query pays this) | ~86s | **0.34s** |
-  | body-only edit | ~86s | **3.7s** |
-  | edit that adds or removes a definition | ~86s | 22.9s |
-  | cold index | 83.6s | 45.1s |
+  Measured on django (2,930 files, 93k edges). Reported as a fraction of that
+  repository's own cold index, because absolute seconds are not reproducible:
+  the same commit measured 24s, 49s and 112s for a cold index on the same
+  machine on the same day, a 4.6x spread from background load alone. Ratios
+  hold across that; wall-clock does not, and an earlier version of this table
+  quoted a "before" column measured on a different day, which made a 2x load
+  difference look like a 2x regression.
+
+  | | cost, relative to a cold index |
+  |---|---|
+  | reconcile with no changes (every query pays this) | **~1/160** |
+  | body-only edit | **~1/13** |
+  | edit that adds or removes a definition | ~0.4 |
+  | cold index | 1 |
+
+  For scale, one full run of that session: cold 112s, no-change reconcile
+  0.45s, body-only edit 8.7s, definition added 45s.
 
   So the honest version: the common cases are proportional now, and the
   symbol-table-changing case is not. What remains non-proportional is effect
