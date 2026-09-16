@@ -50,7 +50,7 @@ def test_a_fully_connected_call_graph_is_one_island(repo, write):
         "implicit": 0,
         "network": 0,
         "unexplained": 1,
-        "basis": "undirected CALLS edges",
+        "basis": "undirected CALLS and INHERITS edges",
     }
     store.close()
 
@@ -145,7 +145,7 @@ def test_a_repo_with_no_python_files_reports_no_islands(repo, write):
         "implicit": 0,
         "network": 0,
         "unexplained": 0,
-        "basis": "undirected CALLS edges",
+        "basis": "undirected CALLS and INHERITS edges",
     }
     assert report.groups == []
     assert report.truncated is False
@@ -203,12 +203,13 @@ def test_module_nodes_are_never_reported_as_symbols(repo, write):
     store.close()
 
 
-def test_inherits_edges_do_not_join_an_island(repo, write):
-    """A subclass and its base are separate islands unless a call links
-    them. An island bounds what `impact` and `effects` can say about a
-    symbol, and both walk CALLS only -- folding INHERITS in would merge
-    psf/requests' 172 islands to 156, claiming boundaries are crossed by a
-    walk that cannot cross them."""
+def test_inherits_edges_join_an_island(repo, write):
+    """A subclass and its base are one island even with no call between
+    them. An island bounds what `impact` can say about a symbol, and since
+    #42 `impact` walks INHERITS: a change to `Base` reaches `Child`, so a
+    report placing them on separate islands would claim a boundary the walk
+    in fact crosses. The methods are not joined -- the edge is between the
+    classes."""
     write(
         "a.py",
         "class Base:\n    def shared(self):\n        pass\n\n\n"
@@ -216,13 +217,30 @@ def test_inherits_edges_do_not_join_an_island(repo, write):
         commit="inheritance only",
     )
     store = build(repo)
-    inherits = store.connection.execute(
+    report = islands_report(store, "HEAD")
+    assert report.summary["islands"] == 3
+    assert report.summary["singletons"] == 2
+    joined = rows(report, "islands")
+    assert len(joined) == 1
+    assert set(named_ids(joined[0])) == {"a.py::Base", "a.py::Child"}
+    store.close()
+
+
+def test_an_ambiguous_base_reference_joins_the_classes_it_could_mean(repo, write):
+    """The same for `class Sub(Widget)` with two `Widget`s: not materialized,
+    and still one island, because `impact` expands it at LOW from either."""
+    write("one.py", "class Widget:\n    pass\n", commit="1")
+    write("two.py", "class Widget:\n    pass\n", commit="2")
+    write("sub.py", "class Sub(Widget):\n    pass\n", commit="s")
+    store = build(repo)
+    stored = store.connection.execute(
         "SELECT COUNT(*) AS n FROM edges WHERE rev='HEAD' AND kind='INHERITS'"
     ).fetchone()["n"]
-    assert inherits >= 1  # the edge exists; the report must still not use it
+    assert stored == 0, "the fixture stopped exercising the unmaterialized path"
     report = islands_report(store, "HEAD")
-    assert report.summary["islands"] == 4
-    assert report.summary["singletons"] == 4
+    joined = rows(report, "islands")
+    assert len(joined) == 1
+    assert set(named_ids(joined[0])) == {"one.py::Widget", "two.py::Widget", "sub.py::Sub"}
     store.close()
 
 
@@ -418,8 +436,8 @@ def test_a_helper_in_a_test_file_is_not_excused_by_its_neighbours(repo, write):
 def test_an_override_of_an_inherited_method_is_not_reported_as_unexplained(repo, write):
     """The ABC/subclass shape: a base declares `send`, a subclass overrides
     it, and a caller holding the base type reaches the override by dispatch.
-    INHERITS still does not join the two islands (that would misreport what
-    an `impact` walk can cross); it labels them instead."""
+    INHERITS joins the two classes, not their methods, so the two `send`s
+    stay apart; the edge labels them instead."""
     write(
         "a.py",
         "class Base:\n    def send(self):\n        pass\n\n\n"

@@ -2,12 +2,20 @@
 it could break, ranked by how urgently each dependent deserves review.
 
 A reverse BFS over `edges(rev, dst)`, starting at the queried symbol and
-walking CALLS edges backward to its callers, its callers' callers, and so
-on up to `max_hops`. Each dependent is recorded the first time it is
+walking CALLS and INHERITS edges backward to its callers and subclasses,
+their callers and subclasses, and so on up to `max_hops`. Each dependent is recorded the first time it is
 reached (fewest hops), and among the edges available at that hop the
 strongest achievable path confidence wins -- the same widest-path bias
 `effects/propagate.py` uses for effect reachability, applied here to
-dependents. Duplicate edge rows for the same `(src, dst)` pair (the same
+dependents.
+
+INHERITS is walked because a subclass is affected by a change to its base
+exactly as a caller is by a change to its callee -- that is the question
+this report answers. It used to walk CALLS alone while `rank.fan_in`
+counted both kinds, so a base class with three subclasses ranked as having
+three dependents and listed none (#42).
+
+Duplicate edge rows for the same `(src, dst)` pair (the same
 call written twice in a body, or the same candidate reached through two
 import aliases) collapse to a single edge of their strongest confidence
 before the walk starts, so they can never count as two distinct hops or
@@ -63,7 +71,8 @@ def _reverse_edges(store: Store, rev: str) -> dict[str, dict[str, str]]:
     strongest confidence -- duplicate edge rows collapsed before the walk."""
     edge_confidence: dict[tuple[str, str], str] = {}
     for row in store.connection.execute(
-        "SELECT src, dst, confidence FROM edges WHERE rev=? AND kind='CALLS'", (rev,)
+        "SELECT src, dst, confidence FROM edges WHERE rev=? AND kind IN ('CALLS', 'INHERITS')",
+        (rev,),
     ):
         key = (row["src"], row["dst"])
         edge_confidence[key] = stronger(
@@ -79,17 +88,20 @@ def _reverse_edges(store: Store, rev: str) -> dict[str, dict[str, str]]:
 def _predecessors(
     reverse: dict[str, dict[str, str]], ambiguity: Ambiguity, node_id: str
 ) -> dict[str, str]:
-    """Every caller of `node_id`, materialized and derived alike, at the
-    strongest confidence any of them claims.
+    """Every caller and subclass of `node_id`, materialized and derived
+    alike, at the strongest confidence any of them claims.
 
     The derived half is the bare-name fan-out the graph deliberately does
-    not store, expanded here for this one node -- always LOW, and never
-    strengthening a materialized edge that already reaches the same caller.
+    not store, expanded here for this one node -- ambiguous calls and
+    ambiguous base references both, always LOW, and never strengthening a
+    materialized edge that already reaches the same node.
     """
-    callers = dict(reverse.get(node_id, {}))
+    predecessors = dict(reverse.get(node_id, {}))
     for src in ambiguity.callers(node_id):
-        callers.setdefault(src, LOW)
-    return callers
+        predecessors.setdefault(src, LOW)
+    for src in ambiguity.inheritors(node_id):
+        predecessors.setdefault(src, LOW)
+    return predecessors
 
 
 def _walk(
@@ -138,8 +150,9 @@ def impact_report(
     limit: int = 40,
     include_low: bool = False,
 ) -> Report:
-    """Everything reachable from `node_id` by walking CALLS edges backward,
-    ranked by `rank.score` and split into `dependents` and `tests` groups."""
+    """Everything reachable from `node_id` by walking CALLS and INHERITS
+    edges backward, ranked by `rank.score` and split into `dependents` and
+    `tests` groups."""
     connection = store.connection
     ambiguity = Ambiguity(store, rev)
     reverse = _reverse_edges(store, rev)

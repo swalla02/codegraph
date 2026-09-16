@@ -110,7 +110,7 @@ slower on a cold cache.
 | `codegraph resolve <name>` | Fuzzy-match a name (trailing name, qualname, or full node id) to node ids. |
 | `codegraph effects <symbol> [--json]` | Report every side-effect kind reachable from a symbol, each with a witness chain down to the causing `file:line`. |
 | `codegraph impact <symbol> [--hops N] [--limit N] [--all] [--json]` | Report the ranked dependents of a symbol — everything a change to it could break. |
-| `codegraph islands [--rev REV] [--limit N] [--json]` | Report the connected components of the revision's `CALLS` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
+| `codegraph islands [--rev REV] [--limit N] [--json]` | Report the connected components of the revision's `CALLS` and `INHERITS` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
 | `codegraph orphans [--rev REV] [--limit N] [--include-public] [--include-decorated] [--json]` | Find functions whose every recorded caller is a test — defined, tested, and never invoked by the code that was supposed to invoke it. Such a function is *not* a one-symbol island, precisely because its test calls it, so `islands` structurally cannot surface it. Candidates are private by name, undecorated, defined outside the test tree, and never mentioned by name anywhere in the source text — that last filter has no off switch, because a static call graph cannot see a callback handed to a library. Not a dead-code report (see below). |
 | `codegraph diff [<base>..<head>] [--json]` | Report what changed between two revisions by content hash, never by line number: symbols added/removed/changed, plus any side effect newly reachable. Defaults to `merge-base(default branch, HEAD)..WORKTREE` — "what has this branch changed so far." |
 | `codegraph gc [--keep REV]` | Prune the Layer 1 parse cache down to what `HEAD`, the worktree, and any `--keep`-named revisions still reference. Never touches the graph itself, so it can only make a future answer slower to rebuild, never wrong. |
@@ -120,12 +120,12 @@ slower on a cold cache.
 
 ### What an island is, and is not
 
-`codegraph islands` treats call edges as undirected and splits the graph
-into connected components. That the call graph is *not* connected is real
+`codegraph islands` treats call and inheritance edges as undirected and
+splits the graph into connected components. That the call graph is *not* connected is real
 structure, not a defect: a service boundary, a config-gated region, and
 code nothing references all show up as separate islands. On psf/requests
-it reports 807 symbols in 153 islands, the biggest holding 647 of them and
-149 being islands of exactly one.
+it reports 807 symbols in 137 islands, the biggest holding 657 of them and
+130 being islands of exactly one.
 
 **An island is not a reachability result, and a one-symbol island is not
 dead code.** Membership comes from the call edges the resolver recorded,
@@ -141,7 +141,7 @@ apart, and no label is ever a claim that code is dead:
 - **`implicit: dunder, decorator, test, override, nested, import`** — a
   mechanism found among the island's members by which something could reach
   it without a call site. Not proof that it runs; counter-evidence to
-  "nothing reaches this". 124 of requests' 153 islands carry at least one.
+  "nothing reaches this". 117 of requests' 137 islands carry at least one.
 - **`boundary: NETWORK`** — a path inside the island leaves the process.
   The handler lives in another repository, so the island boundary *is* the
   service boundary. That is signal, not a false positive. `NETWORK` is
@@ -149,7 +149,7 @@ apart, and no label is ever a claim that code is dead:
   the process is a structural fact, whereas coupling two functions through
   a database means reading SQL and tracking a schema, which is a different
   tool.
-- **`no implicit-invocation mechanism recognised`** — the remainder, 29
+- **`no implicit-invocation mechanism recognised`** — the remainder, 20
   islands on requests, and still a statement about the tool rather than
   about the code. Most of them are the library's own public surface
   (`get_dict`, `dict_from_cookiejar`), called by users of the package and
