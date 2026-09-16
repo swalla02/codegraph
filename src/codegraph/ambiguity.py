@@ -155,7 +155,8 @@ class Ambiguity:
         #: two runs of one query produce the same report.
         self.call_refs: dict[str, list[str]] = {n: sorted(s) for n, s in calls.items()}
         #: The same for `class X(Base)` references, kept apart because
-        #: `impact`, `effects` and `islands` all walk CALLS and only CALLS.
+        #: `effects` walks CALLS only, while `impact` and `islands` walk
+        #: INHERITS too (#42).
         self.base_refs: dict[str, list[str]] = {n: sorted(s) for n, s in bases.items()}
         # The same sets kept as sets, for membership rather than iteration.
         # `rank.fan_in` has to union these with a node's materialized callers
@@ -267,7 +268,19 @@ class Ambiguity:
         than quadratic; see the module docstring. A name whose definitions
         have all disappeared yields nothing rather than a dangling hub.
         """
-        for name, sources in self.call_refs.items():
+        yield from self._hubs(self.call_refs)
+
+    def base_hub_edges(self) -> Iterator[tuple[str, str]]:
+        """The same, for ambiguous base-class references.
+
+        Separate from `hub_edges` because the consumers differ: `islands`
+        joins a subclass to its candidate bases, `effects` does not, since
+        inheriting from a class runs none of its code.
+        """
+        yield from self._hubs(self.base_refs)
+
+    def _hubs(self, refs: dict[str, list[str]]) -> Iterator[tuple[str, str]]:
+        for name, sources in refs.items():
             targets = self.by_name.get(name)
             if not targets:
                 continue

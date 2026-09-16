@@ -256,3 +256,37 @@ def test_limit_is_a_total_budget_across_dependents_and_tests(repo, write):
     dependents_group = next(g for g in report.groups if g.title == "dependents")
     assert len(dependents_group.rows) == 15
     store.close()
+
+
+def test_a_subclass_is_a_dependent_of_its_base(repo, write):
+    """Changing a base class changes every class that inherits from it, so a
+    subclass is impact -- and so is whatever depends on the subclass. Before
+    #42 the walk followed CALLS only, while `rank.fan_in` already counted
+    the INHERITS edges: `Animal` ranked with three dependents and reported
+    none."""
+    write("base.py", "class Animal:\n    pass\n", commit="b")
+    write(
+        "pets.py",
+        "from base import Animal\n\n\nclass Dog(Animal):\n    pass\n\n\n"
+        "def adopt():\n    return Dog()\n",
+        commit="p",
+    )
+    store = build(repo)
+    report = impact_report(store, "HEAD", "base.py::Animal")
+    assert "pets.py::Dog" in group(report, "dependents")
+    assert "pets.py::adopt" in group(report, "dependents")
+    store.close()
+
+
+def test_an_ambiguous_base_reference_is_a_low_confidence_dependent(repo, write):
+    """The same for a base named by a bare name two classes answer to. It is
+    not materialized (see `ambiguity.py`), so the walk has to expand it, at
+    LOW, exactly as it expands an ambiguous call."""
+    write("one.py", "class Widget:\n    pass\n", commit="1")
+    write("two.py", "class Widget:\n    pass\n", commit="2")
+    write("sub.py", "class Sub(Widget):\n    pass\n", commit="s")
+    store = build(repo)
+    report = impact_report(store, "HEAD", "one.py::Widget")
+    assert "sub.py::Sub" in group(report, "low_confidence")
+    assert "sub.py::Sub" not in group(report, "dependents")
+    store.close()

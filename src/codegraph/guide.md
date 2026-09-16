@@ -41,8 +41,8 @@ Reach for codegraph:
    codegraph effects <id>
    ```
 
-   `impact` walks callers (and callers of callers, up to `--hops`, default
-   3) and ranks them. `effects` reports every side-effect kind reachable
+   `impact` walks callers and subclasses (and theirs in turn, up to
+   `--hops`, default 3) and ranks them. `effects` reports every side-effect kind reachable
    downstream of the symbol, each with a witness chain down to the exact
    `file:line` that causes it.
 
@@ -52,8 +52,8 @@ Reach for codegraph:
    full.
 
 `codegraph islands` answers a question the other commands cannot: the
-global shape of the graph. It splits the revision's `CALLS` edges, read as
-**undirected**, into connected components — an *island* is a set of symbols
+global shape of the graph. It splits the revision's `CALLS` and `INHERITS`
+edges, read as **undirected**, into connected components — an *island* is a set of symbols
 that share some call relationship, in either direction and however
 indirect, with each other and with nothing outside it. It takes no symbol,
 so the exit-code convention above does not apply to it: `0` for a report
@@ -193,16 +193,15 @@ the full set and how confident it is in each edge.
   — `HIGH`/`MEDIUM`/`LOW` reflects how certain the resolver is that the call
   really targets this symbol (e.g. a dynamic dispatch site is weaker
   evidence than a direct, unambiguous call).
-- `islands`' summary reads `symbols: 807 · islands: 154 · largest: 646 ·
-  singletons: 149 · implicit: 125 · network: 1 · unexplained: 29 · basis:
-  undirected CALLS edges` (the real figures for psf/requests). `symbols`
+- `islands`' summary reads `symbols: 807 · islands: 137 · largest: 657 ·
+  singletons: 130 · implicit: 117 · network: 1 · unexplained: 20 · basis:
+  undirected CALLS and INHERITS edges` (the real figures for psf/requests). `symbols`
   excludes the synthetic `path::<module>` node each file gets: those carry
   connectivity — a module-scope call is sometimes the only thing tying a
   helper to the rest of the graph — but they are not symbols anyone wrote,
-  so they are never members and never rows. `INHERITS` edges deliberately
-  do not join an island, which keeps a symbol's island exactly equal to the
-  set of nodes an unlimited-hop `impact` or `effects` walk could reach; they
-  are read only to label one. `implicit` and `network` overlap and are not
+  so they are never members and never rows. `INHERITS` edges join an
+  island because `impact` walks them, so a symbol's island always holds
+  every node an unlimited-hop `impact` or `effects` walk could reach. `implicit` and `network` overlap and are not
   meant to sum — an island can be both — while `unexplained` is exactly the
   complement of their union.
 - An `islands` row summarizes a whole component rather than listing it:

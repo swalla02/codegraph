@@ -66,16 +66,17 @@ any direction with another region. A directed notion (strongly connected
 components) would answer a different and much narrower question: almost
 every acyclic caller/callee pair would become its own component.
 
-*CALLS only -- `INHERITS` edges do not join an island.* An island is
-meant to bound what `impact` and `effects` can ever say about a symbol,
-and both of those walk CALLS and only CALLS. So a symbol's island is
-exactly the set of nodes an unlimited-hop `impact` or `effects` walk could
-ever touch, which is a property a reader can check. Folding INHERITS in
-would break that correspondence: measured on psf/requests it merges 172
-islands down to 156, so 16 boundaries would be reported as crossed by a
-walk that cannot in fact cross them. Inheritance still gets read here --
-it is what the `override` mechanism is computed from -- but it labels an
-island rather than merging two.
+*CALLS and INHERITS.* An island is meant to bound what `impact` and
+`effects` can ever say about a symbol, so a symbol's island holds every
+node an unlimited-hop walk from it could touch -- a property a reader can
+check. `impact` walks INHERITS as well as CALLS since #42 (a change to a
+base reaches its subclasses), so a subclass and its base share an island
+even with no call between them. Before that, INHERITS was deliberately
+left out, and psf/requests reported 172 islands rather than 156: 16
+boundaries that `impact` now crosses. `effects` still walks CALLS only,
+which keeps the bound true for it -- an island is never smaller than what
+either walk reaches. The edge joins classes, not their methods, so it
+also still labels an island through the `override` mechanism below.
 
 *The bare-name fan-out counts, and it is not in `edges`.* Since #25 the
 resolver does not materialize a call whose name matches more than one
@@ -104,6 +105,7 @@ attributed by component root rather than by membership.
 from __future__ import annotations
 
 from collections import Counter
+from itertools import chain
 
 from codegraph.ambiguity import Ambiguity
 from codegraph.config import Config
@@ -303,9 +305,9 @@ def _describe(
 def islands_report(
     store: Store, rev: str, config: Config | None = None, limit: int = 20
 ) -> Report:
-    """Connected components of `rev`'s CALLS edges, read as undirected, each
-    labelled with the implicit-invocation mechanisms and process boundaries
-    found inside it.
+    """Connected components of `rev`'s CALLS and INHERITS edges, read as
+    undirected, each labelled with the implicit-invocation mechanisms and
+    process boundaries found inside it.
 
     Four queries and one pass over the edges, never a query per node: on a
     2,930-file repository this walks ~395k edge rows, and a per-node
@@ -318,18 +320,16 @@ def islands_report(
     # twice in a body, or one candidate reached through two import aliases,
     # writes two rows for one relationship and would inflate the fan-in
     # that picks each island's hubs (see rank.fan_in for the same care).
-    # INHERITS is read in the SAME pass -- it never joins an island, but it
-    # is what `override` is computed from, and a second scan of 395k rows
-    # to fetch a few thousand of them would be the more expensive half.
+    # INHERITS is kept as its own set as well, because `override` is
+    # computed from it alone.
     components = _Components()
     pairs: set[tuple[str, str]] = set()
     inherits: set[tuple[str, str]] = set()
     for row in connection.execute(
         "SELECT src, dst, kind FROM edges WHERE rev=? AND kind IN ('CALLS', 'INHERITS')", (rev,)
     ):
-        if row["kind"] == "CALLS":
-            pairs.add((row["src"], row["dst"]))
-        else:
+        pairs.add((row["src"], row["dst"]))
+        if row["kind"] == "INHERITS":
             inherits.add((row["src"], row["dst"]))
     for src, dst in pairs:
         components.union(src, dst)
@@ -340,7 +340,8 @@ def islands_report(
     # a caller, and letting one stand in for its whole reference set would
     # rank a name's definitions by how ambiguous the name is rather than by
     # how much of the graph actually reaches them.
-    for src, dst in Ambiguity(store, rev).hub_edges():
+    ambiguity = Ambiguity(store, rev)
+    for src, dst in chain(ambiguity.hub_edges(), ambiguity.base_hub_edges()):
         components.union(src, dst)
 
     imported = _imported_dotted_names(store, rev)
@@ -474,7 +475,7 @@ def islands_report(
         "unexplained": unexplained_count,
         # Says what the partition was computed from, so a row is read as
         # "these share no call edge" and never as "nothing reaches this".
-        "basis": "undirected CALLS edges",
+        "basis": "undirected CALLS and INHERITS edges",
     }
 
     return Report(summary=summary, groups=groups, truncated=truncated)
