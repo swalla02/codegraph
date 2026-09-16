@@ -76,6 +76,48 @@ def is_builtin_call(ref: ParsedRef) -> bool:
     """
     return not ref.dotted and ref.raw_name in BUILTIN_NAMES
 
+
+def is_external_call(ref: ParsedRef, ctx: ResolveContext) -> bool:
+    """Is this reference a call into a module the repository does not contain?
+
+    `import pytest` then `pytest.main([...])`: the head is bound by an import,
+    and the module it names is nowhere in the tree. Nothing in this graph can
+    be the callee, because the graph never parses site-packages or the standard
+    library -- so projecting `main` onto the repository's own `main` functions
+    is not a weak answer, it is a wrong one. `bench/tracer.py:112` reported
+    three such candidates; `json.dumps(x)` with a single repo `dumps` became a
+    MEDIUM edge. See #47.
+
+    The test is deliberately stricter than "the lookup failed". The head's
+    import target is external only when its FIRST segment names no module, no
+    package and no directory anywhere in the repository (`repo_segments`):
+
+    - `import pkg` then `pkg.main()`, where `pkg` is a repo package but defines
+      no `main`, is not external. The name may be bound at runtime, and it
+      keeps the name match it always had.
+    - `from model_fields.models import build`, where the file is
+      `tests/model_fields/models.py` and a test runner put `tests/` on
+      `sys.path`, is not external either. `module_for_path` spells that module
+      `tests.model_fields.models`, so an exact module lookup would call it
+      foreign -- but a head that names any path component in the tree is not
+      provably someone else's code.
+
+    Both errors fall in the same direction: a reference this cannot classify
+    keeps today's behaviour. Only a head the repository could not possibly
+    supply is written off, which is what makes it sound to claim.
+
+    Like `is_builtin_call`, this is only consulted once every step that could
+    find a repo symbol has declined: an imported name that DOES resolve was
+    answered at step 1, and a module-local definition of the same name at step
+    2.
+    """
+    head = ref.raw_name.partition(".")[0]
+    target = ctx.import_map.get(head)
+    if not target:
+        return False
+    return target.partition(".")[0] not in ctx.repo_segments
+
+
 #: `src` for a reference made at module scope, which owns no node of its own.
 MODULE_SCOPE = "<module>"
 
@@ -159,6 +201,11 @@ class ResolveContext:
     #: hierarchy is fixed once inheritance has been resolved, but the walk runs
     #: per `self.X` reference -- on django that cost 3.5s of a 11.2s resolve.
     descendant_cache: dict[str, list[str]] = field(default_factory=dict)
+    #: Every segment of every module name in the revision: `tests`,
+    #: `model_fields` and `models` for `tests/model_fields/models.py`. A name
+    #: outside this set cannot be supplied by the repository under any
+    #: `sys.path` arrangement; see `is_external_call`.
+    repo_segments: frozenset[str] = frozenset()
 
 
 def breadth_first(start: str, adjacency: dict[str, list[str]]) -> list[str]:
@@ -434,7 +481,7 @@ class AstResolver:
 
     # -- steps 4 and 5: a repo-wide match on the last segment -------------
     def _by_last_segment(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
-        if is_builtin_call(ref):
+        if is_builtin_call(ref) or is_external_call(ref, ctx):
             return []
         candidates = ctx.name_index.get(ref.raw_name.rpartition(".")[2], ())
         if len(candidates) == 1:
@@ -512,6 +559,9 @@ class _SymbolTable:
             # Sorted paths, so a module reachable from two source roots
             # deterministically binds to the first one.
             self.module_to_path.setdefault(self.module_for[path], path)
+        self.repo_segments: frozenset[str] = frozenset(
+            segment for module in self.module_to_path for segment in module.split(".")
+        )
 
         self.qualname_index: dict[tuple[str, str], str] = {}
         self.name_index: dict[str, list[str]] = {}
@@ -572,6 +622,7 @@ class _SymbolTable:
             enclosing_class=self.enclosing_class,
             subclasses=subclasses if subclasses is not None else {},
             descendant_cache=descendant_cache if descendant_cache is not None else {},
+            repo_segments=self.repo_segments,
         )
 
 
@@ -819,6 +870,7 @@ def resolve_revision(
     unresolved_rows: list[tuple] = []
     ambiguous_rows: list[tuple] = []
     builtin_rows: list[tuple] = []
+    external_rows: list[tuple] = []
 
     # Inheritance first: `self.X` walks the class hierarchy, so the hierarchy
     # has to exist before any call is resolved.
@@ -895,6 +947,15 @@ def resolve_revision(
                 builtin_rows.append(
                     (rev, src, path, ref.line, ref.raw_name, "call", "builtin", 0)
                 )
+            elif not hits and is_external_call(ref, ctx):
+                # The same choice one boundary further out: not a repo symbol,
+                # and known not to be one, so not a gap either. Its own reason
+                # rather than 'builtin', because the two are different claims
+                # -- and 'ambiguous' is exactly what it used to be mistaken
+                # for. See `is_external_call`.
+                external_rows.append(
+                    (rev, src, path, ref.line, ref.raw_name, "call", "external", 0)
+                )
             elif not hits:
                 # Never dropped: the ref stays in `blob_refs` for effect
                 # detection, and the gap is counted as a health signal.
@@ -910,7 +971,7 @@ def resolve_revision(
     connection.executemany(
         "INSERT INTO unresolved(rev, src, path, line, raw_name, ref_kind, reason,"
         " candidates) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-        unresolved_rows + ambiguous_rows + builtin_rows,
+        unresolved_rows + ambiguous_rows + builtin_rows + external_rows,
     )
     # Counted over the whole revision, not over this pass: a narrowed rewrite
     # touches a handful of paths but `status` has to describe the whole graph.

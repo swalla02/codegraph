@@ -126,7 +126,9 @@ CREATE TABLE IF NOT EXISTS imports (
 -- 'unknown' means no candidate was found at all -- the resolver is blind to
 -- something. 'builtin' means a call the resolver understood and deliberately
 -- did not link to a repo symbol, kept out of the gap count so the real gaps
--- stay visible. 'ambiguous' is the opposite of 'unknown': the resolver saw
+-- stay visible. 'external' is the same choice one boundary further out: a call
+-- through an import of a module the repository does not contain (`pytest.main`),
+-- which no node in this graph can be. 'ambiguous' is the opposite of 'unknown': the resolver saw
 -- too much. The last-resort step matches a bare name against every live
 -- definition in the revision, and when more than one answers, that fan-out is
 -- recorded HERE, once, instead of as N low-confidence edges.

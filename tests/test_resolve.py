@@ -326,7 +326,10 @@ def test_resolve_is_case_consistent_not_disjoint_across_query_case(repo, write, 
 
 
 def test_status_reports_the_unresolved_count(repo, write, capsys):
-    write("m.py", "import requests\n\n\ndef fetch():\n    requests.get('u')\n", commit="m")
+    # A call nothing can answer. This used to be `requests.get`, which is no
+    # longer a gap: it is a call into a module the repository does not contain,
+    # recorded as 'external' and kept out of this count like a builtin (#47).
+    write("m.py", "def fetch(client):\n    client.frobnicate('u')\n", commit="m")
     assert main(["status", "--path", str(repo), "--rev", "HEAD"]) == 0
     assert "unresolved: 1" in capsys.readouterr().out
 
@@ -1150,4 +1153,90 @@ def test_from_package_import_name_also_follows_the_reexport(repo, write):
     store, indexer = build(repo)
     indexer.reconcile("HEAD")
     assert ("use.py::go", "pkg/app.py::Thing", "HIGH") in edges(store)
+    store.close()
+
+
+# -- the external boundary ---------------------------------------------------
+#
+# `import pytest` names a module this repository does not contain. A call on it
+# still reached the last-resort name match, which projected `pytest.main` onto
+# every repo function called `main`: `bench/tracer.py:112` reported three
+# candidates, none of them right. See #47.
+
+
+def repo_calling_an_external_module(write, call="pytest.main([])", header="import pytest"):
+    write("cli.py", "def main():\n    pass\n")
+    write("bench.py", "def main():\n    pass\n")
+    write("run.py", f"{header}\n\n\ndef go():\n    {call}\n", commit="external")
+
+
+def test_a_call_on_an_external_module_is_not_projected_onto_repo_symbols(repo, write):
+    repo_calling_an_external_module(write)
+    store, indexer = build(repo)
+    stats = indexer.reconcile("HEAD")
+    assert not [dst for src, dst, _ in edges(store) if src == "run.py::go"]
+    rows = [row for row in unresolved_rows(store) if row["path"] == "run.py"]
+    assert [(row["raw_name"], row["reason"], row["candidates"]) for row in rows] == [
+        ("pytest.main", "external", 0)
+    ]
+    # Understood and deliberately unlinked: neither a fan-out nor a gap.
+    assert stats.ambiguous == 0
+    assert stats.unresolved == 0
+    store.close()
+
+
+def test_an_external_call_with_one_same_named_repo_symbol_gets_no_edge(repo, write):
+    """The single-candidate case was the worse half: one repo `dumps` turned
+    `json.dumps(x)` into a MEDIUM edge -- confidently wrong, not a LOW guess."""
+    write("codec.py", "def dumps(value):\n    return value\n")
+    write("use.py", "import json\n\n\ndef go(x):\n    return json.dumps(x)\n", commit="json")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert not [dst for src, dst, _ in edges(store) if src == "use.py::go"]
+    reasons = {row["reason"] for row in unresolved_rows(store) if row["path"] == "use.py"}
+    assert reasons == {"external"}
+    store.close()
+
+
+def test_a_name_imported_from_an_external_module_is_external_too(repo, write):
+    repo_calling_an_external_module(
+        write, call="run_tests()", header="from pytest import main as run_tests"
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    rows = [row for row in unresolved_rows(store) if row["path"] == "run.py"]
+    assert [(row["raw_name"], row["reason"]) for row in rows] == [("run_tests", "external")]
+    store.close()
+
+
+def test_a_missing_attribute_of_a_repo_module_is_not_external(repo, write):
+    """The boundary is the repository, not "the lookup failed". `pkg` is a repo
+    package, so a `pkg.main` the index cannot find may still be bound at
+    runtime; it keeps the name match it had rather than being written off."""
+    write("pkg/__init__.py", "")
+    write("cli.py", "def main():\n    pass\n")
+    write("run.py", "import pkg\n\n\ndef go():\n    pkg.main()\n", commit="internal")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("run.py::go", "cli.py::main", "MEDIUM") in edges(store)
+    store.close()
+
+
+def test_a_module_reached_through_sys_path_is_not_external(repo, write):
+    """django's test runner puts `tests/` on `sys.path`, so its test apps import
+    each other as `from model_fields.models import Foo` -- a top-level name that
+    `module_for_path` spells `tests.model_fields.models`. A head that names ANY
+    directory or file in the repository is not provably someone else's code,
+    so it keeps falling through exactly as before."""
+    write("tests/model_fields/__init__.py", "")
+    write("tests/model_fields/models.py", "def build():\n    pass\n")
+    write(
+        "tests/other/use.py",
+        "import model_fields.models\n\n\ndef go():\n    model_fields.models.build()\n",
+        commit="syspath",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = {dst for src, dst, _ in edges(store) if src == "tests/other/use.py::go"}
+    assert found == {"tests/model_fields/models.py::build"}
     store.close()
