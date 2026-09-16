@@ -290,9 +290,16 @@ class Ambiguity:
             for target in targets:
                 yield (hub, target)
 
-    def call_sites(self) -> int:
-        """How many distinct (source, name) call relationships are deferred."""
-        return sum(len(sources) for sources in self.call_refs.values())
+    def relationships(self) -> int:
+        """How many distinct (source, name) relationships are deferred --
+        ambiguous calls and ambiguous base classes together, since `impact`
+        walks both. A source that both calls and subclasses one name is one
+        relationship, not two."""
+        names = self._call_sets.keys() | self._base_sets.keys()
+        return sum(
+            len(self._call_sets.get(n, frozenset()) | self._base_sets.get(n, frozenset()))
+            for n in names
+        )
 
 
 __all__ = ["HUB_PREFIX", "Ambiguity", "hub_id", "is_hub", "last_segment"]

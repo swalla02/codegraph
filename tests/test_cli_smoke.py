@@ -88,3 +88,38 @@ def test_impact_rejects_negative_hops(repo, write, capsys):
     assert main(["impact", "m.py::target", "--path", str(repo), "--hops", "-1"]) == 1
     err = capsys.readouterr().err
     assert "--hops" in err
+
+
+# -- #46: the summary reports the deferred fan-out at both of its sizes. The
+# `ambiguous:` count is reference SITES, one row per occurrence in the source;
+# the line under it is the distinct (source, name) relationships those sites
+# amount to -- calls and base classes both, repeats collapsed -- which is the
+# unit `impact` ranks by. On django the two differ by a third, so the second
+# is not derivable from the first by a reader.
+
+
+def test_index_summary_collapses_repeated_ambiguous_calls(repo, write, capsys):
+    write("a.py", "class One:\n    def save(self):\n        return 1\n")
+    write("b.py", "class Two:\n    def save(self):\n        return 2\n")
+    write("c.py", "def caller(item):\n    item.save()\n    item.save()\n", commit="ambiguous")
+    assert main(["index", "--path", str(repo)]) == 0
+    out = capsys.readouterr().out
+    assert "ambiguous: 2 bare-name reference(s)" in out
+    assert "1 distinct (source, name) relationship(s)" in out
+
+
+def test_index_summary_counts_an_ambiguous_base_as_a_relationship(repo, write, capsys):
+    write("a.py", "class Widget:\n    def save(self):\n        return 1\n")
+    write("pkg/b.py", "class Widget:\n    def save(self):\n        return 2\n")
+    write(
+        "c.py",
+        "def caller(item):\n    item.save()\n\n\nclass Sub(Widget):\n    pass\n",
+        commit="ambiguous",
+    )
+    assert main(["index", "--path", str(repo)]) == 0
+    out = capsys.readouterr().out
+    # One call and one `class Sub(Widget)` base, both ambiguous. Since #42
+    # `impact` lists `Sub` as a dependent of either `Widget`, so the base is a
+    # relationship the report ranks, exactly as the call is.
+    assert "ambiguous: 2 bare-name reference(s)" in out
+    assert "2 distinct (source, name) relationship(s)" in out

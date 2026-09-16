@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from codegraph import __version__, gitio
+from codegraph.ambiguity import Ambiguity
 from codegraph.guide import guide_text
 from codegraph.indexer import FsTreeSource, GitTreeSource, Indexer
 from codegraph.init import SKIPPED, plan_init
@@ -30,7 +31,7 @@ def open_workspace(root: Path) -> tuple[Store, Indexer]:
     return store, Indexer(root, store, source)
 
 
-def _print_stats(stats) -> None:
+def _print_stats(stats, store: Store, rev: str) -> None:
     print(f"paths: {stats.paths_total} ({stats.paths_dirty} dirty)")
     print(f"blobs: {stats.blobs_parsed} parsed, {stats.blobs_cached} cached")
     print(f"edges: {stats.edges}, unresolved: {stats.unresolved}")
@@ -38,6 +39,24 @@ def _print_stats(stats) -> None:
         print(
             f"ambiguous: {stats.ambiguous} bare-name reference(s), expanded at query time"
             " (see `impact --all`)"
+        )
+        # Two numbers, because the deferred fan-out has two sizes and they
+        # diverge: django 54519 vs 37047, flask 787 vs 569.
+        #
+        # `stats.ambiguous` counts rows in `unresolved` -- one per reference
+        # SITE. A function calling `item.save()` three times contributes three.
+        #
+        # `relationships` counts distinct (source, name) pairs instead, calls
+        # and `class X(Base)` bases together, repeats collapsed. That is the
+        # unit `rank.fan_in` adds to a node's dependents, and since #42 `impact`
+        # walks both kinds, so it is the unit `impact` ranks by.
+        #
+        # Cost is one `Ambiguity` build, ~0.8s on django against an index run of
+        # minutes, and only when this summary prints at all -- `index --quiet`,
+        # the warming-hook path, returns before here.
+        print(
+            f"           {Ambiguity(store, rev).relationships()} distinct (source, name)"
+            " relationship(s) -- what `impact` ranks by"
         )
     if stats.parse_errors:
         print(f"parse errors: {stats.parse_errors}")
@@ -54,7 +73,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
         except gitio.GitError:
             print(f"revision not found: {args.rev}", file=sys.stderr)
             return 1
-        _print_stats(stats)
+        _print_stats(stats, store, args.rev)
     finally:
         store.close()
     return 0
@@ -91,7 +110,7 @@ def _cmd_index(args: argparse.Namespace) -> int:
             if stats.parse_errors:
                 print(f"parse errors: {stats.parse_errors}", file=sys.stderr)
         else:
-            _print_stats(stats)
+            _print_stats(stats, store, args.rev)
     finally:
         store.close()
     return 0
