@@ -542,9 +542,7 @@ class _Collector(ast.NodeVisitor):
         """The scope a name bound here belongs to, spelled as refs spell it."""
         return self._current_owner.removesuffix(".<locals>")
 
-    def _add_binding(
-        self, scope: str, name: str, kind: str, type_: str | None, line: int
-    ) -> None:
+    def _add_binding(self, scope: str, name: str, kind: str, type_: str | None, line: int) -> None:
         self.raw_bindings.append((scope, name, kind, type_, line, self._binding_scope))
 
     def _record_parameters(self, args: ast.arguments, scope: str, skip_first: bool) -> None:
