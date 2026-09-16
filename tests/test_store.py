@@ -25,6 +25,7 @@ def test_expected_tables_exist(tmp_path):
         "blob_nodes",
         "blob_refs",
         "blob_imports",
+        "blob_bindings",
         "revisions",
         "tree",
         "nodes",

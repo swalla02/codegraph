@@ -483,6 +483,14 @@ class Indexer:
                 " name, alias) VALUES(?,?,?,?,?,?)",
                 [(sha, i.ordinal, i.module, i.level, i.name, i.alias) for i in result.imports],
             )
+            connection.executemany(
+                "INSERT OR REPLACE INTO blob_bindings(blob_sha, ordinal, scope, name, kind,"
+                " type, line) VALUES(?,?,?,?,?,?,?)",
+                [
+                    (sha, b.ordinal, b.scope, b.name, b.kind, b.type, b.line)
+                    for b in result.bindings
+                ],
+            )
 
         return len(missing), len(shas) - len(missing)
 

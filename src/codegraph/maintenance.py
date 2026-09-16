@@ -98,6 +98,9 @@ def gc(store: Store, keep_revs: set[str]) -> int:
             connection.execute(
                 f"DELETE FROM blob_imports WHERE blob_sha IN ({placeholders})", params
             )
+            connection.execute(
+                f"DELETE FROM blob_bindings WHERE blob_sha IN ({placeholders})", params
+            )
             connection.execute(f"DELETE FROM blobs WHERE blob_sha IN ({placeholders})", params)
 
     return len(remove_shas)

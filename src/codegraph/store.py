@@ -61,6 +61,22 @@ CREATE TABLE IF NOT EXISTS blob_imports (
     alias TEXT,
     PRIMARY KEY (blob_sha, ordinal)
 );
+-- How each name in each scope was bound, as the text states it: declared with
+-- an annotation, assigned from a call, or bound by something no type can be
+-- read off ('opaque', `type` NULL). `scope` is spelled like
+-- `blob_refs.from_qualname`; an instance attribute is `self.x` under its class.
+-- Read by the resolver's receiver step to answer `catalog.fingerprint()` from
+-- `catalog: Catalog` (#47). See `parse.ParsedBinding`.
+CREATE TABLE IF NOT EXISTS blob_bindings (
+    blob_sha TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    scope TEXT NOT NULL,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    type TEXT,
+    line INTEGER NOT NULL,
+    PRIMARY KEY (blob_sha, ordinal)
+);
 
 -- Layer 2: materialized per revision, evictable.
 -- `fingerprint` pins everything OUTSIDE the tree that the materialized graph
