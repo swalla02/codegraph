@@ -207,7 +207,7 @@ def _value_types(node: ast.expr, target: str) -> list[tuple[str, str]] | None:
     return _union(*(_value_types(operand, target) for operand in operands))
 
 
-def _enclosing_function_scopes(scope: str) -> list[str]:
+def enclosing_function_scopes(scope: str) -> list[str]:
     """`f.<locals>.g.<locals>.h` -> [`f.<locals>.g`, `f`]: the function scopes
     a name in `scope` can close over, nearest first. Class scopes are not among
     them, exactly as in Python, where a method cannot see its class body's
@@ -744,7 +744,7 @@ class _Collector(ast.NodeVisitor):
     def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
         self._record_global(node, node.names)
         self._record_outer_rebinding(
-            node, node.names, _enclosing_function_scopes(self._binding_scope)
+            node, node.names, enclosing_function_scopes(self._binding_scope)
         )
 
     def _record_outer_rebinding(self, node: ast.AST, names: list[str], scopes: list[str]) -> None:
