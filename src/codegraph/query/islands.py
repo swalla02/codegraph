@@ -22,12 +22,12 @@ identically; two of the three are things this report can now say.
 
 *It is invoked by a mechanism that is not a call site.* Each island is
 tagged with every such mechanism codegraph recognises among its members
-(`_MECHANISMS` below): a dunder, a decorator, a test-runner entry point,
-an override of an inherited method, a nested definition its enclosing
-scope can pass around as a value, or an import naming it. None of these
-is a proof that the symbol runs. Each is counter-evidence to "nothing
-reaches this", which is the reading a bare island count invites and the
-one that gets code deleted.
+(`_MECHANISMS` below): a module's top level reaching it, a dunder, a
+decorator, a test-runner entry point, an override of an inherited method, a
+nested definition its enclosing scope can pass around as a value, or an
+import naming it. None of these is a proof that the symbol runs. Each is
+counter-evidence to "nothing reaches this", which is the reading a bare
+island count invites and the one that gets code deleted.
 
 *The path leaves the process.* An island holding a `NETWORK` effect is a
 boundary: the call graph provably ends there because the next hop is a
@@ -44,19 +44,32 @@ but is not itself a boundary and never makes an island `explained`.
 *Nothing codegraph recognises reaches it.* The remainder, counted as
 `unexplained`. That is the strongest claim available and it is still a
 statement about this tool: no resolved call, and no implicit-invocation
-mechanism from the list above. On psf/requests the 29 islands left in
+mechanism from the list above. On psf/requests the 17 islands left in
 this bucket are almost all a library's public surface -- `get_dict`,
 `list_domains`, `dict_from_cookiejar` -- called by users of the package
 and by stdlib `cookiejar`, neither of which is in the tree. Reading the
 bucket as dead code would be wrong in exactly that case.
 
-Measured on psf/requests: 807 symbols, 154 islands, largest 646, 149
-singletons; 125 islands carry at least one recognised mechanism, 1 holds a
-`NETWORK` boundary, 29 are unexplained. Before the constructor edge
-(`resolve.with_constructors`, the plain bug #27 names) the same repository
-reported 172 islands with a largest of 628 and 167 singletons: linking
-`Cls()` to the `__init__` it runs folded 18 islands into the rest of the
-graph.
+It is also the bucket that has to earn the report's keep, and #45 is what
+happens when it does not: on codegraph's own source it held six singletons
+and every one of them was live code -- three Protocols, a class handed to
+sqlite, a method reached through a dispatch table, and a `main` under a
+`__main__` guard. The answer was to make the graph carry the relationships
+that were already there (`REFERENCES` and `IMPLEMENTS` in `resolve.py`,
+and the `entry` mechanism below), not to add more ways of excusing an
+island. That took this repository from 7 unexplained islands to 1, with no
+unexplained singleton left, and psf/requests from 20 to 17.
+
+Measured on psf/requests: 807 symbols, 132 islands, largest 665, 127
+singletons; 115 islands carry at least one recognised mechanism, 1 holds a
+`NETWORK` boundary, 17 are unexplained. Two earlier states of the same
+repository, for scale: before the constructor edge
+(`resolve.with_constructors`, the plain bug #27 names) it reported 172
+islands with a largest of 628 and 167 singletons, and before #45 it
+reported 143 islands with 136 singletons -- linking `Cls()` to the
+`__init__` it runs folded 18 islands into the rest of the graph, and
+recording mentions and Protocol implementations folded another 11, for 118
+further edges (7.6%).
 
 ## Three deliberate calls about membership, each of which moves the numbers
 
@@ -66,17 +79,17 @@ any direction with another region. A directed notion (strongly connected
 components) would answer a different and much narrower question: almost
 every acyclic caller/callee pair would become its own component.
 
-*CALLS and INHERITS.* An island is meant to bound what `impact` and
-`effects` can ever say about a symbol, so a symbol's island holds every
+*Every kind `impact` walks.* An island is meant to bound what `impact`
+and `effects` can ever say about a symbol, so a symbol's island holds every
 node an unlimited-hop walk from it could touch -- a property a reader can
-check. `impact` walks INHERITS as well as CALLS since #42 (a change to a
-base reaches its subclasses), so a subclass and its base share an island
-even with no call between them. Before that, INHERITS was deliberately
-left out, and psf/requests reported 172 islands rather than 156: 16
-boundaries that `impact` now crosses. `effects` still walks CALLS only,
-which keeps the bound true for it -- an island is never smaller than what
-either walk reaches. The edge joins classes, not their methods, so it
-also still labels an island through the `override` mechanism below.
+check. That is why the partition is computed from `resolve.DEPENDENCY_KINDS`
+rather than from a list of its own: CALLS, INHERITS since #42 (a change to a
+base reaches its subclasses), and IMPLEMENTS and REFERENCES since #45. Before
+INHERITS, psf/requests reported 172 islands rather than 156: 16 boundaries
+that `impact` now crosses. `effects` still walks CALLS only, which keeps the
+bound true for it -- an island is never smaller than what either walk
+reaches. INHERITS and IMPLEMENTS join classes, not their methods, so an
+island of methods is still labelled through the `override` mechanism below.
 
 *The bare-name fan-out counts, and it is not in `edges`.* Since #25 the
 resolver does not materialize a call whose name matches more than one
@@ -99,7 +112,10 @@ wrote, and counting one per file would invent 32 further islands on
 requests out of files whose top level simply calls nothing. So module
 nodes carry connectivity and are excluded from `symbols`, from island
 sizes, and from the rows. They can still carry an effect, so a boundary is
-attributed by component root rather than by membership.
+attributed by component root rather than by membership -- and their
+presence in a component is itself the `entry` mechanism below, which is
+what a function reached only from its own file's `__main__` guard has
+instead of a caller.
 """
 
 from __future__ import annotations
@@ -110,7 +126,7 @@ from itertools import chain
 from codegraph.ambiguity import Ambiguity
 from codegraph.config import Config
 from codegraph.render import Group, Report, Row, budget
-from codegraph.resolve import module_for_path
+from codegraph.resolve import DEPENDENCY_KINDS, IMPLEMENTS, INHERITS, module_for_path
 from codegraph.store import Store
 
 #: How many of an island's members a single row names: the row's `id` is
@@ -129,13 +145,14 @@ _HUBS_PER_ROW = 3
 #: unreferenced costs the reader one line of output. So each test below is
 #: deliberately permissive, and a mechanism is claimed on the island as a
 #: whole as soon as ONE member matches.
+ENTRY = "entry"  # a module's top level calls into it: import-time, or `__main__`
 DUNDER = "dunder"  # `del d[k]` runs `__delitem__`; `Cls()` runs `__init__`
 DECORATOR = "decorator"  # ran at definition time; may register/wrap/replace
 TEST = "test"  # matches pytest's default collection convention
-OVERRIDE = "override"  # same name declared on a class linked by INHERITS
+OVERRIDE = "override"  # same name on both ends of an INHERITS/IMPLEMENTS link
 NESTED = "nested"  # defined inside a function that can pass it as a value
 IMPORT = "import"  # its dotted name is imported somewhere in this revision
-_MECHANISMS = (DUNDER, DECORATOR, TEST, OVERRIDE, NESTED, IMPORT)
+_MECHANISMS = (ENTRY, DUNDER, DECORATOR, TEST, OVERRIDE, NESTED, IMPORT)
 
 #: The effect kinds a row reports, in display order. `NETWORK` is the only
 #: one that marks a boundary or makes an island explained; `ENV_READ` is
@@ -281,7 +298,11 @@ def _describe(
     hub names the caller appends last, because they are the longest and
     least structured part.
     """
-    if size == 1:
+    if size == 1 and ENTRY in mechanisms:
+        # One member, but not nothing: a module's top level reaches it. The
+        # row has to say so, because the sentence below would be false.
+        detail = "size 1, reached only from its module's top level"
+    elif size == 1:
         # Deliberately phrased as a statement about the recorded edges, not
         # about the symbol: "nothing calls it" is a claim this graph cannot
         # make (see the module docstring).
@@ -324,13 +345,19 @@ def islands_report(
     # computed from it alone.
     components = _Components()
     pairs: set[tuple[str, str]] = set()
-    inherits: set[tuple[str, str]] = set()
+    # The class-to-class links the `override` pass reads: a base and its
+    # subclass, and a Protocol and the class that satisfies it. Both mean the
+    # same thing for a method declared on each end -- one declaration is what
+    # the caller names and the other is what runs.
+    class_links: set[tuple[str, str]] = set()
+    marks = ",".join("?" * len(DEPENDENCY_KINDS))
     for row in connection.execute(
-        "SELECT src, dst, kind FROM edges WHERE rev=? AND kind IN ('CALLS', 'INHERITS')", (rev,)
+        f"SELECT src, dst, kind FROM edges WHERE rev=? AND kind IN ({marks})",
+        (rev, *DEPENDENCY_KINDS),
     ):
         pairs.add((row["src"], row["dst"]))
-        if row["kind"] == "INHERITS":
-            inherits.add((row["src"], row["dst"]))
+        if row["kind"] in (INHERITS, IMPLEMENTS):
+            class_links.add((row["src"], row["dst"]))
     for src, dst in pairs:
         components.union(src, dst)
     fan_in = Counter(dst for _, dst in pairs)
@@ -354,10 +381,12 @@ def islands_report(
     # already reading every qualname it needs.
     methods: dict[str, dict[str, str]] = {}
     module_names: dict[str, str] = {}
+    module_nodes: list[str] = []
     for row in connection.execute(
         "SELECT id, path, qualname, kind, line_start, decorators FROM nodes WHERE rev=?", (rev,)
     ):
         if row["kind"] == "module":
+            module_nodes.append(row["id"])
             continue
         node_id, path, qualname = row["id"], row["path"], row["qualname"]
         members[node_id] = (path, row["line_start"])
@@ -381,12 +410,28 @@ def islands_report(
         if dot:
             methods.setdefault(f"{path}::{owner}", {})[leaf] = node_id
 
-    # A method declared on both ends of an INHERITS edge is reached by
-    # dispatch through the other declaration -- the ABC/subclass shape #27
-    # names. Driven from the edges rather than from the nodes so it costs
-    # one dict intersection per inheritance link, not a hierarchy walk per
-    # method.
-    for subclass, base in inherits:
+    # A module node in a component is a statement at a file's top level
+    # reaching into it -- `app = create_app()`, a registration call, or the
+    # `main()` inside a `__main__` guard. It is not a member (see the module
+    # docstring), which is exactly why the island it connects to needed a
+    # label: `bench/tracer.py::main` in this repository was reported as a
+    # singleton with nothing recognised reaching it, when the edge from its
+    # own module node was sitting in the graph the whole time. The claim is
+    # the strongest in the list -- it is a resolved call, not an inference
+    # from a name -- and it is still not proof the code runs: whether anything
+    # executes that file is a question about how the program is started.
+    for node_id in module_nodes:
+        root = components.find(node_id)
+        if root in grouped:
+            mechanisms.setdefault(root, set()).add(ENTRY)
+
+    # A method declared on both ends of an INHERITS or IMPLEMENTS edge is
+    # reached by dispatch through the other declaration -- the ABC/subclass
+    # shape #27 names, and the Protocol/implementer shape #45 adds, which is
+    # the same shape with the link established structurally rather than
+    # nominally. Driven from the edges rather than from the nodes so it costs
+    # one dict intersection per link, not a hierarchy walk per method.
+    for subclass, base in class_links:
         shared = methods.get(subclass, {}).keys() & methods.get(base, {}).keys()
         for leaf in shared:
             for class_id in (subclass, base):
@@ -475,7 +520,7 @@ def islands_report(
         "unexplained": unexplained_count,
         # Says what the partition was computed from, so a row is read as
         # "these share no call edge" and never as "nothing reaches this".
-        "basis": "undirected CALLS and INHERITS edges",
+        "basis": f"undirected {', '.join(DEPENDENCY_KINDS)} edges",
     }
 
     return Report(summary=summary, groups=groups, truncated=truncated)

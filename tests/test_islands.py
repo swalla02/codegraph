@@ -50,7 +50,7 @@ def test_a_fully_connected_call_graph_is_one_island(repo, write):
         "implicit": 0,
         "network": 0,
         "unexplained": 1,
-        "basis": "undirected CALLS and INHERITS edges",
+        "basis": "undirected CALLS, INHERITS, IMPLEMENTS, REFERENCES edges",
     }
     store.close()
 
@@ -145,7 +145,7 @@ def test_a_repo_with_no_python_files_reports_no_islands(repo, write):
         "implicit": 0,
         "network": 0,
         "unexplained": 0,
-        "basis": "undirected CALLS and INHERITS edges",
+        "basis": "undirected CALLS, INHERITS, IMPLEMENTS, REFERENCES edges",
     }
     assert report.groups == []
     assert report.truncated is False
@@ -554,4 +554,98 @@ def test_a_constructor_call_removes_the_island_the_missing_edge_created(repo, wr
     assert report.summary["islands"] == 1
     assert report.summary["largest"] == 3
     assert report.summary["singletons"] == 0
+    store.close()
+
+
+# #45: the unexplained bucket is the one output a reader is told to act on,
+# and on this repository's own source all six symbols in it were live code.
+# The three shapes below are what they were.
+
+
+def test_a_script_entry_point_is_explained_by_its_module_top_level(repo, write):
+    """`bench/tracer.py::main`, whose only caller is the `__main__` guard at
+    the foot of its own file. The edge was always there -- it is the
+    `path::<module>` node that owns it -- but module nodes carry connectivity
+    without being members, so `main` was reported as an island of one with
+    nothing recognised reaching it. That is a reporting artifact, not a
+    missing edge, and the row said something untrue: there IS a resolved call
+    in one direction."""
+    write("a.py", "")
+    write(
+        "tracer.py",
+        'def main():\n    return 0\n\n\nif __name__ == "__main__":\n    main()\n',
+        commit="entry point",
+    )
+    store = build(repo)
+    report = islands_report(store, "HEAD")
+    assert report.summary["unexplained"] == 0
+    detail = detail_for(report, "tracer.py::main")
+    assert "reached only from its module's top level" in detail
+    assert "implicit: entry" in detail
+    store.close()
+
+
+def test_a_protocol_joins_the_island_of_the_classes_that_satisfy_it(repo, write):
+    """A `typing.Protocol` is never instantiated, never called and -- being
+    satisfied structurally -- never subclassed either, so it was an island of
+    one in every repository that defines one. It is not apart from anything:
+    it is the declaration the implementers are written against, and the
+    IMPLEMENTS edge says so."""
+    write(
+        "source.py",
+        "from typing import Protocol\n\n\n"
+        "class TreeSource(Protocol):\n"
+        "    def tree(self, rev): ...\n\n"
+        "    def read(self, shas): ...\n\n\n"
+        "class GitTreeSource:\n"
+        "    def tree(self, rev):\n        return {}\n\n"
+        "    def read(self, shas):\n        return []\n",
+        commit="protocol",
+    )
+    store = build(repo)
+    report = islands_report(store, "HEAD")
+    listed = [set(named_ids(row)) for row in rows(report, "islands")]
+    assert any({"source.py::TreeSource", "source.py::GitTreeSource"} <= names for names in listed)
+    store.close()
+
+
+def test_a_function_nothing_reaches_is_still_unexplained(repo, write):
+    """The control, and the point of the whole change: the three mechanisms
+    added in #45 must explain the symbols they are about and nothing else.
+
+    The fixture holds one of each -- a class handed to a library, a method
+    reached through a dispatch table, a Protocol its implementer never names,
+    and a `__main__` guard -- plus `forgotten`, which really is dead. Every
+    other symbol is explained; `forgotten` must still be reported, with the
+    bucket's strongest negative claim on it. #45's own control
+    (`Ambiguity.call_sites`) was fixed by #49, so without this the change
+    would be measured only by the number it was asked to reduce.
+    """
+    write("a.py", "")
+    write(
+        "app.py",
+        "from typing import Protocol\n\n\n"
+        "class Row:\n"
+        "    def __init__(self, data):\n        self.data = data\n\n\n"
+        "class Sink(Protocol):\n"
+        "    def write(self, row): ...\n\n\n"
+        "class FileSink:\n"
+        "    def write(self, row):\n        return row\n\n\n"
+        "class Loader:\n"
+        "    def __init__(self, sink: Sink):\n        self.sink = sink\n\n"
+        "    def load(self, connection):\n"
+        "        connection.row_factory = Row\n"
+        "        for step in (self._check,):\n"
+        "            step(connection)\n"
+        "        return self.sink.write(None)\n\n"
+        "    def _check(self, connection):\n        return connection\n\n\n"
+        "def forgotten(value):\n    return value + 1\n\n\n"
+        "def main():\n    return Loader(FileSink()).load(None)\n\n\n"
+        'if __name__ == "__main__":\n    main()\n',
+        commit="fixture",
+    )
+    store = build(repo)
+    report = islands_report(store, "HEAD")
+    assert report.summary["unexplained"] == 1
+    assert "no implicit-invocation mechanism recognised" in detail_for(report, "app.py::forgotten")
     store.close()
