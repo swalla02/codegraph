@@ -57,8 +57,9 @@ Reach for codegraph:
    full.
 
 `codegraph islands` answers a question the other commands cannot: the
-global shape of the graph. It splits the revision's `CALLS` and `INHERITS`
-edges, read as **undirected**, into connected components — an *island* is a set of symbols
+global shape of the graph. It splits the revision's `CALLS`, `INHERITS`,
+`IMPLEMENTS` and `REFERENCES` edges — every kind `impact` walks —
+read as **undirected**, into connected components — an *island* is a set of symbols
 that share some call relationship, in either direction and however
 indirect, with each other and with nothing outside it. It takes no symbol,
 so the exit-code convention above does not apply to it: `0` for a report
@@ -77,18 +78,20 @@ shares no call edge with that one", never as "nothing uses this".
 Every island is therefore labelled with what codegraph can say about why it
 stands apart, and each row carries the label:
 
-- `implicit: dunder, decorator, test, override, nested, import` — one or
-  more mechanisms found among the island's members by which something could
-  reach it without a call site. Not a proof that the code runs; **it is
+- `implicit: entry, dunder, decorator, test, override, nested, import` —
+  one or more mechanisms found among the island's members by which something
+  could reach it without a call site. Not a proof that the code runs; **it is
   counter-evidence to "nothing reaches this"**, which is the reading that
-  gets working code deleted.
+  gets working code deleted. `entry` means a module's top level calls into
+  the island — an import-time statement, or the `main()` under an
+  `if __name__ == "__main__"` guard.
 - `boundary: NETWORK` — a path inside the island leaves the process. The
   handler is in another repository, so the island boundary *is* the service
   boundary: this is signal, not a defect. `ENV_READ` is printed alongside as
   a legend ("this region is lit up by a variable") but is not a boundary.
 - `no implicit-invocation mechanism recognised` — the honest remainder, and
   still a statement about the tool: no resolved call, and no mechanism from
-  a list codegraph knows to be incomplete. On psf/requests these 29 islands
+  a list codegraph knows to be incomplete. On psf/requests these 17 islands
   are mostly the library's public surface (`get_dict`, `dict_from_cookiejar`)
   — called by users of the package and by the stdlib, neither of which is in
   the tree. **Do not read this bucket as dead code.**
@@ -200,14 +203,16 @@ the full set and how confident it is in each edge.
   — `HIGH`/`MEDIUM`/`LOW` reflects how certain the resolver is that the call
   really targets this symbol (e.g. a dynamic dispatch site is weaker
   evidence than a direct, unambiguous call).
-- `islands`' summary reads `symbols: 807 · islands: 137 · largest: 657 ·
-  singletons: 130 · implicit: 117 · network: 1 · unexplained: 20 · basis:
-  undirected CALLS and INHERITS edges` (the real figures for psf/requests). `symbols`
+- `islands`' summary reads `symbols: 807 · islands: 132 · largest: 665 ·
+  singletons: 127 · implicit: 115 · network: 1 · unexplained: 17 · basis:
+  undirected CALLS, INHERITS, IMPLEMENTS, REFERENCES edges` (the real figures
+  for psf/requests). `symbols`
   excludes the synthetic `path::<module>` node each file gets: those carry
   connectivity — a module-scope call is sometimes the only thing tying a
   helper to the rest of the graph — but they are not symbols anyone wrote,
-  so they are never members and never rows. `INHERITS` edges join an
-  island because `impact` walks them, so a symbol's island always holds
+  so they are never members and never rows (a module node in a component is
+  instead reported as the `entry` mechanism). The partition is computed from
+  every edge kind `impact` walks, so a symbol's island always holds
   every node an unlimited-hop `impact` or `effects` walk could reach. `implicit` and `network` overlap and are not
   meant to sum — an island can be both — while `unexplained` is exactly the
   complement of their union.
@@ -215,10 +220,12 @@ the full set and how confident it is in each edge.
   its `id` and `location` are the island's most-called member, and
   `detail` reads `size N across M files; <classification>; also <two more
   members>`. Islands of exactly one are collected into a single
-  `singletons` group — one group of 149 rows on psf/requests, not 149
+  `singletons` group — one group of 127 rows on psf/requests, not 127
   groups of one — and each such row's `detail` opens `size 1, no resolved
   call in either direction`, which is a statement about the recorded edges
-  and not about the symbol. `--limit N` (default 20) is a total budget
+  and not about the symbol (or `size 1, reached only from its module's top
+  level`, when the one thing reaching it is an import-time statement or a
+  `__main__` guard). `--limit N` (default 20) is a total budget
   across both groups, islands first, exactly as `impact` budgets dependents
   ahead of tests.
 - `orphans`' summary reads `functions: 812 · test_callers_only: 280 ·

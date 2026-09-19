@@ -552,3 +552,77 @@ def test_a_subscripted_base_is_recorded_as_its_class():
     class, and the resolver would then bind calls through it to the stub."""
     result = parse_blob(b"class Source(Protocol[T]):\n    pass\n")
     assert [r.raw_name for r in result.refs if r.ref_kind == "base"] == ["Protocol"]
+
+
+# Value references. A name used as a *value* -- `connection.row_factory =
+# _Row`, a method named in a dispatch table -- is a use of the definition it
+# names, and until #45 the parser recorded it nowhere, so the symbol looked
+# unconnected to everything.
+
+
+def value_refs(source: str) -> list[tuple[str, str]]:
+    result = parse_blob(source.encode())
+    return [(r.from_qualname, r.raw_name) for r in result.refs if r.ref_kind == "value"]
+
+
+def test_a_class_handed_to_a_library_is_recorded_as_a_value_reference():
+    """`store.py`'s own shape. `_Row` is never called in this repository:
+    it is handed to sqlite, which calls it. The assignment is the only
+    mention of the name there is."""
+    assert ("open_store", "_Row") in value_refs(
+        "class _Row:\n    pass\n\n\ndef open_store(connection):\n"
+        "    connection.row_factory = _Row\n"
+    )
+
+
+def test_a_method_named_in_a_dispatch_table_is_recorded_as_a_value_reference():
+    """`resolve.py`'s step table: the method is named in a tuple and invoked
+    through the loop over it, so no call site anywhere spells its name."""
+    assert ("Runner.run", "self._step") in value_refs(
+        "class Runner:\n"
+        "    def run(self):\n"
+        "        for step in (self._step,):\n"
+        "            step()\n\n"
+        "    def _step(self):\n"
+        "        pass\n"
+    )
+
+
+def test_a_name_its_own_scope_binds_is_not_a_value_reference():
+    """The filter that keeps this from being every name in the file. A name
+    the scope binds is a variable: what it holds is a question about
+    bindings, which `blob_bindings` already answers, and it is not a
+    reference to the definition that happens to share its spelling."""
+    assert ("run", "handler") not in value_refs(
+        "def handler():\n    pass\n\n\ndef run(handler):\n    register(handler)\n"
+    )
+
+
+def test_a_callee_is_a_call_and_never_also_a_value_reference():
+    """One reference per mention: `helper()` is already recorded as a call,
+    and recording the same text twice would double every edge it produces."""
+    assert value_refs("def run():\n    helper()\n") == []
+
+
+def test_an_annotation_and_a_base_class_are_not_value_references():
+    """Both are already recorded, as a binding and as a `base` ref, and both
+    are read by machinery that knows what they mean. An annotation is not
+    even evaluated when `from __future__ import annotations` is in force."""
+    assert (
+        value_refs(
+            "class Base:\n    pass\n\n\nclass Child(Base):\n"
+            "    def go(self, item: Base) -> Base:\n        return item\n"
+        )
+        == []
+    )
+
+
+def test_a_call_written_inside_an_annotation_is_still_a_call():
+    """Annotations stopped being walked for value references, and a first cut
+    stopped walking them altogether -- which silently dropped 7 of django's
+    189,417 call references, because a call inside an annotation
+    (`x: Annotated[int, Field(gt=0)]`) really does run at definition time.
+    The names in an annotation are not values; the calls in it are calls."""
+    result = parse_blob(b"def go(x: Annotated[int, Field(gt=0)]) -> Sized:\n    return x\n")
+    assert [r.raw_name for r in result.refs if r.ref_kind == "call"] == ["Field"]
+    assert value_refs("def go(x: Annotated[int, Field(gt=0)]) -> Sized:\n    return x\n") == []

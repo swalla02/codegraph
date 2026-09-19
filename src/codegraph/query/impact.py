@@ -2,18 +2,21 @@
 it could break, ranked by how urgently each dependent deserves review.
 
 A reverse BFS over `edges(rev, dst)`, starting at the queried symbol and
-walking CALLS and INHERITS edges backward to its callers and subclasses,
-their callers and subclasses, and so on up to `max_hops`. Each dependent is recorded the first time it is
+walking every `resolve.DEPENDENCY_KINDS` edge backward to its callers,
+subclasses, implementers and the code that merely names it, theirs in turn,
+and so on up to `max_hops`. Each dependent is recorded the first time it is
 reached (fewest hops), and among the edges available at that hop the
 strongest achievable path confidence wins -- the same widest-path bias
 `effects/propagate.py` uses for effect reachability, applied here to
 dependents.
 
-INHERITS is walked because a subclass is affected by a change to its base
-exactly as a caller is by a change to its callee -- that is the question
-this report answers. It used to walk CALLS alone while `rank.fan_in`
-counted both kinds, so a base class with three subclasses ranked as having
-three dependents and listed none (#42).
+Every kind but CALLS is walked for the same reason: this report answers
+"what could a change to this break", and a subclass, a structural
+implementer of a Protocol and a line that hands the symbol to a library are
+all broken by a changed signature exactly as a caller is. INHERITS came in
+with #42 -- it used to walk CALLS alone while `rank.fan_in` counted both
+kinds, so a base class with three subclasses ranked as having three
+dependents and listed none. IMPLEMENTS and REFERENCES came in with #45.
 
 Duplicate edge rows for the same `(src, dst)` pair (the same
 call written twice in a body, or the same candidate reached through two
@@ -53,7 +56,7 @@ from __future__ import annotations
 from codegraph.ambiguity import Ambiguity
 from codegraph.query.rank import fan_in, salience, score
 from codegraph.render import Group, Report, Row, budget
-from codegraph.resolve import CONFIDENCE_RANK, HIGH, LOW, stronger, weaker
+from codegraph.resolve import CONFIDENCE_RANK, DEPENDENCY_KINDS, HIGH, LOW, stronger, weaker
 from codegraph.store import Store
 
 _RANK = CONFIDENCE_RANK
@@ -70,9 +73,10 @@ def _reverse_edges(store: Store, rev: str) -> dict[str, dict[str, str]]:
     """dst -> {src: confidence}, one entry per (src, dst) pair at its
     strongest confidence -- duplicate edge rows collapsed before the walk."""
     edge_confidence: dict[tuple[str, str], str] = {}
+    marks = ",".join("?" * len(DEPENDENCY_KINDS))
     for row in store.connection.execute(
-        "SELECT src, dst, confidence FROM edges WHERE rev=? AND kind IN ('CALLS', 'INHERITS')",
-        (rev,),
+        f"SELECT src, dst, confidence FROM edges WHERE rev=? AND kind IN ({marks})",
+        (rev, *DEPENDENCY_KINDS),
     ):
         key = (row["src"], row["dst"])
         edge_confidence[key] = stronger(
@@ -150,7 +154,7 @@ def impact_report(
     limit: int = 40,
     include_low: bool = False,
 ) -> Report:
-    """Everything reachable from `node_id` by walking CALLS and INHERITS
+    """Everything reachable from `node_id` by walking `DEPENDENCY_KINDS`
     edges backward, ranked by `rank.score` and split into `dependents` and
     `tests` groups."""
     connection = store.connection

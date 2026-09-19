@@ -1512,3 +1512,133 @@ def test_a_union_with_a_protocol_and_a_reassignment_is_medium(repo, write):
     assert ("resolver.py::AstResolver.resolve_call", "MEDIUM") in found
     assert not [conf for _, conf in found if conf == "HIGH" and _ != "resolver.py::AstResolver"]
     store.close()
+
+
+# Value references (#45). A name used as a value -- handed to a library,
+# listed in a dispatch table, passed as a callback -- is a real relationship
+# between two definitions, and the graph held nothing for it at all.
+
+
+def references(store, rev="HEAD"):
+    return {
+        (row["src"], row["dst"], row["confidence"])
+        for row in store.connection.execute(
+            "SELECT src, dst, confidence FROM edges WHERE rev=? AND kind='REFERENCES'", (rev,)
+        )
+    }
+
+
+def test_a_class_handed_to_a_library_gets_a_reference_edge(repo, write):
+    """`store.py`'s own shape: `connection.row_factory = _Row` is the only
+    mention of `_Row` in this repository, and sqlite is what calls it."""
+    write(
+        "store.py",
+        "class _Row:\n    pass\n\n\ndef open_store(connection):\n"
+        "    connection.row_factory = _Row\n    return connection\n",
+        commit="row factory",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("store.py::open_store", "store.py::_Row", "HIGH") in references(store)
+    store.close()
+
+
+def test_a_method_named_in_a_dispatch_table_gets_a_reference_edge(repo, write):
+    """`resolve.py`'s step table, which is why `AstResolver._module_local`
+    was an island of one in this repository's own graph."""
+    write(
+        "resolver.py",
+        "class AstResolver:\n"
+        "    def resolve_call(self, ref):\n"
+        "        for step in (self._module_local,):\n"
+        "            step(ref)\n\n"
+        "    def _module_local(self, ref):\n"
+        "        return []\n",
+        commit="steps",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert (
+        "resolver.py::AstResolver.resolve_call",
+        "resolver.py::AstResolver._module_local",
+        "HIGH",
+    ) in references(store)
+    store.close()
+
+
+def test_a_mention_never_takes_the_bare_name_fan_out(repo, write):
+    """The flood guard. A call whose name matches many definitions is
+    deferred to `ambiguity` and expanded on demand; a *mention* does not even
+    get that far. `self.handler` is an attribute read, and matching it against
+    every definition named `handler` in the repository would connect regions
+    that have nothing to do with each other -- in the one report whose whole
+    value is that the regions it prints are really apart."""
+    write("a.py", "def handler():\n    pass\n")
+    write(
+        "b.py",
+        "def handler():\n    pass\n\n\nclass Runner:\n"
+        "    def run(self):\n        return register(self.handler)\n",
+        commit="fan-out",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert not [edge for edge in references(store) if edge[0] == "b.py::Runner.run"]
+    assert "self.handler" not in ambiguous_names(store)
+    store.close()
+
+
+def test_an_unresolved_mention_is_not_counted_as_a_gap(repo, write):
+    """`unresolved` is a health signal about the CALL graph -- "this many
+    calls found no callee". A name read as a value that turns out to name
+    nothing in the repository (a builtin, a local attribute, a library
+    symbol) is not a gap in it, and counting one would bury the real gaps."""
+    write("m.py", "def run(connection):\n    connection.row_factory = dict\n", commit="builtin")
+    store, indexer = build(repo)
+    stats = indexer.reconcile("HEAD")
+    assert stats.unresolved == 0
+    store.close()
+
+
+# Protocol implementation (#45). A class that structurally satisfies a
+# Protocol has no textual link to it: no import, no base, no call. The
+# receiver step has computed exactly this relationship since #50 and threw it
+# away; this writes it down.
+
+
+def implementations(store, rev="HEAD"):
+    return {
+        (row["src"], row["dst"], row["confidence"])
+        for row in store.connection.execute(
+            "SELECT src, dst, confidence FROM edges WHERE rev=? AND kind='IMPLEMENTS'", (rev,)
+        )
+    }
+
+
+def test_a_structural_implementer_gets_an_implements_edge(repo, write):
+    """`GitTreeSource` and `FsTreeSource` define every method `TreeSource`
+    declares, so each of them is what an annotation naming the Protocol
+    reaches at runtime. `Unrelated` defines `read` alone and is not."""
+    write("source.py", TREE_SOURCES.format(generic=""), commit="protocol")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = implementations(store)
+    assert ("source.py::GitTreeSource", "source.py::TreeSource", "MEDIUM") in found
+    assert ("source.py::FsTreeSource", "source.py::TreeSource", "MEDIUM") in found
+    assert not [edge for edge in found if edge[0] == "source.py::Unrelated"]
+    store.close()
+
+
+def test_a_nominal_subclass_of_a_protocol_gets_no_implements_edge(repo, write):
+    """It already has an INHERITS edge saying the same thing, more strongly.
+    A second edge would double the subclass's fan-in for one declaration."""
+    write(
+        "source.py",
+        "from typing import Protocol\n\n\n"
+        "class TreeSource(Protocol):\n    def tree(self, rev): ...\n\n\n"
+        "class GitTreeSource(TreeSource):\n    def tree(self, rev):\n        return {}\n",
+        commit="nominal",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert implementations(store) == set()
+    store.close()

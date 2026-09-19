@@ -22,8 +22,8 @@ from codegraph.config import Config
 from codegraph.effects.catalog import Catalog
 from codegraph.effects.detect import detect_direct
 from codegraph.effects.propagate import propagate
-from codegraph.parse import PARSER_VERSION, parse_blob
-from codegraph.resolve import MODULE_SCOPE, resolve_revision
+from codegraph.parse import MODULE_SCOPE, PARSER_VERSION, parse_blob
+from codegraph.resolve import resolve_revision
 from codegraph.store import WORKTREE, Store
 
 #: The modules whose *source* decides what a materialized revision contains,
@@ -571,6 +571,17 @@ class Indexer:
 
         for sha, data in self.source.read(missing):
             result = parse_blob(data)
+            # Every Layer 1 row this blob already has, before writing the new
+            # ones. The inserts below are `INSERT OR REPLACE` on (blob_sha,
+            # ordinal), so on their own they overwrite what the new parse
+            # reaches and leave any surplus from a previous PARSER_VERSION in
+            # place -- rows attributed to a parser that never wrote them, and
+            # resolved into edges as if it had. That is the same class of
+            # silent staleness `PARSER_VERSION` exists to prevent, one layer
+            # down, and it only costs four no-op deletes per blob actually
+            # being parsed (never on a cache hit).
+            for table in ("blob_nodes", "blob_refs", "blob_imports", "blob_bindings"):
+                connection.execute(f"DELETE FROM {table} WHERE blob_sha=?", (sha,))
             connection.execute(
                 "INSERT OR REPLACE INTO blobs(blob_sha, status, error, parser_version,"
                 " module_body_hash) VALUES(?, ?, ?, ?, ?)",

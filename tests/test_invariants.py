@@ -724,3 +724,42 @@ def test_an_unchanged_resolver_still_skips(repo, write, monkeypatch):
     Indexer(repo, store, GitTreeSource(repo)).reconcile(WORKTREE)
     assert calls == [], "an unchanged resolver re-resolved"
     store.close()
+
+
+def test_a_body_only_edit_keeps_the_protocol_and_value_edges_a_cold_build_has(repo, write):
+    """The narrowed rewrite deletes and re-emits by `callsite_path`, and an
+    IMPLEMENTS edge has no call site: it is attributed to the implementing
+    class's own file, so that a narrowed pass re-emits exactly the edges it
+    deleted. A value reference is attributed like a call, to the file the
+    mention is written in. Both are pinned here by the only test that can
+    fail for the right reason -- the same tree, built cold."""
+    write(
+        "source.py",
+        "from typing import Protocol\n\n\n"
+        "class TreeSource(Protocol):\n    def tree(self, rev): ...\n\n\n"
+        "class GitTreeSource:\n    def tree(self, rev):\n        return {}\n",
+    )
+    write(
+        "app.py",
+        "from source import GitTreeSource\n\n\n"
+        "class Loader:\n"
+        "    def load(self, connection):\n"
+        "        connection.row_factory = GitTreeSource\n"
+        "        for step in (self._check,):\n"
+        "            step()\n\n"
+        "    def _check(self):\n        return 1\n",
+        commit="two",
+    )
+    store = Store.open(repo)
+    indexer = Indexer(repo, store, GitTreeSource(repo))
+    indexer.reconcile(WORKTREE)
+    # The edits land in `app.py`, never in the file the Protocol and its
+    # implementer live in: a narrowed pass that re-emitted every IMPLEMENTS
+    # edge in the revision would duplicate the one whose rows it never
+    # deleted, and only an edit elsewhere can catch that.
+    write("app.py", (repo / "app.py").read_text().replace("return 1", "return 2"))
+    indexer.reconcile(WORKTREE)
+    incremental = dump_graph(store, WORKTREE)
+    store.close()
+    assert [edge for edge in incremental["edges"] if edge[2] in ("IMPLEMENTS", "REFERENCES")]
+    assert incremental == cold_dump(repo, WORKTREE)

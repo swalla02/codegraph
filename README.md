@@ -110,7 +110,7 @@ slower on a cold cache.
 | `codegraph resolve <name>` | Fuzzy-match a name (trailing name, qualname, or full node id) to node ids. |
 | `codegraph effects <symbol> [--json]` | Report every side-effect kind reachable from a symbol, each with a witness chain down to the causing `file:line`. |
 | `codegraph impact <symbol> [--hops N] [--limit N] [--all] [--json]` | Report the ranked dependents of a symbol — everything a change to it could break. |
-| `codegraph islands [--rev REV] [--limit N] [--json]` | Report the connected components of the revision's `CALLS` and `INHERITS` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
+| `codegraph islands [--rev REV] [--limit N] [--json]` | Report the connected components of the revision's `CALLS`, `INHERITS`, `IMPLEMENTS` and `REFERENCES` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
 | `codegraph orphans [--rev REV] [--limit N] [--include-public] [--include-decorated] [--json]` | Find functions whose every recorded caller is a test — defined, tested, and never invoked by the code that was supposed to invoke it. Such a function is *not* a one-symbol island, precisely because its test calls it, so `islands` structurally cannot surface it. Candidates are private by name, undecorated, defined outside the test tree, and never mentioned by name anywhere in the source text — that last filter has no off switch, because a static call graph cannot see a callback handed to a library. Not a dead-code report (see below). |
 | `codegraph diff [<base>..<head>] [--json]` | Report what changed between two revisions by content hash, never by line number: symbols added/removed/changed, plus any side effect newly reachable. Defaults to `merge-base(default branch, HEAD)..WORKTREE` — "what has this branch changed so far." |
 | `codegraph gc [--keep REV]` | Prune the Layer 1 parse cache down to what `HEAD`, the worktree, and any `--keep`-named revisions still reference. Never touches the graph itself, so it can only make a future answer slower to rebuild, never wrong. |
@@ -120,12 +120,14 @@ slower on a cold cache.
 
 ### What an island is, and is not
 
-`codegraph islands` treats call and inheritance edges as undirected and
-splits the graph into connected components. That the call graph is *not* connected is real
+`codegraph islands` treats every edge a change travels along — a call, a
+base class, a structural implementation of a `typing.Protocol`, and a name
+used as a value — as undirected, and splits the graph into connected
+components. That the call graph is *not* connected is real
 structure, not a defect: a service boundary, a config-gated region, and
 code nothing references all show up as separate islands. On psf/requests
-it reports 807 symbols in 137 islands, the biggest holding 657 of them and
-130 being islands of exactly one.
+it reports 807 symbols in 132 islands, the biggest holding 665 of them and
+127 being islands of exactly one.
 
 **An island is not a reachability result, and a one-symbol island is not
 dead code.** Membership comes from the call edges the resolver recorded,
@@ -138,10 +140,13 @@ island of one on requests, and neither is unused.
 So each island is labelled with what can be said about why it stands
 apart, and no label is ever a claim that code is dead:
 
-- **`implicit: dunder, decorator, test, override, nested, import`** — a
-  mechanism found among the island's members by which something could reach
-  it without a call site. Not proof that it runs; counter-evidence to
-  "nothing reaches this". 117 of requests' 137 islands carry at least one.
+- **`implicit: entry, dunder, decorator, test, override, nested, import`**
+  — a mechanism found among the island's members by which something could
+  reach it without a call site. Not proof that it runs; counter-evidence to
+  "nothing reaches this". 115 of requests' 132 islands carry at least one.
+  `entry` is the one that is not an inference: a statement at some file's
+  top level calls into the island, which is what a `main()` under an
+  `if __name__ == "__main__"` guard has instead of a caller.
 - **`boundary: NETWORK`** — a path inside the island leaves the process.
   The handler lives in another repository, so the island boundary *is* the
   service boundary. That is signal, not a false positive. `NETWORK` is
@@ -149,18 +154,24 @@ apart, and no label is ever a claim that code is dead:
   the process is a structural fact, whereas coupling two functions through
   a database means reading SQL and tracking a schema, which is a different
   tool.
-- **`no implicit-invocation mechanism recognised`** — the remainder, 20
+- **`no implicit-invocation mechanism recognised`** — the remainder, 17
   islands on requests, and still a statement about the tool rather than
   about the code. Most of them are the library's own public surface
   (`get_dict`, `dict_from_cookiejar`), called by users of the package and
   by the stdlib — neither of which is in the tree.
 
-One thing that moved the numbers is worth naming separately, because it was
-a plain bug rather than a limit of static analysis: `Cls()` resolves to the
-class and nothing in the source ever spells `Cls.__init__`, so constructors
-had no incoming edge at all. Implying that edge (following the MRO for an
-inherited one) folded 18 of requests' 172 islands into the rest of the
-graph.
+Two things that moved the numbers are worth naming separately, because both
+were relationships the source really states and the graph simply did not
+hold. `Cls()` resolves to the class and nothing in the source ever spells
+`Cls.__init__`, so constructors had no incoming edge at all; implying that
+edge (following the MRO for an inherited one) folded 18 of requests' 172
+islands into the rest of the graph. And a name used as a *value* —
+`connection.row_factory = _Row`, a method listed in a dispatch table, a
+callback passed to a library — was recorded nowhere, which is why on
+codegraph's own source all six symbols in the `unexplained` bucket were
+live code. Recording it (`REFERENCES`, plus `IMPLEMENTS` for a class that
+satisfies a `typing.Protocol` without naming it) took that bucket from 7
+islands to 1 here, and from 20 to 17 on requests, for 7.6% more edges.
 
 ### What `orphans` finds that nothing else can
 

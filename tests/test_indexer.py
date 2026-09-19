@@ -1,4 +1,5 @@
 # tests/test_indexer.py
+import codegraph.indexer
 from codegraph.indexer import (
     RESOLVER_SOURCES,
     FsTreeSource,
@@ -6,6 +7,7 @@ from codegraph.indexer import (
     Indexer,
     digest_sources,
 )
+from codegraph.parse import ParseResult
 from codegraph.store import WORKTREE, Store
 from tests.conftest import git
 
@@ -219,3 +221,32 @@ def test_the_fingerprint_pins_the_modules_that_write_layer_2_and_no_others(tmp_p
     assert not [name for name in RESOLVER_SOURCES if name.startswith("query/")]
     for name in RESOLVER_SOURCES:
         assert (package / name).is_file(), f"{name} is pinned but no longer exists"
+
+
+def test_reparsing_a_blob_leaves_no_row_the_new_parser_did_not_write(repo, write, monkeypatch):
+    """Layer 1 is keyed on (blob sha, `PARSER_VERSION`), which is what lets a
+    parser change invalidate structure already stored for content already
+    seen. The rows themselves are written with `INSERT OR REPLACE` on
+    (blob_sha, ordinal), so a version that produces FEWER rows for the same
+    bytes overwrites what it can and leaves the surplus behind -- rows
+    attributed to a parser that never wrote them, and resolved into edges as
+    if it had.
+
+    Found while measuring #45: the version bump there records more references
+    per blob, so running the previous version over a store the new one had
+    filled left its extra references in place and reported 3,859 call
+    references for a tree with 2,687 of them.
+    """
+    write("m.py", "def helper():\n    pass\n\n\ndef caller():\n    helper()\n", commit="m")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    counts = "SELECT COUNT(*) AS n FROM blob_refs"
+    assert store.connection.execute(counts).fetchone()["n"] > 0
+
+    monkeypatch.setattr(codegraph.indexer, "PARSER_VERSION", "test-other")
+    monkeypatch.setattr(
+        codegraph.indexer, "parse_blob", lambda data: ParseResult(module_body_hash="x")
+    )
+    indexer.reconcile("HEAD")
+    assert store.connection.execute(counts).fetchone()["n"] == 0
+    store.close()
