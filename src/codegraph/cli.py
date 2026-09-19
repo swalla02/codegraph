@@ -458,7 +458,8 @@ def build_parser() -> argparse.ArgumentParser:
         "islands",
         help="Report the connected components of the call graph",
         description=(
-            "Split the revision's CALLS and INHERITS edges, read as undirected, into connected"
+            "Split the revision's CALLS, INHERITS, IMPLEMENTS and REFERENCES edges,"
+            " read as undirected, into connected"
             " components. An island is a set of symbols that share some call"
             " relationship with each other and none with anything outside it. It is"
             " NOT a reachability result: a one-symbol island is not dead code, only a"
