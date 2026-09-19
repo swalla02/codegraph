@@ -400,10 +400,14 @@ are not in the same place:
 
 ## How good is the graph, honestly
 
-`tests/test_accuracy.py` reports precision 1.00 / recall 1.00, and that number
-means very little: it measures 10 hand-written call sites in a synthetic
-11-file repository, each authored to illustrate a rule the resolver already
-implements. It is a regression guard wearing a benchmark's clothes.
+`tests/test_resolution_rules.py` reports recall 1.00 at precision 0.91, and
+that is **not** a statement about real code: it measures 15 hand-written call
+sites in a synthetic 17-file repository, each authored to illustrate a rule the
+resolver already implements, with no dunder invoked by syntax, no decorated
+target and no closure among them. It is a regression guard, it is named like
+one, and its assertions say so when they fail. The effectiveness floors are on
+`bench/` output instead (#39), per target repository — see
+[Effectiveness floors](#effectiveness-floors).
 
 `bench/` is the real measurement (#35). It runs a target repository's **own
 test suite** under `sys.monitoring`, records every `(caller, callee)` pair that
@@ -416,6 +420,7 @@ uv run python -m bench.run requests          # clones, or --source-root DIR to c
 uv run python -m bench.run flask --json /tmp/flask.json
 uv run python -m bench.run requests --tests tests/test_utils.py   # narrow the suite
 uv run python -m bench.run flask --reuse-trace --rebuild          # cold index time, not a warm reconcile
+uv run python -m bench.run requests --check-floors                # exits 1 below the floor
 ```
 
 Each run copies the clone (an editable install writes into the tree, and the
@@ -432,36 +437,59 @@ is unit-tested there (`tests/test_bench_scorer.py`).
 |---|---|---|
 | suite traced | `test_utils.py`, `test_structures.py` (240 tests) | `tests/` (494 tests) |
 | traced call edges (judgeable) | 115 | 2683 |
-| **recall** | **0.79** | **0.29** |
-| recall at HIGH/MEDIUM | 0.76 | 0.25 |
-| conditional precision | 0.99 (82/83) | 0.93 (455/490) |
+| **recall** | **0.79** (91/115) | **0.29** (775/2683) |
+| recall at HIGH/MEDIUM | 0.77 | 0.26 |
+| conditional precision | 0.99 (85/86) | 0.74 (515/699) |
 
-Worth reading those two rows together, because #38 (following a package
-re-export, so `flask.Flask` resolves instead of degrading to an ambiguous bare
-name) moved them and left **recall flat**: 765 -> 776 judgeable edges found, so
-0.29 both before and after. It could not move much. Recall counts an edge the
-LOW bare-name fan-out would produce, and the fan-out already contained the
-right answer — buried among the wrong ones. What changed is which tier the
-answer is claimed at: recall at HIGH/MEDIUM 0.19 -> 0.25 (507 -> 673 edges) and
-conditional precision 0.86 -> 0.93. That is the whole point of the fix, and it
-is invisible in the headline number, which is a property of this benchmark
-worth knowing: **recall does not distinguish a fact from a lucky guess.**
+Measured 2026-09-19 at codegraph `ce69dfc`, against psf/requests `dae7ef6` and
+pallets/flask `d73fa1c`. Every run prints the target's commit beside the score,
+because a clone tracks its default branch and two runs a month apart measure
+two different repositories.
+
+Worth reading those rows together rather than reading the headline alone,
+because on flask the headline has now sat at 0.29 through two changes that
+moved the graph substantially.
+
+#38 (following a package re-export, so `flask.Flask` resolves instead of
+degrading to an ambiguous bare name) left **recall flat**: 765 -> 776 judgeable
+edges found, 0.29 before and after. It could not move much. Recall counts an
+edge the LOW bare-name fan-out would produce, and the fan-out already contained
+the right answer — buried among the wrong ones. What changed is which tier the
+answer is claimed at: recall at HIGH/MEDIUM 0.19 -> 0.25, conditional precision
+0.86 -> 0.93.
+
+#50 (resolving a call on a receiver whose type is annotated or assigned in the
+same scope) moved the same two rows again, and one of them **down**. Scoring
+one flask trace with the graph from before and after: recall 0.29 -> 0.29,
+recall at HIGH/MEDIUM 673 -> 694 edges, and static HIGH edges with both
+endpoints executed 490 -> 699 — of which the trace observed 455 -> 515. So
+conditional precision fell **0.93 -> 0.74**. Receiver-type resolution promotes
+far more calls to HIGH on a framework than it gets right there: 209 more HIGH
+edges were put up for judgement and 60 of them were taken. The number is doing
+its job by dropping; the floor below is set under it, not at the older value.
+
+Together those two are the property of this benchmark most worth knowing:
+**recall does not distinguish a fact from a lucky guess, and a change that
+improves the tier an answer is claimed at can cost conditional precision
+without touching recall at all.**
 
 On `tests/test_utils.py` alone — the scope #35 recorded — requests is **0.93**
-recall, and all 6 misses are dunders invoked by syntax (`d[k]`, `for x in jar`,
-`len(f)`). Adding `test_structures.py`, which tests a mapping's dunders
-directly, drops it to 0.79: the same gap, weighted differently by which tests
-you run. **Recall is a property of the target repository and of the suite you
-trace, not a single number about codegraph.**
+recall (83/89), and every one of the 6 misses has a dunder as its target,
+invoked by syntax (`d[k]`, `for x in jar`, `len(f)`). Adding
+`test_structures.py`, which tests a mapping's dunders directly, drops it to
+0.79: the same gap, weighted differently by which tests you run. **Recall is a
+property of the target repository and of the suite you trace, not a single
+number about codegraph** — which is why a floor is pinned to one target at one
+scope, and why `--check-floors` refuses to run against a `--tests` override.
 
 flask is where a static resolver is supposed to do badly, and it does. Every
 miss is grouped by mechanism, and the grouping is the finding:
 
-| flask misses (1907 of 2683) | |
+| flask misses (1908 of 2683) | |
 |---|---|
 | target nested in another function (a view defined inside a test) | 561 |
 | reachable only through an out-of-repo frame | 552 |
-| target is decorated (`@app.route`, `@setupmethod`) | 523 |
+| target is decorated (`@app.route`, `@setupmethod`) | 524 |
 | target is a dunder, invoked by syntax or protocol | 223 |
 | target is a constructor — a real resolution gap | 13 |
 | target applied as a decorator by the source | 18 |
@@ -477,6 +505,42 @@ recall at 0.36. The honest summary is that on a framework, most of what runs is
 reached by decoration and dispatch, and a call-site-based graph sees about a
 third of it.
 
+### Effectiveness floors
+
+The floors that say the graph has not got worse on real code live here, on
+`bench/` output, one set per target (#39):
+
+```sh
+uv run python -m bench.run requests --check-floors   # ~1 min
+uv run python -m bench.run flask --check-floors      # ~3 min
+```
+
+| floor | psf/requests | pallets/flask |
+|---|---|---|
+| recall | 0.76 | 0.27 |
+| recall at HIGH/MEDIUM | 0.74 | 0.24 |
+| conditional precision | 0.95 | 0.70 |
+
+An order of magnitude apart on recall, and that is the point: a library whose
+tests call its functions by name and a framework whose tests reach their
+targets by decoration and dispatch are not the same measurement, and one number
+covering both would be a number about neither.
+
+Each floor sits a little below a figure the benchmark actually printed, with
+the run it came from recorded next to it in `bench/run.py`'s `TARGETS` — the
+date, codegraph's commit, the target's commit, and the counts behind each
+ratio. The headroom is for drift in the target repository, which moves on its
+own; it is not slack for the resolver. A failure prints the target's commit
+beside the score so the first question — was it the resolver that changed, or
+the target? — is answerable from the output.
+
+Both targets carry a floor, and both are enforced only by the command above.
+They are deliberately not `pytest` tests, not even `slow` ones: a floor needs a
+clone of somebody else's repository, a virtualenv, a network fetch and a few
+minutes of their suite, and `uv run pytest -m slow` is a thing you can run on a
+plane. What the default suite asserts about resolution is the fixture
+regression guard, which is a different claim and is named like one.
+
 ### Why precision is reported as *conditional*
 
 A static edge the trace never saw is **not** thereby wrong — the suite may
@@ -484,9 +548,10 @@ simply not cover it, and most of a library's surface is not exercised by its
 own tests. Unconditional precision is therefore not measurable this way, and
 the benchmark does not print a number for it. What is defensible: among static
 HIGH edges whose **two endpoints both executed at least once**, how many did
-the trace observe? 0.99 on requests, 0.93 on flask. That says the HIGH edges
+the trace observe? 0.99 on requests, 0.74 on flask. That says most HIGH edges
 that could have been checked were taken; it does not say the resolver invents no
-edges.
+edges. It is also the one number here that a resolution improvement can push
+*down*, by claiming HIGH on more calls than it gets right — see #50 above.
 
 ### The one filter that decides whether the number is honest
 
