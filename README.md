@@ -106,7 +106,7 @@ slower on a cold cache.
 | Command | What it does |
 |---|---|
 | `codegraph status [--rev REV]` | Reconcile a revision and print summary counts: paths, blobs parsed/cached, edges, unresolved refs, parse errors. |
-| `codegraph index [--rev REV] [--rebuild] [--quiet]` | Reconcile a revision into the graph explicitly, paying the cold-build cost up front. `--rebuild` discards the Layer 1 parse cache first; `--quiet` is what the warming hooks invoke in the background. |
+| `codegraph index [--rev REV] [--rebuild] [--quiet]` | Reconcile a revision into the graph explicitly, paying the cold-build cost up front. `--rebuild` discards the Layer 1 parse cache *and* the revision's materialized graph first, so it really does rebuild; `--quiet` is what the warming hooks invoke in the background. |
 | `codegraph resolve <name>` | Fuzzy-match a name (trailing name, qualname, or full node id) to node ids. |
 | `codegraph effects <symbol> [--json]` | Report every side-effect kind reachable from a symbol, each with a witness chain down to the causing `file:line`. |
 | `codegraph impact <symbol> [--hops N] [--limit N] [--all] [--json]` | Report the ranked dependents of a symbol — everything a change to it could break. |
@@ -367,6 +367,26 @@ are not in the same place:
   inputs, which is why a body-only edit is 3.7s rather than 9s, but a
   structural edit still pays it in full.
 
+- **An upgrade re-resolves every materialized revision, once.** The
+  fingerprint that lets an unchanged tree skip its work pins a digest of
+  codegraph's own resolution source, not just the parser version and your
+  `codegraph.toml` — so the first reconcile after `pip install -U` (or after
+  pulling a new commit into a checkout) rebuilds Layer 2 for each revision
+  you query, at roughly the "adds or removes a definition" row above rather
+  than the `~1/160` one. Measured on django (2,932 files, 109k edges,
+  one session): **12s** to re-resolve after a resolver change, against **34s**
+  to index the same tree cold and 0.1s for the no-change reconcile every query
+  otherwise pays.
+
+  The parse cache is deliberately *not* invalidated: what a parse produces is
+  a function of the blob's bytes and the parser version alone, never of
+  resolver code, so this is a re-resolve and not a re-index — zero blobs
+  parsed. The price is the right one to pay, because the alternative is what
+  happened before #44: the upgraded resolver simply never ran. Same tree,
+  same fingerprint, so the reconcile decided there was nothing to do and kept
+  answering with the previous version's edges — indefinitely, with no error
+  and no warning.
+
 ## How good is the graph, honestly
 
 `tests/test_accuracy.py` reports precision 1.00 / recall 1.00, and that number
@@ -384,6 +404,7 @@ real gap — no labelling judgement involved.
 uv run python -m bench.run requests          # clones, or --source-root DIR to copy a clone
 uv run python -m bench.run flask --json /tmp/flask.json
 uv run python -m bench.run requests --tests tests/test_utils.py   # narrow the suite
+uv run python -m bench.run flask --reuse-trace --rebuild          # cold index time, not a warm reconcile
 ```
 
 Each run copies the clone (an editable install writes into the tree, and the
