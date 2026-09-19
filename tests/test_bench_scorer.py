@@ -7,7 +7,17 @@ publishing a wrong number about the resolver. So the arithmetic is checked
 here, with synthetic traces, in milliseconds.
 """
 
-from bench.score import StaticGraph, Trace, classify, collapse_anonymous, read_static_graph, score
+from bench.score import (
+    Floor,
+    Report,
+    StaticGraph,
+    Trace,
+    check_floor,
+    classify,
+    collapse_anonymous,
+    read_static_graph,
+    score,
+)
 
 from codegraph.indexer import GitTreeSource, Indexer
 from codegraph.store import Store
@@ -159,7 +169,8 @@ def test_each_miss_is_explained_by_the_first_cause_that_applies():
 def test_the_scored_graph_includes_the_query_time_ambiguity_expansion(repo, write):
     """The property that keeps the benchmark honest about the resolver rather
     than about the storage layer: an all-LOW fan-out is never written to
-    `edges` (#25), it is expanded when a query asks. `tests/test_accuracy.py`
+    `edges` (#25), it is expanded when a query asks.
+    `tests/test_resolution_rules.py`
     unions the same two sources, and scoring `edges` alone would report a
     target as missed while every real query returns it."""
     write("box.py", "class One:\n    def save(self):\n        pass\n")
@@ -184,3 +195,49 @@ def test_the_scored_graph_includes_the_query_time_ambiguity_expansion(repo, writ
     assert report.found == 2
     assert report.found_high_medium == 0  # the fan-out is LOW, as resolve.py would have written it
     store.close()
+
+
+def test_a_floor_check_names_every_metric_and_fails_only_below_the_floor():
+    """The effectiveness floors live on `bench/` output, per target (#39).
+
+    Three metrics rather than one, because recall alone hides the change that
+    matters most: #38 moved 158 flask edges from a LOW bare-name fan-out to a
+    resolved HIGH answer and left recall flat at 0.29. A floor on recall
+    would not have noticed if that regressed; a floor on recall at
+    HIGH/MEDIUM does.
+    """
+    floor = Floor(recall=0.70, recall_high_medium=0.60, conditional_precision=0.90)
+    report = _report(recall=0.70, recall_high_medium=0.60, conditional_precision=0.90)
+
+    checks = check_floor(report, floor)
+    assert [check.metric for check in checks] == [
+        "recall",
+        "recall at HIGH/MEDIUM",
+        "conditional precision",
+    ]
+    assert all(check.ok for check in checks)  # at the floor is not below it
+
+    # Each metric is checked on its own: a confidence regression that leaves
+    # recall untouched still fails.
+    dropped = _report(recall=0.70, recall_high_medium=0.59, conditional_precision=0.90)
+    failed = [check for check in check_floor(dropped, floor) if not check.ok]
+    assert [check.metric for check in failed] == ["recall at HIGH/MEDIUM"]
+
+
+def _report(*, recall: float, recall_high_medium: float, conditional_precision: float) -> Report:
+    """A report with the three floored ratios and nothing else that matters."""
+    judgeable = 100
+    testable_high = 100
+    return Report(
+        traced_total=judgeable,
+        anonymous_target=0,
+        body_execution=0,
+        target_unknown=0,
+        judgeable=judgeable,
+        found=round(recall * judgeable),
+        found_high_medium=round(recall_high_medium * judgeable),
+        misses=[],
+        miss_causes={},
+        testable_high=testable_high,
+        observed_high=round(conditional_precision * testable_high),
+    )

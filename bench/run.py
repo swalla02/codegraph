@@ -2,6 +2,7 @@
 
     uv run python -m bench.run requests
     uv run python -m bench.run flask --source-root /path/to/clones
+    uv run python -m bench.run flask --check-floors      # exits 1 on a regression
 
 Per target: copy the clone, build a virtualenv, install the package
 **editable**, run its test suite under `bench/tracer.py`, index the same
@@ -17,6 +18,15 @@ must leave the source clone untouched.
 The revision indexed is WORKTREE, deliberately: the tracer executes the files
 on disk, so the graph has to be built from the files on disk. Indexing HEAD
 would score a graph of slightly different code whenever the clone is dirty.
+
+`--check-floors` is where codegraph's effectiveness floors live (#39). They
+are here rather than in `pytest` because a floor needs what this script
+needs: a clone of somebody else's repository, a virtualenv, and a few minutes
+of their test suite. `tests/` stays offline and fast, and what the default
+suite does assert about resolution is a regression guard over a fixture
+(`tests/test_resolution_rules.py`), which is a different claim and is named
+like one. Each target's floor, and the run it was read off, is recorded in
+`TARGETS` below.
 """
 
 from __future__ import annotations
@@ -31,7 +41,15 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from bench.score import Trace, format_report, read_static_graph, score
+from bench.score import (
+    Floor,
+    Report,
+    Trace,
+    check_floor,
+    format_report,
+    read_static_graph,
+    score,
+)
 from codegraph.indexer import GitTreeSource, Indexer
 from codegraph.store import WORKTREE, Store
 
@@ -49,6 +67,14 @@ class Target:
     #: Test-only dependencies the editable install does not pull in.
     extra_deps: tuple[str, ...] = ()
     note: str = ""
+    #: What `--check-floors` enforces for this target, or None for a target
+    #: nobody has measured yet. A floor belongs to the `tests` above and to
+    #: no other scope: recall is a property of the suite you trace as much as
+    #: of the repository, and requests reads 0.93 on `test_utils.py` alone
+    #: against 0.79 once `test_structures.py` -- a file of dunder tests --
+    #: joins it. `--check-floors` refuses a `--tests` override for that
+    #: reason.
+    floor: Floor | None = None
 
 
 TARGETS: dict[str, Target] = {
@@ -59,6 +85,17 @@ TARGETS: dict[str, Target] = {
         name="requests",
         url="https://github.com/psf/requests",
         tests=("tests/test_utils.py", "tests/test_structures.py"),
+        floor=Floor(
+            recall=0.76,
+            recall_high_medium=0.74,
+            conditional_precision=0.95,
+            measured=(
+                "2026-09-19, codegraph ce69dfc, psf/requests dae7ef6: recall 0.79"
+                " (91/115 judgeable), at HIGH/MEDIUM 0.77, conditional precision"
+                " 0.99 (85/86). All 24 misses are dunders invoked by syntax or"
+                " calls reached through an out-of-repo frame."
+            ),
+        ),
     ),
     # The interesting one: decorators, framework dispatch, a context-local
     # proxy object. A static resolver should do measurably worse here, and
@@ -69,6 +106,18 @@ TARGETS: dict[str, Target] = {
         tests=("tests/",),
         extra_deps=("pytest-asyncio", "python-dotenv", "asgiref", "greenlet"),
         note="tests/ minus the ones needing extras; see --tests to narrow",
+        floor=Floor(
+            recall=0.27,
+            recall_high_medium=0.24,
+            conditional_precision=0.70,
+            measured=(
+                "2026-09-19, codegraph ce69dfc, pallets/flask d73fa1c: recall 0.29"
+                " (775/2683 judgeable), at HIGH/MEDIUM 0.26, conditional precision"
+                " 0.74 (515/699). 1637 of the 1908 misses are a view defined inside"
+                " a test, a decorated target, or a pair only an out-of-repo frame"
+                " connects -- dispatch a call-site graph does not model."
+            ),
+        ),
     ),
 }
 
@@ -194,6 +243,65 @@ def index(repo: Path, rebuild: bool = False) -> Store:
     return store
 
 
+def head_sha(repo: Path) -> str:
+    """The target's commit, printed beside every score.
+
+    The clone tracks the target's default branch, so two runs a month apart
+    measure two different repositories. When a floor fails, the first
+    question is whether codegraph changed or the target did, and the answer
+    has to be in the output of both runs or it is not available at all.
+    """
+    completed = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed.stdout.strip() or "(unknown rev)"
+
+
+def _refuse_unenforceable_floor(target: Target, args: argparse.Namespace) -> None:
+    """Fail before spending four minutes producing a number nothing floors.
+
+    A floor is tied to one suite. Narrowing the scope changes the score
+    without changing the resolver at all -- requests reads 0.93 on
+    `test_utils.py` and 0.79 once `test_structures.py` joins it -- so
+    checking a floor against a different scope would compare two unrelated
+    measurements and call the difference a regression.
+    """
+    if target.floor is None:
+        raise SystemExit(
+            f"{target.name} has no recorded floor. Run the benchmark, then write one"
+            " a little below what it prints (bench/run.py, TARGETS)."
+        )
+    if args.tests:
+        raise SystemExit(
+            f"--check-floors and --tests are mutually exclusive: {target.name}'s floor was"
+            f" measured on {' '.join(target.tests)} and means nothing on another scope."
+        )
+
+
+def report_floor(target: Target, report: Report) -> int:
+    """Print every floored metric against its floor; 1 if any is below it."""
+    assert target.floor is not None  # _refuse_unenforceable_floor ran first
+    checks = check_floor(report, target.floor)
+    print()
+    print(f"floors for {target.name} ({' '.join(target.tests)}):")
+    for check in checks:
+        print(f"  {check}")
+    print(f"  floor measured at: {target.floor.measured}")
+    below = [check for check in checks if not check.ok]
+    if not below:
+        return 0
+    print()
+    print(
+        f"FAILED: {len(below)} metric(s) below the floor. Either the resolver lost"
+        " something, or the target repository moved -- compare the commit above"
+        " with the one the floor was measured at before touching the floor."
+    )
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m bench.run")
     parser.add_argument("target", choices=sorted(TARGETS), help="Which repository to score")
@@ -220,6 +328,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Score the trace already on disk instead of re-running the suite",
     )
+    parser.add_argument(
+        "--check-floors",
+        action="store_true",
+        help="Exit non-zero if this target scores below its recorded floor (#39)",
+    )
     parser.add_argument("--json", default=None, help="Also write the report as JSON here")
     args = parser.parse_args(argv)
 
@@ -227,6 +340,9 @@ def main(argv: list[str] | None = None) -> int:
     work = Path(args.work)
     source_root = None if args.source_root is None else Path(args.source_root)
     tests = tuple(args.tests) if args.tests else target.tests
+
+    if args.check_floors:
+        _refuse_unenforceable_floor(target, args)
 
     repo = prepare(target, work, source_root)
     trace_path = work / f"{target.name}-trace.json"
@@ -242,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     store.close()
 
     print()
-    print(format_report(f"{target.name}  ({' '.join(tests)})", report))
+    print(format_report(f"{target.name} {head_sha(repo)}  ({' '.join(tests)})", report))
     if args.json:
         Path(args.json).write_text(
             json.dumps(
@@ -266,6 +382,8 @@ def main(argv: list[str] | None = None) -> int:
                 indent=2,
             )
         )
+    if args.check_floors:
+        return report_floor(target, report)
     return 0
 
 
