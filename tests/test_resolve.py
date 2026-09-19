@@ -1,3 +1,5 @@
+import pytest
+
 from codegraph.ambiguity import Ambiguity
 from codegraph.cli import main
 from codegraph.indexer import GitTreeSource, Indexer
@@ -326,7 +328,10 @@ def test_resolve_is_case_consistent_not_disjoint_across_query_case(repo, write, 
 
 
 def test_status_reports_the_unresolved_count(repo, write, capsys):
-    write("m.py", "import requests\n\n\ndef fetch():\n    requests.get('u')\n", commit="m")
+    # A call nothing can answer. This used to be `requests.get`, which is no
+    # longer a gap: it is a call into a module the repository does not contain,
+    # recorded as 'external' and kept out of this count like a builtin (#47).
+    write("m.py", "def fetch(client):\n    client.frobnicate('u')\n", commit="m")
     assert main(["status", "--path", str(repo), "--rev", "HEAD"]) == 0
     assert "unresolved: 1" in capsys.readouterr().out
 
@@ -1150,4 +1155,360 @@ def test_from_package_import_name_also_follows_the_reexport(repo, write):
     store, indexer = build(repo)
     indexer.reconcile("HEAD")
     assert ("use.py::go", "pkg/app.py::Thing", "HIGH") in edges(store)
+    store.close()
+
+
+# -- the external boundary ---------------------------------------------------
+#
+# `import pytest` names a module this repository does not contain. A call on it
+# still reached the last-resort name match, which projected `pytest.main` onto
+# every repo function called `main`: `bench/tracer.py:112` reported three
+# candidates, none of them right. See #47.
+
+
+def repo_calling_an_external_module(write, call="pytest.main([])", header="import pytest"):
+    write("cli.py", "def main():\n    pass\n")
+    write("bench.py", "def main():\n    pass\n")
+    write("run.py", f"{header}\n\n\ndef go():\n    {call}\n", commit="external")
+
+
+def test_a_call_on_an_external_module_is_not_projected_onto_repo_symbols(repo, write):
+    repo_calling_an_external_module(write)
+    store, indexer = build(repo)
+    stats = indexer.reconcile("HEAD")
+    assert not [dst for src, dst, _ in edges(store) if src == "run.py::go"]
+    rows = [row for row in unresolved_rows(store) if row["path"] == "run.py"]
+    assert [(row["raw_name"], row["reason"], row["candidates"]) for row in rows] == [
+        ("pytest.main", "external", 0)
+    ]
+    # Understood and deliberately unlinked: neither a fan-out nor a gap.
+    assert stats.ambiguous == 0
+    assert stats.unresolved == 0
+    store.close()
+
+
+def test_an_external_call_with_one_same_named_repo_symbol_gets_no_edge(repo, write):
+    """The single-candidate case was the worse half: one repo `dumps` turned
+    `json.dumps(x)` into a MEDIUM edge -- confidently wrong, not a LOW guess."""
+    write("codec.py", "def dumps(value):\n    return value\n")
+    write("use.py", "import json\n\n\ndef go(x):\n    return json.dumps(x)\n", commit="json")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert not [dst for src, dst, _ in edges(store) if src == "use.py::go"]
+    reasons = {row["reason"] for row in unresolved_rows(store) if row["path"] == "use.py"}
+    assert reasons == {"external"}
+    store.close()
+
+
+def test_a_name_imported_from_an_external_module_is_external_too(repo, write):
+    repo_calling_an_external_module(
+        write, call="run_tests()", header="from pytest import main as run_tests"
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    rows = [row for row in unresolved_rows(store) if row["path"] == "run.py"]
+    assert [(row["raw_name"], row["reason"]) for row in rows] == [("run_tests", "external")]
+    store.close()
+
+
+def test_a_missing_attribute_of_a_repo_module_is_not_external(repo, write):
+    """The boundary is the repository, not "the lookup failed". `pkg` is a repo
+    package, so a `pkg.main` the index cannot find may still be bound at
+    runtime; it keeps the name match it had rather than being written off."""
+    write("pkg/__init__.py", "")
+    write("cli.py", "def main():\n    pass\n")
+    write("run.py", "import pkg\n\n\ndef go():\n    pkg.main()\n", commit="internal")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("run.py::go", "cli.py::main", "MEDIUM") in edges(store)
+    store.close()
+
+
+def test_a_module_reached_through_sys_path_is_not_external(repo, write):
+    """django's test runner puts `tests/` on `sys.path`, so its test apps import
+    each other as `from model_fields.models import Foo` -- a top-level name that
+    `module_for_path` spells `tests.model_fields.models`. A head that names ANY
+    directory or file in the repository is not provably someone else's code,
+    so it keeps falling through exactly as before."""
+    write("tests/model_fields/__init__.py", "")
+    write("tests/model_fields/models.py", "def build():\n    pass\n")
+    write(
+        "tests/other/use.py",
+        "import model_fields.models\n\n\ndef go():\n    model_fields.models.build()\n",
+        commit="syspath",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = {dst for src, dst, _ in edges(store) if src == "tests/other/use.py::go"}
+    assert found == {"tests/model_fields/models.py::build"}
+    store.close()
+
+
+def test_a_parameter_named_like_an_external_module_is_not_external(repo, write):
+    """`def go(json): json.dumps()` -- the parameter shadows the import for the
+    whole function body, so the call is on whatever was passed, not on the
+    standard library."""
+    write("codec.py", "def dumps(value):\n    return value\n")
+    write("use.py", "import json\n\n\ndef go(json):\n    return json.dumps(1)\n", commit="shadow")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("use.py::go", "codec.py::dumps", "MEDIUM") in edges(store)
+    store.close()
+
+
+# -- receiver types (#47) ------------------------------------------------------
+#
+# Everything above resolves a NAME. A call written on a variable -- most method
+# calls in most Python -- used to reach the bare-name match with nothing but its
+# final segment, even when the variable's type was written a few lines up.
+
+
+def targets_of(store, src, rev="HEAD"):
+    return {(dst, conf) for s, dst, conf in edges(store) if s == src}
+
+
+def ambiguous_names(store, rev="HEAD"):
+    return {
+        row["raw_name"]
+        for row in store.connection.execute(
+            "SELECT raw_name FROM unresolved WHERE rev=? AND reason='ambiguous'", (rev,)
+        )
+    }
+
+
+def two_savers(write):
+    write(
+        "models.py",
+        "class Item:\n    def save(self):\n        pass\n\n\n"
+        "class Settings:\n    def save(self):\n        pass\n",
+    )
+
+
+def test_an_annotated_parameter_resolves_its_method_at_high(repo, write):
+    write("catalog.py", "class Catalog:\n    def fingerprint(self):\n        return 1\n")
+    write("other.py", "def fingerprint():\n    return 2\n")
+    write(
+        "use.py",
+        "from catalog import Catalog\n\n\n"
+        "def digest(catalog: Catalog):\n    return catalog.fingerprint()\n",
+        commit="annotated",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert targets_of(store, "use.py::digest") == {("catalog.py::Catalog.fingerprint", "HIGH")}
+    assert "catalog.fingerprint" not in ambiguous_names(store)
+    store.close()
+
+
+def test_an_annotation_also_reaches_subclass_overrides_at_medium(repo, write):
+    """`catalog: Catalog` may be passed a subclass, exactly as `self` may be one
+    -- the reasoning, and the tiers, are `_through_self`'s (#14)."""
+    two_savers(write)
+    write("special.py", "from models import Item\n\n\nclass Special(Item):\n    def save(self):\n        pass\n")
+    write(
+        "use.py",
+        "from models import Item\n\n\ndef persist(item: Item):\n    return item.save()\n",
+        commit="override",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert targets_of(store, "use.py::persist") == {
+        ("models.py::Item.save", "HIGH"),
+        ("special.py::Special.save", "MEDIUM"),
+    }
+    store.close()
+
+
+def test_a_local_constructed_in_the_body_resolves_its_method(repo, write):
+    two_savers(write)
+    write("special.py", "from models import Item\n\n\nclass Special(Item):\n    def save(self):\n        pass\n")
+    write(
+        "use.py",
+        "from models import Item\n\n\ndef build():\n    item = Item()\n    item.save()\n",
+        commit="constructed",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    # `Item()` names the exact class, so -- unlike an annotation -- a subclass
+    # override is not a candidate. Same rule as `constructor_target`.
+    assert targets_of(store, "use.py::build") == {
+        ("models.py::Item", "HIGH"),
+        ("models.py::Item.save", "HIGH"),
+    }
+    store.close()
+
+
+def test_a_reassigned_receiver_is_medium(repo, write):
+    two_savers(write)
+    write(
+        "use.py",
+        "from models import Item, Settings\n\n\n"
+        "def build(flag):\n    target = Item()\n    if flag:\n        target = Settings()\n"
+        "    target.save()\n",
+        commit="reassigned",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = targets_of(store, "use.py::build")
+    assert ("models.py::Item.save", "MEDIUM") in found
+    assert ("models.py::Settings.save", "MEDIUM") in found
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "label, body",
+    [
+        ("rebound by a loop", "    for item in rows:\n        pass\n    item = Item()\n"),
+        ("an unannotated parameter", ""),
+        ("assigned from a function call", "    item = load()\n"),
+        ("assigned from a subscript", "    item = rows[0]\n"),
+    ],
+)
+def test_a_receiver_whose_bindings_are_not_all_known_falls_through(repo, write, label, body):
+    """One binding the resolver cannot type makes every other one untrustworthy:
+    claiming `Item.save` at HIGH while `item` is also a loop variable would be
+    narrower than today's fan-out AND wrong. So the reference keeps exactly the
+    answer it had."""
+    two_savers(write)
+    signature = "item, rows" if label == "an unannotated parameter" else "rows"
+    write(
+        "use.py",
+        "from models import Item\n\n\ndef load():\n    return None\n\n\n"
+        f"def build({signature}):\n{body}    item.save()\n",
+        commit="opaque",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert "item.save" in ambiguous_names(store), label
+    store.close()
+
+
+def test_self_attribute_assigned_from_an_annotated_init_parameter(repo, write):
+    two_savers(write)
+    write(
+        "service.py",
+        "from models import Item\n\n\n"
+        "class Service:\n"
+        "    def __init__(self, item: Item):\n        self.item = item\n\n"
+        "    def run(self):\n        return self.item.save()\n",
+        commit="attribute",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert targets_of(store, "service.py::Service.run") == {("models.py::Item.save", "HIGH")}
+    store.close()
+
+
+def test_a_class_defined_inside_the_function_is_found(repo, write):
+    two_savers(write)
+    write(
+        "use.py",
+        "def check():\n"
+        "    class Local:\n        def save(self):\n            pass\n"
+        "    thing = Local()\n    thing.save()\n",
+        commit="local-class",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("use.py::check.<locals>.Local.save", "HIGH") in targets_of(store, "use.py::check")
+    assert not any("models.py" in dst for dst, _ in targets_of(store, "use.py::check"))
+    store.close()
+
+
+def test_a_module_level_instance_is_seen_from_a_function(repo, write):
+    two_savers(write)
+    write(
+        "app.py",
+        "from models import Item\n\nitem = Item()\n\n\ndef persist():\n    item.save()\n",
+        commit="global",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert targets_of(store, "app.py::persist") == {("models.py::Item.save", "HIGH")}
+    store.close()
+
+
+# The Protocol question. A `typing.Protocol` is satisfied structurally: its
+# implementations need not subclass it, so the hierarchy has no link from the
+# Protocol to the code that runs. Binding a call to the stub alone would repeat
+# #14 -- narrower, more confident, more wrong than the fan-out it replaced.
+
+TREE_SOURCES = (
+    "from typing import Protocol\n\n\n"
+    "class TreeSource(Protocol{generic}):\n"
+    "    def tree(self, rev): ...\n\n"
+    "    def read(self, shas): ...\n\n\n"
+    "class GitTreeSource:\n"
+    "    def tree(self, rev):\n        return {{}}\n\n"
+    "    def read(self, shas):\n        return []\n\n\n"
+    "class FsTreeSource:\n"
+    "    def tree(self, rev):\n        return {{}}\n\n"
+    "    def read(self, shas):\n        return []\n\n\n"
+    "class Unrelated:\n"
+    "    def read(self):\n        return b''\n"
+)
+
+INDEXER = (
+    "from source import TreeSource\n\n\n"
+    "class Indexer:\n"
+    "    def __init__(self, source: TreeSource):\n        self.source = source\n\n"
+    "    def reconcile(self):\n        return self.source.read([])\n"
+)
+
+
+@pytest.mark.parametrize("generic", ["", "[T]"])
+def test_a_protocol_receiver_reaches_its_structural_implementers(repo, write, generic):
+    write("source.py", TREE_SOURCES.format(generic=generic))
+    write("indexer.py", INDEXER, commit="protocol")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = targets_of(store, "indexer.py::Indexer.reconcile")
+    assert ("source.py::TreeSource.read", "HIGH") in found
+    assert ("source.py::GitTreeSource.read", "MEDIUM") in found
+    assert ("source.py::FsTreeSource.read", "MEDIUM") in found
+    store.close()
+
+
+def test_a_protocol_receiver_never_loses_a_candidate_the_fan_out_had(repo, write):
+    """The floor, by construction. `Unrelated.read` does not implement the
+    Protocol, and today's LOW fan-out still contains it; the receiver step
+    keeps it, at LOW, rather than deciding it away. Structural matching is an
+    approximation -- an implementer can inherit a method from a class outside
+    the repository, or satisfy a member with an attribute set in `__init__` --
+    and over-approximation is this resolver's bias."""
+    write("source.py", TREE_SOURCES.format(generic=""))
+    write("indexer.py", INDEXER, commit="protocol")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    today = set(Ambiguity(store, "HEAD").candidates("self.source.read"))
+    found = targets_of(store, "indexer.py::Indexer.reconcile")
+    assert today <= {dst for dst, _ in found}
+    assert ("source.py::Unrelated.read", "LOW") in found
+    store.close()
+
+
+def test_a_union_with_a_protocol_and_a_reassignment_is_medium(repo, write):
+    """`resolver: Resolver | None = None` then `resolver = resolver or
+    AstResolver()` -- `resolve.py`'s own shape, and two of this repository's
+    twelve ambiguous references."""
+    write(
+        "resolver.py",
+        "from typing import Protocol\n\n\n"
+        "class Resolver(Protocol):\n    def resolve_call(self, ref): ...\n\n\n"
+        "class AstResolver:\n    def resolve_call(self, ref):\n        return []\n",
+    )
+    write(
+        "run.py",
+        "from resolver import AstResolver, Resolver\n\n\n"
+        "def run(resolver: Resolver | None = None):\n"
+        "    resolver = resolver or AstResolver()\n"
+        "    return resolver.resolve_call(1)\n",
+        commit="union",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = targets_of(store, "run.py::run")
+    assert ("resolver.py::Resolver.resolve_call", "MEDIUM") in found
+    assert ("resolver.py::AstResolver.resolve_call", "MEDIUM") in found
+    assert not [conf for _, conf in found if conf == "HIGH" and _ != "resolver.py::AstResolver"]
     store.close()

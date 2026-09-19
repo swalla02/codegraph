@@ -403,3 +403,152 @@ def test_hashing_does_not_mutate_the_tree_it_is_given():
             _class_body_hash(node)
     assert ast.dump(tree) == before
     assert _module_body_hash(tree) == first
+
+
+# -- per-scope bindings (#47) --------------------------------------------------
+#
+# What each name in each scope was declared or constructed as, so the resolver
+# can answer `catalog.fingerprint()` with the type written a few lines up. The
+# parser records only what the text says; which of these names a class is, and
+# whether a call constructs one, is decided in phase 2.
+
+
+def bindings(source: str) -> set[tuple]:
+    result = parse_blob(source.encode())
+    return {(b.scope, b.name, b.kind, b.type) for b in result.bindings}
+
+
+def test_an_annotated_parameter_is_recorded():
+    got = bindings("def fingerprint(catalog: Catalog) -> str:\n    return catalog.fingerprint()\n")
+    assert got == {("fingerprint", "catalog", "annotation", "Catalog")}
+
+
+def test_annotations_are_unwrapped_to_the_classes_they_name():
+    """`None` is dropped rather than recorded: no repo method can be called on
+    it, so `Resolver | None` says exactly as much as `Resolver` does about what
+    `resolver.resolve_call` can reach. A union keeps one row per member."""
+    got = bindings(
+        "def f(a: Resolver | None, b: 'Store', c: Optional[mod.Thing],\n"
+        "      d: Union[A, B], e: Annotated[Item, 'meta'], g: Box[int]):\n"
+        "    pass\n"
+    )
+    assert got == {
+        ("f", "a", "annotation", "Resolver"),
+        ("f", "b", "annotation", "Store"),
+        ("f", "c", "annotation", "mod.Thing"),
+        ("f", "d", "annotation", "A"),
+        ("f", "d", "annotation", "B"),
+        ("f", "e", "annotation", "Item"),
+        ("f", "g", "annotation", "Box"),
+    }
+
+
+def test_a_local_assigned_from_a_call_records_the_callee():
+    got = bindings("def f():\n    item = models.Item()\n    item.save()\n")
+    assert got == {("f", "item", "call", "models.Item")}
+
+
+def test_or_else_reassignment_records_both_sides_of_the_union():
+    """`resolver = resolver or AstResolver()` (`resolve.py`). The left operand
+    is the name itself, which adds nothing new; the right is a construction."""
+    got = bindings(
+        "def run(resolver: Resolver | None = None):\n    resolver = resolver or AstResolver()\n"
+    )
+    assert got == {
+        ("run", "resolver", "annotation", "Resolver"),
+        ("run", "resolver", "call", "AstResolver"),
+    }
+
+
+def test_self_attribute_assigned_from_an_annotated_parameter_is_a_class_binding():
+    got = bindings(
+        "class Indexer:\n"
+        "    def __init__(self, root, source: TreeSource):\n"
+        "        self.source = source\n"
+        "        self.cache = Cache()\n"
+        "        self.root = root\n"
+        "        self.name: Label = make()\n"
+    )
+    assert {row for row in got if row[0] == "Indexer"} == {
+        ("Indexer", "self.source", "annotation", "TreeSource"),
+        ("Indexer", "self.cache", "call", "Cache"),
+        ("Indexer", "self.root", "opaque", None),
+        ("Indexer", "self.name", "annotation", "Label"),
+    }
+
+
+def test_a_class_body_annotation_declares_an_instance_attribute():
+    got = bindings("@dataclass\nclass Context:\n    store: Store\n")
+    assert got == {("Context", "self.store", "annotation", "Store")}
+
+
+def test_self_and_cls_are_not_recorded_but_a_staticmethod_parameter_is():
+    got = bindings(
+        "class A:\n"
+        "    def m(self):\n        pass\n"
+        "    @classmethod\n    def c(cls):\n        pass\n"
+        "    @staticmethod\n    def s(item: Item):\n        pass\n"
+    )
+    assert got == {("A.s", "item", "annotation", "Item")}
+
+
+def test_bindings_nothing_can_type_are_recorded_as_opaque():
+    """Recorded, not skipped. A name bound somewhere the resolver cannot read a
+    type off must stop it from trusting the bindings it CAN read -- a loop
+    variable, an unpacked tuple, an augmented assignment, an unannotated
+    parameter, a `with` target, a subscript -- or a single `item = Item()`
+    would be claimed HIGH while `item` is rebound three lines later."""
+    got = bindings(
+        "def f(plain, *args, **kwargs):\n"
+        "    for row in rows:\n        pass\n"
+        "    a, b = pair\n"
+        "    total += 1\n"
+        "    with open(p) as handle:\n        pass\n"
+        "    first = rows[0]\n"
+        "    try:\n        pass\n    except Exception as error:\n        pass\n"
+        "    squares = [x for x in rows]\n"
+        "    key = lambda k: k\n"
+    )
+    opaque = {name for scope, name, kind, _ in got if kind == "opaque"}
+    assert opaque == {
+        "plain", "args", "kwargs", "row", "a", "b", "total", "handle", "first", "error",
+        "squares", "x", "k", "key",
+    }
+    # `open(p)` is still a call, but the `with` target is what `__enter__`
+    # returns -- not what was called.
+    assert ("f", "handle", "call", "open") not in got
+
+
+def test_assigning_none_records_nothing():
+    got = bindings("def f():\n    conn = None\n    conn = Connection()\n")
+    assert got == {("f", "conn", "call", "Connection")}
+
+
+def test_a_self_attribute_copied_from_an_unannotated_name_is_opaque():
+    got = bindings("class A:\n    def __init__(self, source):\n        self.source = source\n")
+    assert ("A", "self.source", "opaque", None) in got
+
+
+def test_global_and_nonlocal_make_the_outer_binding_opaque():
+    got = bindings(
+        "app = Flask()\n"
+        "def reset():\n    global app\n    app = make()\n"
+        "def outer():\n    item = Item()\n"
+        "    def inner():\n        nonlocal item\n        item = other()\n"
+    )
+    assert ("<module>", "app", "opaque", None) in got
+    assert ("outer", "item", "opaque", None) in got
+
+
+def test_module_scope_bindings_are_recorded_under_the_module():
+    got = bindings("app = Flask(__name__)\n")
+    assert got == {("<module>", "app", "call", "Flask")}
+
+
+def test_a_subscripted_base_is_recorded_as_its_class():
+    """`class TreeSource(Protocol[T])` inherits from `Protocol` at runtime; the
+    subscript is a type argument, not a different base. Dropping the base
+    because it did not flatten would make a generic Protocol look like a plain
+    class, and the resolver would then bind calls through it to the stub."""
+    result = parse_blob(b"class Source(Protocol[T]):\n    pass\n")
+    assert [r.raw_name for r in result.refs if r.ref_kind == "base"] == ["Protocol"]

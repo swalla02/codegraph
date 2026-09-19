@@ -591,6 +591,43 @@ def test_a_definition_added_elsewhere_updates_another_files_edges(repo, write):
     store.close()
 
 
+def test_an_attribute_type_edit_updates_a_subclass_in_another_file(repo, write):
+    """`self.thing.save()` in `child.py` resolves through what `base.py` says
+    `self.thing` is (#47). Changing that annotation declares no new symbol and
+    no new base, so the symbol-table check alone would narrow the reconcile to
+    `base.py` and leave `child.py` pointing at the old type."""
+    write(
+        "models.py",
+        "class Item:\n    def save(self):\n        pass\n\n\n"
+        "class Other:\n    def save(self):\n        pass\n",
+    )
+    base = (
+        "from models import Item, Other\n\n\n"
+        "class Base:\n    def __init__(self, thing: {}):\n        self.thing = thing\n"
+    )
+    write("base.py", base.format("Item"))
+    write(
+        "child.py",
+        "from base import Base\n\n\nclass Child(Base):\n"
+        "    def go(self):\n        return self.thing.save()\n",
+        commit="three",
+    )
+    store = Store.open(repo)
+    indexer = Indexer(repo, store, GitTreeSource(repo))
+    indexer.reconcile(WORKTREE)
+    write("base.py", base.format("Other"))
+    indexer.reconcile(WORKTREE)
+    dsts = {
+        row["dst"]
+        for row in store.connection.execute(
+            "SELECT dst FROM edges WHERE rev=? AND src='child.py::Child.go'", (WORKTREE,)
+        )
+    }
+    assert dsts == {"models.py::Other.save"}
+    assert dump_graph(store, WORKTREE) == cold_dump(repo, WORKTREE)
+    store.close()
+
+
 def test_rebuild_rebuilds_layer_2_not_just_the_parse_cache(repo, write):
     """`--rebuild` used to clear only the `blobs` cache. The tree and the
     fingerprint were untouched, so the reconcile that followed took the

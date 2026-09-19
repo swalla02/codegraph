@@ -11,7 +11,7 @@ import copy
 import hashlib
 from dataclasses import dataclass, field
 
-PARSER_VERSION = "3"
+PARSER_VERSION = "4"
 
 _DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
@@ -49,11 +49,46 @@ class ParsedImport:
     alias: str | None
 
 
+#: `ParsedBinding.kind` values.
+#:
+#: - `annotation`: the name was declared with this type (a parameter
+#:   annotation, `x: T = ...`, a class-body `x: T`).
+#: - `call`: the name was assigned the result of calling this dotted name.
+#:   Whether that is a construction is not the parser's to say -- `Item()` and
+#:   `load()` look identical here, and only phase 2 knows which one names a
+#:   class.
+#: - `opaque`: the name was bound by something no type can be read off: a loop
+#:   variable, an unpacked tuple, an unannotated parameter, `x += 1`, a
+#:   subscript. It carries no type, and its presence is the point: it tells the
+#:   resolver the bindings it CAN read are not the whole story.
+ANNOTATION, CALL, OPAQUE = "annotation", "call", "opaque"
+
+
+@dataclass(frozen=True)
+class ParsedBinding:
+    """One way a name in one scope was bound, as the text states it.
+
+    `scope` uses the same spelling as `ParsedRef.from_qualname`, so a call's
+    receiver is looked up under exactly the scope the call was recorded in:
+    `f`, `C.m`, `f.<locals>.g`, or `<module>`. An instance attribute is
+    recorded under its CLASS, as `self.x`, because every method of that class
+    (and of its subclasses) reads the same attribute.
+    """
+
+    ordinal: int
+    scope: str
+    name: str
+    kind: str
+    type: str | None
+    line: int
+
+
 @dataclass(frozen=True)
 class ParseResult:
     nodes: tuple[ParsedNode, ...] = ()
     refs: tuple[ParsedRef, ...] = ()
     imports: tuple[ParsedImport, ...] = ()
+    bindings: tuple[ParsedBinding, ...] = ()
     #: Structural hash of the module's top-level statements, with every
     #: nested function/class BODY elided (see `_module_skeleton`). Empty on
     #: a parse error, since there is no tree to hash.
@@ -72,6 +107,154 @@ def _dotted_name(node: ast.AST) -> str | None:
         return None
     parts.append(current.id)
     return ".".join(reversed(parts))
+
+
+#: Typing constructs whose FIRST argument is the type a name actually holds:
+#: `Optional[T]`, `Annotated[T, meta]`, `ClassVar[T]`, `Final[T]`. Every other
+#: subscript is a generic applied to its arguments -- `Box[int]` is a `Box`,
+#: `list[Item]` is a `list` -- and is recorded as the thing subscripted.
+_TRANSPARENT_WRAPPERS = frozenset(
+    {"Optional", "Annotated", "ClassVar", "Final", "Required", "NotRequired", "ReadOnly"}
+)
+
+#: Internal marker for `self.x = name`: "whatever `name` is bound to in this
+#: scope". Resolved within the parse (`_finalize_bindings`) and never stored.
+_ALIAS = "alias"
+
+
+def _annotation_types(node: ast.expr) -> list[str] | None:
+    """The class names an annotation says a value may be, or None when it says
+    something this cannot reduce to class names (`Callable[..., T]` is not a
+    `Callable` whose methods get called, a `Literal` is no class at all, and a
+    string that does not parse is nothing).
+
+    `None` members are dropped rather than recorded: no repository method can
+    be called on `None`, so `Resolver | None` says exactly as much as
+    `Resolver` about what a call on the name can reach. An empty list is
+    therefore a real answer ("only ever None"), distinct from None ("unknown").
+    """
+    if isinstance(node, ast.Constant):
+        if node.value is None:
+            return []
+        if isinstance(node.value, str):
+            # A forward reference, `"Catalog"`, is the same annotation quoted.
+            try:
+                return _annotation_types(ast.parse(node.value.strip(), mode="eval").body)
+            except (SyntaxError, ValueError):
+                return None
+        return None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _union(_annotation_types(node.left), _annotation_types(node.right))
+    if isinstance(node, ast.Subscript):
+        head = _dotted_name(node.value)
+        if head is None:
+            return None
+        last = head.rpartition(".")[2]
+        args = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+        if last == "Union":
+            return _union(*(_annotation_types(arg) for arg in args))
+        if last in _TRANSPARENT_WRAPPERS:
+            return _annotation_types(args[0]) if args else None
+        return [head]
+    name = _dotted_name(node)
+    return [name] if name else None
+
+
+def _union(*parts: list | None) -> list | None:
+    """Concatenate, unless any part is unknown -- then the whole is unknown."""
+    if any(part is None for part in parts):
+        return None
+    return [item for part in parts for item in part]
+
+
+def _value_types(node: ast.expr, target: str) -> list[tuple[str, str]] | None:
+    """What assigning `node` to `target` binds it to, as `(kind, type)` pairs,
+    or None when nothing can be read off the value.
+
+    Only shapes that name their answer are read:
+
+    - `Item()` / `models.Item()`: a call, recorded by its callee. Phase 2
+      decides whether the callee is a class.
+    - `x = source`: whatever `source` is bound to in the same scope. This is
+      how `self.source = source` in `__init__` inherits the parameter's
+      annotation.
+    - `a or B()` and `a if c else B()`: each operand is a possible value, so
+      the union of what each binds. An operand that is the target itself
+      (`resolver = resolver or AstResolver()`) adds nothing new.
+    - `None`: binds no class, and contributes nothing (see `_annotation_types`).
+
+    Everything else -- a subscript, an arithmetic result, a chained call's
+    return value -- is opaque. Return-type inference is deliberately out of
+    scope (#47): `Catalog.load(...).fingerprint()` needs to know what `load`
+    returns, which is a different mechanism with different evidence.
+    """
+    if isinstance(node, ast.Constant) and node.value is None:
+        return []
+    if isinstance(node, ast.Call):
+        callee = _dotted_name(node.func)
+        return [(CALL, callee)] if callee else None
+    if isinstance(node, ast.Name | ast.Attribute):
+        name = _dotted_name(node)
+        if name == target:
+            return []
+        return [(_ALIAS, node.id)] if isinstance(node, ast.Name) else None
+    if isinstance(node, ast.BoolOp):
+        operands = node.values
+    elif isinstance(node, ast.IfExp):
+        operands = [node.body, node.orelse]
+    else:
+        return None
+    return _union(*(_value_types(operand, target) for operand in operands))
+
+
+def enclosing_function_scopes(scope: str) -> list[str]:
+    """`f.<locals>.g.<locals>.h` -> [`f.<locals>.g`, `f`]: the function scopes
+    a name in `scope` can close over, nearest first. Class scopes are not among
+    them, exactly as in Python, where a method cannot see its class body's
+    names."""
+    pieces = scope.split(".<locals>.")
+    return [".<locals>.".join(pieces[:end]) for end in range(len(pieces) - 1, 0, -1)]
+
+
+def _finalize_bindings(raw: list[tuple]) -> tuple[ParsedBinding, ...]:
+    """Replace every `x = name` alias with what `name` is bound to, and number
+    the result.
+
+    Done after the whole module is visited, not at the assignment, because a
+    binding may be written after the alias in source order (`self.x = item`
+    above a later `item = other()` in the same function) and the resolver is
+    flow-insensitive: a name means every binding it has in its scope.
+
+    An alias is copied only when its source is fully known. If `name` has no
+    binding in the scope (it is a global, or a closure variable), an opaque
+    binding, or is itself an alias, the alias site becomes opaque -- one level
+    of copying keeps this a lookup rather than a fixpoint, and anything deeper
+    is left unknown rather than half-answered.
+    """
+    direct: dict[tuple[str, str], list[tuple[str, str | None]]] = {}
+    aliased: set[tuple[str, str]] = set()
+    for scope, name, kind, type_, _line, _source_scope in raw:
+        if kind == _ALIAS:
+            aliased.add((scope, name))
+        else:
+            direct.setdefault((scope, name), []).append((kind, type_))
+
+    rows: list[tuple[str, str, str, str | None, int]] = []
+    for scope, name, kind, type_, line, source_scope in raw:
+        if kind != _ALIAS:
+            rows.append((scope, name, kind, type_, line))
+            continue
+        key = (source_scope, type_)
+        source = direct.get(key)
+        if not source or key in aliased or any(k == OPAQUE for k, _ in source):
+            rows.append((scope, name, OPAQUE, None, line))
+            continue
+        for copied_kind, copied_type in dict.fromkeys(source):
+            rows.append((scope, name, copied_kind, copied_type, line))
+    return tuple(
+        ParsedBinding(ordinal=index, scope=scope, name=name, kind=kind, type=type_, line=line)
+        for index, (scope, name, kind, type_, line) in enumerate(rows)
+    )
 
 
 #: Any of these appearing in a literal `open(...)` mode string makes the
@@ -248,6 +431,12 @@ class _Collector(ast.NodeVisitor):
         # replaces a class-level set, which would leak state across parses.
         self._kinds: list[str] = ["module"]
         self._conditional_depth = 0
+        #: `(scope, name, kind, type, line, source_scope)`, aliases unresolved;
+        #: see `_finalize_bindings`.
+        self.raw_bindings: list[tuple] = []
+        #: Qualnames of the enclosing classes, innermost last: where a
+        #: `self.x = ...` inside a method is recorded.
+        self._classes: list[str] = []
 
     # -- scope helpers -------------------------------------------------
     @property
@@ -306,6 +495,13 @@ class _Collector(ast.NodeVisitor):
         )
         if kind == "class":
             for base in node.bases:
+                # `Protocol[T]` / `Base[T]`: the class inherits from what is
+                # subscripted -- the argument parametrizes it, it is not a
+                # different base. Dropping it would make a generic Protocol
+                # indistinguishable from a plain class, and the receiver step
+                # would then bind calls through it to the stub alone.
+                if isinstance(base, ast.Subscript):
+                    base = base.value
                 name = _dotted_name(base)
                 if name:
                     self.refs.append(
@@ -319,15 +515,153 @@ class _Collector(ast.NodeVisitor):
                         )
                     )
 
+        qualname = self._qualname(node.name)
+        if kind in ("function", "method"):
+            skip_first = kind == "method" and not any(
+                d.rpartition(".")[2] == "staticmethod" for d in decorators
+            )
+            self._record_parameters(node.args, qualname, skip_first)
+
         self._scope.append(node.name)
         self._kinds.append("class" if kind == "class" else "function")
+        if kind == "class":
+            self._classes.append(qualname)
         if kind in ("function", "method"):
             self._scope.append("<locals>")
         self.generic_visit(node)
         if kind in ("function", "method"):
             self._scope.pop()
+        if kind == "class":
+            self._classes.pop()
         self._kinds.pop()
         self._scope.pop()
+
+    # -- bindings ----------------------------------------------------------
+    @property
+    def _binding_scope(self) -> str:
+        """The scope a name bound here belongs to, spelled as refs spell it."""
+        return self._current_owner.removesuffix(".<locals>")
+
+    def _add_binding(self, scope: str, name: str, kind: str, type_: str | None, line: int) -> None:
+        self.raw_bindings.append((scope, name, kind, type_, line, self._binding_scope))
+
+    def _record_parameters(self, args: ast.arguments, scope: str, skip_first: bool) -> None:
+        """A parameter is a binding like any other. Annotated, it names its
+        type; unannotated, it is opaque -- the caller may pass anything, so a
+        later `item = Item()` in the body does not make `item` an `Item`.
+
+        The implicit first parameter of a method (`self`, `cls`) is skipped:
+        `self.X` is `_through_self`'s, which answers it by a stronger route.
+        `*args: T` and `**kwargs: T` hold a tuple and a dict OF `T`, so they are
+        opaque whatever they are annotated with.
+        """
+        positional = [*args.posonlyargs, *args.args]
+        if skip_first and positional:
+            positional = positional[1:]
+        for arg in [*positional, *args.kwonlyargs]:
+            types = _annotation_types(arg.annotation) if arg.annotation else None
+            if types is None:
+                self._add_binding(scope, arg.arg, OPAQUE, None, arg.lineno)
+            for type_ in types or ():
+                self._add_binding(scope, arg.arg, ANNOTATION, type_, arg.lineno)
+        for arg in (args.vararg, args.kwarg):
+            if arg is not None:
+                self._add_binding(scope, arg.arg, OPAQUE, None, arg.lineno)
+
+    def _bind(self, target: ast.expr, entries: list[tuple[str, str]] | None, line: int) -> None:
+        """Record `target` as bound to `entries` (None: opaque).
+
+        A plain name belongs to the current scope -- except in a class body,
+        where it is a class attribute, readable through `self`, and is recorded
+        as `self.x` on the class. `self.x` inside a method belongs to the
+        nearest enclosing class. Unpacking binds every element, opaquely: the
+        parser does not track which element of a tuple is which.
+        """
+        if isinstance(target, ast.Name):
+            if self._kinds[-1] == "class":
+                self._record(self._classes[-1], f"self.{target.id}", entries, line)
+            else:
+                self._record(self._binding_scope, target.id, entries, line)
+        elif (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "self"
+            and self._classes
+        ):
+            self._record(self._classes[-1], f"self.{target.attr}", entries, line)
+        elif isinstance(target, ast.Tuple | ast.List):
+            for element in target.elts:
+                self._bind(element, None, line)
+        elif isinstance(target, ast.Starred):
+            self._bind(target.value, None, line)
+
+    def _record(
+        self, scope: str, name: str, entries: list[tuple[str, str]] | None, line: int
+    ) -> None:
+        if entries is None:
+            self._add_binding(scope, name, OPAQUE, None, line)
+            return
+        for kind, type_ in entries:
+            self._add_binding(scope, name, kind, type_, line)
+
+    @staticmethod
+    def _target_name(target: ast.expr) -> str:
+        return _dotted_name(target) or ""
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            self._bind(target, _value_types(node.value, self._target_name(target)), node.lineno)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        types = _annotation_types(node.annotation)
+        entries = None if types is None else [(ANNOTATION, type_) for type_ in types]
+        self._bind(node.target, entries, node.lineno)
+        self.generic_visit(node)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self._bind(node.target, _value_types(node.value, node.target.id), node.lineno)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self._bind(node.target, None, node.lineno)
+        self.generic_visit(node)
+
+    def visit_For(self, node: ast.For) -> None:
+        self._bind(node.target, None, node.lineno)
+        self.generic_visit(node)
+
+    visit_AsyncFor = visit_For  # type: ignore[assignment]
+
+    def visit_With(self, node: ast.With) -> None:
+        # The target is what `__enter__` returns, not what was called.
+        for item in node.items:
+            if item.optional_vars is not None:
+                self._bind(item.optional_vars, None, node.lineno)
+        self.generic_visit(node)
+
+    visit_AsyncWith = visit_With  # type: ignore[assignment]
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name:
+            self._record(self._binding_scope, node.name, None, node.lineno)
+        self.generic_visit(node)
+
+    def visit_comprehension(self, node: ast.comprehension) -> None:
+        # Comprehensions get no scope of their own here, so their variables are
+        # recorded (opaquely) in the enclosing one. That over-reports: an outer
+        # `x = Item()` alongside `[x for x in rows]` becomes unknown. It is the
+        # safe direction -- the resolver falls back to what it did before.
+        self._bind(node.target, None, node.target.lineno)
+        self.generic_visit(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]:
+            self._record(self._binding_scope, arg.arg, None, node.lineno)
+        for arg in (node.args.vararg, node.args.kwarg):
+            if arg is not None:
+                self._record(self._binding_scope, arg.arg, None, node.lineno)
+        self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         kind = "method" if self._kinds[-1] == "class" else "function"
@@ -403,9 +737,24 @@ class _Collector(ast.NodeVisitor):
 
     def visit_Global(self, node: ast.Global) -> None:
         self._record_global(node, node.names)
+        self._record_outer_rebinding(node, node.names, ["<module>"])
 
     def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
         self._record_global(node, node.names)
+        self._record_outer_rebinding(
+            node, node.names, enclosing_function_scopes(self._binding_scope)
+        )
+
+    def _record_outer_rebinding(self, node: ast.AST, names: list[str], scopes: list[str]) -> None:
+        """`global x` / `nonlocal x` let this scope rebind a name that belongs
+        to another one, with whatever it likes. The outer scope's own bindings
+        of `x` are then not all of them, so an opaque binding is recorded there
+        (and here). Which outer scope `nonlocal` means is the nearest one that
+        binds the name; marking every enclosing function is the conservative
+        superset."""
+        for name in names:
+            for scope in [self._binding_scope, *scopes]:
+                self._add_binding(scope, name, OPAQUE, None, node.lineno)
 
     def _record_global(self, node: ast.AST, names: list[str]) -> None:
         # `global`/`nonlocal` both bind the name to an outer scope, so a
@@ -490,6 +839,7 @@ def parse_blob(source: bytes) -> ParseResult:
         nodes=_apply_shadowing(collector.nodes),
         refs=tuple(collector.refs),
         imports=tuple(collector.imports),
+        bindings=_finalize_bindings(collector.raw_bindings),
         module_body_hash=_module_body_hash(tree),
         error=None,
     )

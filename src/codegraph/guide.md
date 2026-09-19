@@ -170,11 +170,13 @@ the full set and how confident it is in each edge.
   only when something is actually hidden.
 - Many of those `LOW` rows are not in the stored graph at all. A call like
   `item.save()` that names nothing importable, nothing module-local and
-  nothing reachable through `self` matches every definition named `save`
-  in the repository — up to 971 of them on django — and codegraph records
-  the call once rather than storing that cross product, expanding it when
-  a query asks. So `impact` can name callers that no edge in the database
-  names, and `--limit` is the only bound on how many.
+  nothing reachable through `self` — and whose receiver `item` was neither
+  annotated with a class nor assigned one in its scope — matches every
+  definition named `save` in the repository — up to 971 of them on django —
+  and codegraph records the call once rather than storing that cross
+  product, expanding it when a query asks. So `impact` can name callers
+  that no edge in the database names, and `--limit` is the only bound on
+  how many.
 - `impact --limit N` caps the *total* rows kept across `dependents` and
   `tests` combined at `N` (default 40) — not `N` each — so the printed
   report never exceeds its documented budget. The `low_confidence` sample

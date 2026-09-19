@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from codegraph.config import Config
-from codegraph.parse import SUPER, ParsedRef
+from codegraph.parse import CALL, OPAQUE, SUPER, ParsedRef, enclosing_function_scopes
 from codegraph.store import Store
 
 HIGH, MEDIUM, LOW = "HIGH", "MEDIUM", "LOW"
@@ -75,6 +75,87 @@ def is_builtin_call(ref: ParsedRef) -> bool:
     builtin.
     """
     return not ref.dotted and ref.raw_name in BUILTIN_NAMES
+
+
+def is_external_call(ref: ParsedRef, ctx: ResolveContext) -> bool:
+    """Is this reference a call into a module the repository does not contain?
+
+    `import pytest` then `pytest.main([...])`: the head is bound by an import,
+    and the module it names is nowhere in the tree. Nothing in this graph can
+    be the callee, because the graph never parses site-packages or the standard
+    library -- so projecting `main` onto the repository's own `main` functions
+    is not a weak answer, it is a wrong one. `bench/tracer.py:112` reported
+    three such candidates; `json.dumps(x)` with a single repo `dumps` became a
+    MEDIUM edge. See #47.
+
+    The test is deliberately stricter than "the lookup failed". The head's
+    import target is external only when its FIRST segment names no module, no
+    package and no directory anywhere in the repository (`repo_segments`):
+
+    - `import pkg` then `pkg.main()`, where `pkg` is a repo package but defines
+      no `main`, is not external. The name may be bound at runtime, and it
+      keeps the name match it always had.
+    - `from model_fields.models import build`, where the file is
+      `tests/model_fields/models.py` and a test runner put `tests/` on
+      `sys.path`, is not external either. `module_for_path` spells that module
+      `tests.model_fields.models`, so an exact module lookup would call it
+      foreign -- but a head that names any path component in the tree is not
+      provably someone else's code.
+
+    Both errors fall in the same direction: a reference this cannot classify
+    keeps today's behaviour. Only a head the repository could not possibly
+    supply is written off, which is what makes it sound to claim.
+
+    Like `is_builtin_call`, this is only consulted once every step that could
+    find a repo symbol has declined: an imported name that DOES resolve was
+    answered at step 1, and a module-local definition of the same name at step
+    2.
+    """
+    head = ref.raw_name.partition(".")[0]
+    target = ctx.import_map.get(head)
+    if not target:
+        return False
+    if local_bindings(head, ref.from_qualname, ctx):
+        # `def go(json): json.dumps()` -- the parameter shadows the import for
+        # the whole body, so the call is on whatever was passed.
+        return False
+    return target.partition(".")[0] not in ctx.repo_segments
+
+
+@dataclass(frozen=True)
+class Binding:
+    """One `blob_bindings` row, placed in its revision: where the name was bound
+    (`path`, `scope`) and what the text says it was bound to."""
+
+    path: str
+    scope: str
+    kind: str
+    type: str | None
+
+
+def local_bindings(name: str, scope: str, ctx: ResolveContext) -> list[Binding]:
+    """Every binding of `name` visible from `scope` in `ctx.path`, from the
+    nearest scope that binds it at all -- the function itself, then each
+    enclosing function, then the module. Class bodies are skipped, as Python
+    skips them. Empty if nothing binds it.
+
+    The first scope with ANY binding wins, opaque ones included: a name bound
+    in a function is local to it everywhere in its body, so a module-level
+    `item = Item()` says nothing about a function that also loops over `item`.
+    """
+    chain = [scope, *enclosing_function_scopes(scope)]
+    if MODULE_SCOPE not in chain:
+        chain.append(MODULE_SCOPE)
+    for candidate in chain:
+        found = ctx.bindings.get((ctx.path, candidate, name))
+        if found:
+            return found
+    return []
+
+
+#: What a class must list among its bases to be a `typing.Protocol`.
+PROTOCOL_BASES = frozenset({"typing.Protocol", "typing_extensions.Protocol"})
+
 
 #: `src` for a reference made at module scope, which owns no node of its own.
 MODULE_SCOPE = "<module>"
@@ -159,6 +240,25 @@ class ResolveContext:
     #: hierarchy is fixed once inheritance has been resolved, but the walk runs
     #: per `self.X` reference -- on django that cost 3.5s of a 11.2s resolve.
     descendant_cache: dict[str, list[str]] = field(default_factory=dict)
+    #: Every segment of every module name in the revision: `tests`,
+    #: `model_fields` and `models` for `tests/model_fields/models.py`. A name
+    #: outside this set cannot be supplied by the repository under any
+    #: `sys.path` arrangement; see `is_external_call`.
+    repo_segments: frozenset[str] = frozenset()
+    #: (path, scope, name) -> how that name was bound there; see `Binding`.
+    bindings: dict[tuple[str, str, str], list[Binding]] = field(default_factory=dict)
+    #: Live class node ids.
+    class_ids: frozenset[str] = frozenset()
+    #: class node id -> its base references as written (`Protocol`,
+    #: `typing.Protocol`), which is how a Protocol is recognised: `Protocol`
+    #: lives outside the repository, so no INHERITS edge ever points at it.
+    class_bases: dict[str, list[str]] = field(default_factory=dict)
+    #: class node id -> the names of the methods it defines itself.
+    class_members: dict[str, frozenset[str]] = field(default_factory=dict)
+    #: Memo for the receiver step's per-class answers (is it a Protocol, what
+    #: does its MRO define, who implements it), shared across the revision like
+    #: `descendant_cache`.
+    receiver_cache: dict[tuple, object] = field(default_factory=dict)
 
 
 def breadth_first(start: str, adjacency: dict[str, list[str]]) -> list[str]:
@@ -190,8 +290,8 @@ class AstResolver:
     """Scope-aware heuristics over the revision's symbol table.
 
     First match wins, in the order the spec fixes: imported name, module-local
-    name, `self.X` through the class and its bases, then a repo-wide match on
-    the final dotted segment.
+    name, `self.X` through the class and its bases, a method on a receiver whose
+    type is written down, then a repo-wide match on the final dotted segment.
     """
 
     def resolve_call(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
@@ -200,6 +300,7 @@ class AstResolver:
             self._module_local,
             self._through_super,
             self._through_self,
+            self._through_receiver,
             self._by_last_segment,
         ):
             hits = step(ref, ctx)
@@ -432,9 +533,268 @@ class AstResolver:
             ctx.descendant_cache[start] = cached
         return cached
 
+    # -- step 3b: x.m() through what `x` was declared or constructed as ----
+    def _through_receiver(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
+        """`catalog.fingerprint()` where `catalog: Catalog`, `item.save()` where
+        `item = Item()`, and `self.source.tree()` where `__init__` did
+        `self.source = source` from `source: TreeSource`.
+
+        Every step above resolves a NAME. Nothing resolved a receiver, so a call
+        on a variable reached the bare-name match with only its last segment,
+        even when the variable's type was written a few lines up. On this
+        repository that was half of the ambiguous references. See #47.
+
+        The receiver's type is read from `blob_bindings`, never inferred:
+
+        - Annotations -- parameters, `x: T`, a class-body `x: T`, and a
+          `self.x` copied from an annotated parameter. They cover what crosses
+          a function boundary.
+        - Constructor tracking -- `item = Item()`, the same for `self.x`. It
+          covers what is born inside one.
+
+        The type name is looked up with the machinery that already answers a
+        call: the file's import map and `_lookup_dotted` (re-exports and all),
+        then a class defined in an enclosing function, then one defined in the
+        module. The method is then found on it the way `_through_self` finds
+        one.
+
+        The step declines -- the reference falls through to exactly the answer
+        it had before -- unless EVERY binding of the receiver is known: one
+        opaque binding (a loop variable, an unannotated parameter), a callee
+        that is a function rather than a class, a type outside the repository,
+        or a class on which the method cannot be found, and nothing is claimed.
+        A partial answer here would be narrower than the fan-out and not more
+        right.
+
+        Confidence, per mechanism:
+
+        - An annotation on a concrete class, bound once: the declaration its
+          MRO resolves to is HIGH, and every subclass override is MEDIUM. This
+          is `_through_self`'s argument unchanged. `catalog: Catalog` is a
+          recorded fact about the text, as `from x import Catalog` is, and the
+          value may be a subclass instance exactly as `self` may be -- so the
+          overrides are real candidates (#14), less certain than the
+          declaration and far more grounded than a repo-wide guess. Python does
+          not enforce the annotation; neither does it enforce that an imported
+          name is not rebound, and that has been HIGH since the start.
+        - A construction, bound once: HIGH, and NO subclass overrides.
+          `Item()` names the exact class, for the reason `constructor_target`
+          gives -- the instance is an `Item`, not a subclass of one.
+        - A Protocol: see below.
+        - Any of these with more than one binding (the name is reassigned, or
+          annotated with a union of classes): every candidate is capped at
+          MEDIUM. Which binding reaches the call depends on control flow this
+          does not track, and each is still a real, declared candidate --
+          neither a certainty nor a guess. `x: T | None` counts as one binding:
+          `None` is not a class, and the parser drops it.
+
+        The Protocol question. `typing.Protocol` is satisfied structurally, so
+        `GitTreeSource` implements `TreeSource` without subclassing it and the
+        hierarchy holds no link between them. Resolving `source: TreeSource` to
+        `TreeSource.tree` alone would bind the call to a stub at HIGH and hide
+        the code that runs -- #14's failure again, narrower and more confident
+        than the LOW fan-out it replaced, which at least contained the right
+        answer. Of the three options #47 lays out, this takes the first AND
+        the second:
+
+        - the Protocol's declaration is HIGH -- it is what the annotation names
+          and the contract every caller is written against, so editing its
+          signature does affect this call;
+        - every structural implementer -- a non-Protocol class whose MRO
+          defines every method the Protocol (and its Protocol bases) declares,
+          or a class with a subclass that does -- is MEDIUM, the tier
+          `_through_self` gives a candidate that runs depending on the instance;
+        - and every candidate the bare-name fan-out would have produced that is
+          not already among them stays, at LOW.
+
+        The last clause is the floor, and it holds by construction: no
+        Protocol-typed receiver can lose a candidate today's fan-out contains.
+        Structural matching alone cannot promise that. An implementer can
+        inherit a method from a class outside the repository, or satisfy a
+        member with an attribute assigned in `__init__`, and neither is a node
+        whose method set this can read; dropping those classes would trade
+        recall for precision, which this resolver never does. What the step
+        adds for a Protocol is ranking, not removal: the implementers a reader
+        would name rise above the unrelated `read` methods, and the result is
+        materialized as edges rather than deferred as `ambiguous`.
+
+        Skipping Protocol receivers entirely (option 3) was the other safe
+        choice, and it was rejected because five of the six annotation cases on
+        this repository are Protocols -- it would have left the mechanism
+        idle where the evidence says it matters.
+
+        ABCs are nominal: an implementation must subclass one (or be
+        `register()`ed, which is not tracked), so an ABC annotation takes the
+        concrete-class path, where subclass overrides are already candidates.
+        """
+        if ref.ref_kind != "call":
+            # A base class is named, never called on an instance.
+            return []
+        head, _, rest = ref.raw_name.partition(".")
+        if head == "self":
+            attribute, _, method = rest.partition(".")
+            if not method or "." in method:
+                return []
+            bindings = self._attribute_bindings(attribute, ref, ctx)
+        elif not rest or "." in rest or head.startswith("<"):
+            # `<attr>.x`, `<super>.x` and `<dynamic>` have no receiver name.
+            return []
+        else:
+            method = rest
+            bindings = local_bindings(head, ref.from_qualname, ctx)
+        if not bindings:
+            return []
+
+        types: list[tuple[str, bool]] = []
+        for binding in bindings:
+            if binding.kind == OPAQUE:
+                return []
+            class_id = self._resolve_type(binding, ctx)
+            if class_id is None:
+                return []
+            types.append((class_id, binding.kind == CALL))
+
+        hits: dict[str, str] = {}
+
+        def add(node_id: str, confidence: str) -> None:
+            previous = hits.get(node_id)
+            hits[node_id] = confidence if previous is None else stronger(previous, confidence)
+
+        structural = False
+        for class_id, constructed in types:
+            declared = self._inherited(class_id, method, ctx)
+            if declared is None:
+                return []
+            add(declared, HIGH)
+            if self._is_protocol(class_id, ctx):
+                structural = True
+                for node_id in self._implementers(class_id, method, ctx):
+                    add(node_id, MEDIUM)
+            elif not constructed:
+                for subclass in self._descendants(class_id, ctx):
+                    node_id = self._method_on(subclass, method, ctx)
+                    if node_id:
+                        add(node_id, MEDIUM)
+
+        if len(bindings) > 1:
+            hits = {node_id: weaker(conf, MEDIUM) for node_id, conf in hits.items()}
+        if structural:
+            for node_id in ctx.name_index.get(method, ()):
+                hits.setdefault(node_id, LOW)
+        return list(hits.items())
+
+    def _attribute_bindings(
+        self, attribute: str, ref: ParsedRef, ctx: ResolveContext
+    ) -> list[Binding]:
+        """Every binding of `self.<attribute>` the enclosing class can see.
+
+        That is the class, its bases, AND its subclasses: `self` may be a
+        subclass instance, and a subclass that assigns the attribute something
+        else changes what `self.x` holds inside an inherited method. Collecting
+        across the whole hierarchy means one opaque assignment anywhere in it
+        makes the step decline, which is the conservative direction.
+        """
+        owner = ctx.qualname_index.get((ctx.path, ref.from_qualname))
+        start = ctx.enclosing_class.get(owner) if owner else None
+        if start is None:
+            return []
+        found: list[Binding] = []
+        for class_id in [*self._mro(start, ctx), *self._descendants(start, ctx)]:
+            path, _, qualname = class_id.partition("::")
+            found.extend(ctx.bindings.get((path, qualname, f"self.{attribute}"), ()))
+        return found
+
+    def _resolve_type(self, binding: Binding, ctx: ResolveContext) -> str | None:
+        """The live class a binding's type name refers to, or None.
+
+        Resolved where the binding was written, which for an inherited
+        attribute is another file: its import map, then a class defined in the
+        binding's function or an enclosing one (`def test(): class Local`), then
+        one defined at the top of that module.
+        """
+        dotted = binding.type or ""
+        head, _, rest = dotted.partition(".")
+        target = ctx.import_maps.get(binding.path, {}).get(head)
+        if target is not None:
+            node_id = self._lookup_dotted(f"{target}.{rest}" if rest else target, ctx)
+        else:
+            node_id = None
+            for scope in [binding.scope, *enclosing_function_scopes(binding.scope)]:
+                node_id = ctx.qualname_index.get((binding.path, f"{scope}.<locals>.{dotted}"))
+                if node_id:
+                    break
+            node_id = node_id or ctx.qualname_index.get((binding.path, dotted))
+        return node_id if node_id in ctx.class_ids else None
+
+    def _inherited(self, class_id: str, method: str, ctx: ResolveContext) -> str | None:
+        """The declaration of `method` that `class_id`'s MRO walk reaches first."""
+        for owner in self._mro(class_id, ctx):
+            node_id = self._method_on(owner, method, ctx)
+            if node_id:
+                return node_id
+        return None
+
+    @staticmethod
+    def _is_protocol(class_id: str, ctx: ResolveContext) -> bool:
+        """Does the class list `typing.Protocol` among its OWN bases?
+
+        Only its own: under PEP 544 a subclass of a Protocol that does not
+        repeat `Protocol` in its bases is an ordinary class, and its
+        implementations are nominal.
+        """
+        key = ("protocol", class_id)
+        if key not in ctx.receiver_cache:
+            path = class_id.partition("::")[0]
+            import_map = ctx.import_maps.get(path, {})
+            found = False
+            for raw in ctx.class_bases.get(class_id, ()):
+                head, _, rest = raw.partition(".")
+                target = import_map.get(head)
+                if target and (f"{target}.{rest}" if rest else target) in PROTOCOL_BASES:
+                    found = True
+                    break
+            ctx.receiver_cache[key] = found
+        return ctx.receiver_cache[key]  # type: ignore[return-value]
+
+    def _methods_in_mro(self, class_id: str, ctx: ResolveContext) -> frozenset[str]:
+        key = ("members", class_id)
+        if key not in ctx.receiver_cache:
+            ctx.receiver_cache[key] = frozenset().union(
+                *(ctx.class_members.get(owner, frozenset()) for owner in self._mro(class_id, ctx))
+            )
+        return ctx.receiver_cache[key]  # type: ignore[return-value]
+
+    def _implementers(self, protocol_id: str, method: str, ctx: ResolveContext) -> list[str]:
+        """Every definition of `method` on a class that structurally satisfies
+        the Protocol: a non-Protocol class whose MRO defines every method the
+        Protocol and its Protocol bases declare -- or a class with a subclass
+        that does, since that subclass runs the inherited method."""
+        key = ("implementers", protocol_id, method)
+        if key not in ctx.receiver_cache:
+            required = frozenset().union(
+                *(
+                    ctx.class_members.get(owner, frozenset())
+                    for owner in self._mro(protocol_id, ctx)
+                    if self._is_protocol(owner, ctx)
+                )
+            )
+            found: list[str] = []
+            for node_id in ctx.name_index.get(method, ()):
+                path, _, qualname = node_id.partition("::")
+                owner = ctx.qualname_index.get((path, qualname.rpartition(".")[0]))
+                if owner is None or owner not in ctx.class_ids or self._is_protocol(owner, ctx):
+                    continue
+                if any(
+                    required <= self._methods_in_mro(candidate, ctx)
+                    for candidate in [owner, *self._descendants(owner, ctx)]
+                ):
+                    found.append(node_id)
+            ctx.receiver_cache[key] = found
+        return ctx.receiver_cache[key]  # type: ignore[return-value]
+
     # -- steps 4 and 5: a repo-wide match on the last segment -------------
     def _by_last_segment(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
-        if is_builtin_call(ref):
+        if is_builtin_call(ref) or is_external_call(ref, ctx):
             return []
         candidates = ctx.name_index.get(ref.raw_name.rpartition(".")[2], ())
         if len(candidates) == 1:
@@ -499,7 +859,9 @@ def build_import_maps(
 class _SymbolTable:
     """The revision's live symbol table, plus the per-file import maps."""
 
-    def __init__(self, store: Store, rev: str, config: Config) -> None:
+    def __init__(
+        self, store: Store, rev: str, config: Config, only_paths: set[str] | None = None
+    ) -> None:
         connection = store.connection
         self.paths: list[str] = sorted(
             row["path"] for row in connection.execute("SELECT path FROM tree WHERE rev=?", (rev,))
@@ -512,6 +874,9 @@ class _SymbolTable:
             # Sorted paths, so a module reachable from two source roots
             # deterministically binds to the first one.
             self.module_to_path.setdefault(self.module_for[path], path)
+        self.repo_segments: frozenset[str] = frozenset(
+            segment for module in self.module_to_path for segment in module.split(".")
+        )
 
         self.qualname_index: dict[tuple[str, str], str] = {}
         self.name_index: dict[str, list[str]] = {}
@@ -551,6 +916,47 @@ class _SymbolTable:
 
         self.import_maps, self.imported_modules = build_import_maps(connection, rev, config)
 
+        members: dict[str, set[str]] = {}
+        for row in live_rows:
+            if row["kind"] != "method":
+                continue
+            owner_qualname, _, name = row["qualname"].rpartition(".")
+            owner = class_ids.get((row["path"], owner_qualname))
+            if owner:
+                members.setdefault(owner, set()).add(name)
+        self.class_members: dict[str, frozenset[str]] = {
+            owner: frozenset(names) for owner, names in members.items()
+        }
+
+        self.class_bases: dict[str, list[str]] = {}
+        for row in connection.execute(
+            "SELECT t.path, r.from_qualname, r.raw_name FROM blob_refs r"
+            " JOIN tree t ON t.blob_sha = r.blob_sha WHERE t.rev=? AND r.ref_kind='base'"
+            " ORDER BY t.path, r.ordinal",
+            (rev,),
+        ):
+            owner = class_ids.get((row["path"], row["from_qualname"]))
+            if owner:
+                self.class_bases.setdefault(owner, []).append(row["raw_name"])
+
+        # A local binding is only ever read by references in its own file, so a
+        # narrowed pass needs only its own paths' -- but `self.x` is read
+        # across the class hierarchy, wherever a subclass or base lives.
+        sql = (
+            "SELECT t.path, b.scope, b.name, b.kind, b.type FROM blob_bindings b"
+            " JOIN tree t ON t.blob_sha = b.blob_sha WHERE t.rev=?"
+        )
+        args: tuple = (rev,)
+        if only_paths is not None:
+            marks = ",".join("?" * len(only_paths))
+            sql += f" AND (b.name LIKE 'self.%' OR t.path IN ({marks}))"
+            args += tuple(sorted(only_paths))
+        self.bindings: dict[tuple[str, str, str], list[Binding]] = {}
+        for row in connection.execute(sql + " ORDER BY t.path, b.ordinal", args):
+            self.bindings.setdefault((row["path"], row["scope"], row["name"]), []).append(
+                Binding(row["path"], row["scope"], row["kind"], row["type"])
+            )
+
     def context(
         self,
         rev: str,
@@ -558,6 +964,7 @@ class _SymbolTable:
         bases: dict[str, list[str]],
         subclasses: dict[str, list[str]] | None = None,
         descendant_cache: dict[str, list[str]] | None = None,
+        receiver_cache: dict[tuple, object] | None = None,
     ) -> ResolveContext:
         return ResolveContext(
             rev=rev,
@@ -572,6 +979,12 @@ class _SymbolTable:
             enclosing_class=self.enclosing_class,
             subclasses=subclasses if subclasses is not None else {},
             descendant_cache=descendant_cache if descendant_cache is not None else {},
+            repo_segments=self.repo_segments,
+            bindings=self.bindings,
+            class_ids=self.class_node_ids,
+            class_bases=self.class_bases,
+            class_members=self.class_members,
+            receiver_cache=receiver_cache if receiver_cache is not None else {},
         )
 
 
@@ -651,10 +1064,14 @@ def is_derivable_fanout(hits: list[tuple[str, str]]) -> bool:
 
     True exactly when every candidate is LOW, which happens exactly when the
     last-resort step (`_by_last_segment`) matched a bare name against more
-    than one live definition. Every other step returns HIGH or MEDIUM: an
-    imported name, a module-local name, a `self.X` hit and its overrides, and
-    a last-segment match with a single answer all name something the resolver
-    actually distinguished, and all get an edge.
+    than one live definition. Every other step returns at least one HIGH or
+    MEDIUM candidate: an imported name, a module-local name, a `self.X` hit and
+    its overrides, a typed receiver, and a last-segment match with a single
+    answer all name something the resolver actually distinguished, and all get
+    an edge. (A Protocol-typed receiver also carries the rest of the fan-out at
+    LOW, and those are materialized with it: the set as a whole is not
+    `name_index[name]` ranked flat, so it is not derivable. See
+    `AstResolver._through_receiver`.)
 
     A LOW set does not. It is `name_index[name]` verbatim -- a set the `nodes`
     table already determines -- so materializing it stores nothing the graph
@@ -783,7 +1200,7 @@ def resolve_revision(
     """
     resolver = resolver or AstResolver()
     connection = store.connection
-    table = _SymbolTable(store, rev, config)
+    table = _SymbolTable(store, rev, config, only_paths)
 
     if only_paths is None:
         target_paths = table.paths
@@ -819,6 +1236,7 @@ def resolve_revision(
     unresolved_rows: list[tuple] = []
     ambiguous_rows: list[tuple] = []
     builtin_rows: list[tuple] = []
+    external_rows: list[tuple] = []
 
     # Inheritance first: `self.X` walks the class hierarchy, so the hierarchy
     # has to exist before any call is resolved.
@@ -857,6 +1275,7 @@ def resolve_revision(
     # One cache object shared by every file's context, so the descendant walk
     # runs once per class for the whole revision rather than once per reference.
     descendant_cache: dict[str, list[str]] = {}
+    receiver_cache: dict[tuple, object] = {}
 
     # `Cls()` -> `Cls.__init__` is the same lookup for every call site that
     # names the same class, and on django that is tens of thousands of them.
@@ -864,7 +1283,7 @@ def resolve_revision(
 
     call_refs = _refs_by_path(store, rev, "call", scan_paths)
     for path in target_paths:
-        ctx = table.context(rev, path, bases, subclasses, descendant_cache)
+        ctx = table.context(rev, path, bases, subclasses, descendant_cache, receiver_cache)
         for ref in call_refs.get(path, ()):
             src = _source_id(ref, table, path)
             hits = resolver.resolve_call(ref, ctx)
@@ -895,6 +1314,15 @@ def resolve_revision(
                 builtin_rows.append(
                     (rev, src, path, ref.line, ref.raw_name, "call", "builtin", 0)
                 )
+            elif not hits and is_external_call(ref, ctx):
+                # The same choice one boundary further out: not a repo symbol,
+                # and known not to be one, so not a gap either. Its own reason
+                # rather than 'builtin', because the two are different claims
+                # -- and 'ambiguous' is exactly what it used to be mistaken
+                # for. See `is_external_call`.
+                external_rows.append(
+                    (rev, src, path, ref.line, ref.raw_name, "call", "external", 0)
+                )
             elif not hits:
                 # Never dropped: the ref stays in `blob_refs` for effect
                 # detection, and the gap is counted as a health signal.
@@ -910,7 +1338,7 @@ def resolve_revision(
     connection.executemany(
         "INSERT INTO unresolved(rev, src, path, line, raw_name, ref_kind, reason,"
         " candidates) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-        unresolved_rows + ambiguous_rows + builtin_rows,
+        unresolved_rows + ambiguous_rows + builtin_rows + external_rows,
     )
     # Counted over the whole revision, not over this pass: a narrowed rewrite
     # touches a handful of paths but `status` has to describe the whole graph.

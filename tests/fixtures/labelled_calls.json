@@ -1,5 +1,5 @@
 {
-  "_readme": "Ground truth is hand-derived by reasoning about (and, where noted in task-15-report.md, executing) what these modules actually do at runtime -- never by running codegraph and recording its output. See task-15-report.md for the derivation of every entry below.",
+  "_readme": "Ground truth is hand-derived by reasoning about (and, where noted in task-15-report.md, executing) what these modules actually do at runtime -- never by running codegraph and recording its output. See task-15-report.md for the derivation of every entry below. The pkg/typed.py and pkg/codec.py entries (#47) are derived the same way: persist_any runs whichever of Document.save and Settings.save it is passed -- the Saver Protocol's stub never runs, so it is not a label -- and encode calls the standard library's json.dumps, which is no node in this graph at all, so its expected set is empty.",
   "files": {
     "pkg/__init__.py": "",
     "pkg/utils.py": "def helper():\n    return \"utils.helper\"\n",
@@ -15,7 +15,9 @@
     "pkg/api/__init__.py": "from pkg.api.impl import Engine\n",
     "pkg/api/impl.py": "class Engine:\n    def __init__(self):\n        self.started = False\n",
     "pkg/reexport.py": "import pkg.api\n\n\ndef build_engine():\n    return pkg.api.Engine()\n",
-    "pkg/other_engine.py": "class Engine:\n    def __init__(self):\n        self.kind = \"unrelated\"\n"
+    "pkg/other_engine.py": "class Engine:\n    def __init__(self):\n        self.kind = \"unrelated\"\n",
+    "pkg/codec.py": "def dumps(value):\n    return repr(value)\n",
+    "pkg/typed.py": "import json\nfrom typing import Protocol\n\nfrom pkg.duck_ambiguous import Document, Settings\n\n\nclass Saver(Protocol):\n    def save(self): ...\n\n\ndef persist_document(doc: Document):\n    return doc.save()\n\n\ndef persist_new_settings():\n    settings = Settings()\n    return settings.save()\n\n\ndef persist_any(saver: Saver):\n    return saver.save()\n\n\ndef encode(value):\n    return json.dumps(value)\n"
   },
   "calls": [
     {
@@ -88,6 +90,30 @@
         "pkg/api/impl.py::Engine",
         "pkg/api/impl.py::Engine.__init__"
       ]
+    },
+    {
+      "src": "pkg/typed.py::persist_document",
+      "expected": [
+        "pkg/duck_ambiguous.py::Document.save"
+      ]
+    },
+    {
+      "src": "pkg/typed.py::persist_new_settings",
+      "expected": [
+        "pkg/duck_ambiguous.py::Settings",
+        "pkg/duck_ambiguous.py::Settings.save"
+      ]
+    },
+    {
+      "src": "pkg/typed.py::persist_any",
+      "expected": [
+        "pkg/duck_ambiguous.py::Document.save",
+        "pkg/duck_ambiguous.py::Settings.save"
+      ]
+    },
+    {
+      "src": "pkg/typed.py::encode",
+      "expected": []
     }
   ]
 }

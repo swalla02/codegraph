@@ -261,7 +261,10 @@ class Indexer:
         - every dirty path's base references are unchanged. A changed base
           class moves `self.X` resolution in every subclass, wherever it lives,
           and lets `_load_bases` read the hierarchy back from the existing
-          INHERITS edges instead of recomputing it.
+          INHERITS edges instead of recomputing it;
+        - every dirty path's `self.x` attribute bindings are unchanged. The
+          receiver step reads them across the hierarchy, so a changed
+          attribute type moves `self.x.m()` in subclasses in other files.
 
         Anything else falls back to a whole-revision rewrite, which cannot
         leave a stale edge behind. Getting this wrong is worse than being slow,
@@ -277,6 +280,8 @@ class Indexer:
             if self._symbol_signature(before) != self._symbol_signature(after):
                 return None
             if self._base_signature(before) != self._base_signature(after):
+                return None
+            if self._attribute_signature(before) != self._attribute_signature(after):
                 return None
         return set(dirty)
 
@@ -347,6 +352,26 @@ class Indexer:
             for row in self.store.connection.execute(
                 "SELECT from_qualname, raw_name, dotted FROM blob_refs"
                 " WHERE blob_sha=? AND ref_kind='base'",
+                (blob_sha,),
+            )
+        )
+
+    def _attribute_signature(self, blob_sha: str) -> frozenset[tuple]:
+        """What the blob says its classes' `self.x` attributes hold, ignoring
+        line positions.
+
+        The receiver step resolves `self.x.m()` through every binding of
+        `self.x` across the class hierarchy (#47), which spans files: changing
+        `thing: Item` to `thing: Other` in a base class's `__init__` declares no
+        new symbol and no new base, yet moves every `self.thing.save()` in every
+        subclass. Local bindings are absent on purpose -- they are only ever
+        read by references in their own file, which the narrowed pass rebuilds.
+        """
+        return frozenset(
+            tuple(row)
+            for row in self.store.connection.execute(
+                "SELECT scope, name, kind, type FROM blob_bindings"
+                " WHERE blob_sha=? AND name LIKE 'self.%'",
                 (blob_sha,),
             )
         )
@@ -482,6 +507,14 @@ class Indexer:
                 "INSERT OR REPLACE INTO blob_imports(blob_sha, ordinal, module, level,"
                 " name, alias) VALUES(?,?,?,?,?,?)",
                 [(sha, i.ordinal, i.module, i.level, i.name, i.alias) for i in result.imports],
+            )
+            connection.executemany(
+                "INSERT OR REPLACE INTO blob_bindings(blob_sha, ordinal, scope, name, kind,"
+                " type, line) VALUES(?,?,?,?,?,?,?)",
+                [
+                    (sha, b.ordinal, b.scope, b.name, b.kind, b.type, b.line)
+                    for b in result.bindings
+                ],
             )
 
         return len(missing), len(shas) - len(missing)

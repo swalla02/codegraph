@@ -25,6 +25,23 @@ def test_gc_removes_unreferenced_blobs(repo, write):
     store.close()
 
 
+def test_gc_removes_the_bindings_of_the_blobs_it_removes(repo, write):
+    """`blob_bindings` is Layer 1 like `blob_refs`: pruning a blob and keeping
+    its bindings would leak rows that nothing can ever read again."""
+    store = Store.open(repo)
+    indexer = Indexer(repo, store, GitTreeSource(repo))
+    write("a.py", "def alpha(item: Item):\n    return item.save()\n", commit="bind")
+    indexer.reconcile("HEAD")
+    write("a.py", "def alpha(thing: Thing):\n    return thing.save()\n", commit="edit")
+    indexer.reconcile("HEAD")
+    gc(store, {"HEAD"})
+    names = {
+        row["name"] for row in store.connection.execute("SELECT name FROM blob_bindings")
+    }
+    assert names == {"thing"}
+    store.close()
+
+
 def test_gc_keeps_blobs_of_retained_revisions(repo):
     store = Store.open(repo)
     Indexer(repo, store, GitTreeSource(repo)).reconcile("HEAD")
