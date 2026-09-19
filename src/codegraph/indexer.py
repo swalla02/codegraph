@@ -22,8 +22,8 @@ from codegraph.config import Config
 from codegraph.effects.catalog import Catalog
 from codegraph.effects.detect import detect_direct
 from codegraph.effects.propagate import propagate
-from codegraph.parse import PARSER_VERSION, parse_blob
-from codegraph.resolve import MODULE_SCOPE, resolve_revision
+from codegraph.parse import MODULE_SCOPE, PARSER_VERSION, parse_blob
+from codegraph.resolve import resolve_revision
 from codegraph.store import WORKTREE, Store
 
 #: The modules whose *source* decides what a materialized revision contains,

@@ -22,7 +22,15 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from codegraph.config import Config
-from codegraph.parse import CALL, OPAQUE, SUPER, ParsedRef, enclosing_function_scopes
+from codegraph.parse import (
+    CALL,
+    MODULE_SCOPE,
+    OPAQUE,
+    SUPER,
+    VALUE_REF,
+    ParsedRef,
+    enclosing_function_scopes,
+)
 from codegraph.store import Store
 
 HIGH, MEDIUM, LOW = "HIGH", "MEDIUM", "LOW"
@@ -50,6 +58,25 @@ def weaker(a: str, b: str) -> str:
 
 
 PROVENANCE = "static"
+
+#: The kinds of edge this resolver writes.
+#:
+#: - `CALLS`: this call site may run that definition.
+#: - `INHERITS`: this class lists that one among its bases.
+#: - `IMPLEMENTS`: this class structurally satisfies that `typing.Protocol`,
+#:   without naming it anywhere (see `protocol_implementations`).
+#: - `REFERENCES`: this code evaluates that definition's name as a value and
+#:   hands it somewhere (see the value-reference pass in `resolve_revision`).
+CALLS, INHERITS, IMPLEMENTS, REFERENCES = "CALLS", "INHERITS", "IMPLEMENTS", "REFERENCES"
+
+#: The kinds a change travels backwards along, and therefore the ones
+#: `impact` walks and `islands` partitions on. Declared once, here, because
+#: the two have to agree: an island is meant to bound what an unlimited-hop
+#: `impact` walk could ever reach, and that claim is only checkable while
+#: both read the same list. `effects` deliberately walks `CALLS` alone -- its
+#: witness path is a chain of call sites, and neither a base class nor a
+#: mention is one.
+DEPENDENCY_KINDS: tuple[str, ...] = (CALLS, INHERITS, IMPLEMENTS, REFERENCES)
 
 #: Python builtins, as the names they are actually called by.
 #:
@@ -156,9 +183,6 @@ def local_bindings(name: str, scope: str, ctx: ResolveContext) -> list[Binding]:
 #: What a class must list among its bases to be a `typing.Protocol`.
 PROTOCOL_BASES = frozenset({"typing.Protocol", "typing_extensions.Protocol"})
 
-
-#: `src` for a reference made at module scope, which owns no node of its own.
-MODULE_SCOPE = "<module>"
 
 #: How many re-export hops `AstResolver._lookup_dotted` will follow.
 #:
@@ -280,9 +304,124 @@ def breadth_first(start: str, adjacency: dict[str, list[str]]) -> list[str]:
     return order
 
 
+def is_protocol(class_id: str, ctx: ResolveContext) -> bool:
+    """Does the class list `typing.Protocol` among its OWN bases?
+
+    Only its own: under PEP 544 a subclass of a Protocol that does not repeat
+    `Protocol` in its bases is an ordinary class, and its implementations are
+    nominal.
+    """
+    key = ("protocol", class_id)
+    if key not in ctx.receiver_cache:
+        path = class_id.partition("::")[0]
+        import_map = ctx.import_maps.get(path, {})
+        found = False
+        for raw in ctx.class_bases.get(class_id, ()):
+            head, _, rest = raw.partition(".")
+            target = import_map.get(head)
+            if target and (f"{target}.{rest}" if rest else target) in PROTOCOL_BASES:
+                found = True
+                break
+        ctx.receiver_cache[key] = found
+    return ctx.receiver_cache[key]  # type: ignore[return-value]
+
+
+def methods_in_mro(class_id: str, ctx: ResolveContext) -> frozenset[str]:
+    """Every method name the class or one of its bases defines."""
+    key = ("members", class_id)
+    if key not in ctx.receiver_cache:
+        ctx.receiver_cache[key] = frozenset().union(
+            *(
+                ctx.class_members.get(owner, frozenset())
+                for owner in breadth_first(class_id, ctx.bases)
+            )
+        )
+    return ctx.receiver_cache[key]  # type: ignore[return-value]
+
+
+def protocol_requirements(protocol_id: str, ctx: ResolveContext) -> frozenset[str]:
+    """The method names a class must define to satisfy this Protocol: its own
+    and those of its Protocol bases.
+
+    A non-Protocol base is deliberately not counted. `class Reader(Protocol,
+    Sized)` declares what a Reader must have; what `Sized` happens to provide
+    is inherited by the stub, not required of an implementation.
+    """
+    key = ("requires", protocol_id)
+    if key not in ctx.receiver_cache:
+        ctx.receiver_cache[key] = frozenset().union(
+            *(
+                ctx.class_members.get(owner, frozenset())
+                for owner in breadth_first(protocol_id, ctx.bases)
+                if is_protocol(owner, ctx)
+            )
+        )
+    return ctx.receiver_cache[key]  # type: ignore[return-value]
+
+
+def protocol_implementations(ctx: ResolveContext) -> list[tuple[str, str]]:
+    """`(implementer, protocol)` for every class that structurally satisfies a
+    `typing.Protocol` in this revision without saying so anywhere.
+
+    This is the relationship #50 already computes and then discards. Its
+    receiver step matches a class against a Protocol's declared method set to
+    decide what `self.source.read()` can reach, per call site and per method;
+    the same test asked once per class is the edge itself, and it is the only
+    thing that ties `TreeSource` to `GitTreeSource` at all. A Protocol is
+    never instantiated, never subclassed and never called by name, so before
+    this it was an island of one in every repository that defines one -- in a
+    bucket a reader is told is where the dead code is.
+
+    Deliberately excluded:
+
+    - A Protocol with no declared methods. Every class in the repository
+      satisfies it, and an edge that cannot fail to hold says nothing.
+    - A Protocol as an implementer of another. A stub that happens to declare
+      the right methods is still a stub; what runs is the class behind it.
+    - A class that already lists the Protocol among its bases. PEP 544 allows
+      that, and it is the stronger, nominal statement -- it already has an
+      INHERITS edge, and a second edge for one declaration would count the
+      class twice in every fan-in.
+
+    Structural satisfaction is an inference, not a reading of the text: a
+    one-method Protocol can be satisfied by coincidence, and a class can
+    satisfy one it has never heard of. So the edge is MEDIUM (`IMPLEMENTS`
+    below), the tier this resolver gives a candidate that really runs
+    depending on the instance -- and the same tier #50 gives the very same
+    classes when it resolves a call through the Protocol.
+
+    The walk is per Protocol over the revision's classes, with both the method
+    set and the Protocol test memoized in `receiver_cache`, so it costs one
+    frozenset comparison per (Protocol, class) pair. Repositories have very
+    few Protocols -- three in this one and two in psf/requests, for 5 and 2
+    edges -- and none at all is the common case (django), which returns
+    before looking at a single class.
+    """
+    protocols = [class_id for class_id in sorted(ctx.class_ids) if is_protocol(class_id, ctx)]
+    found: list[tuple[str, str]] = []
+    for protocol_id in protocols:
+        required = protocol_requirements(protocol_id, ctx)
+        if not required:
+            continue
+        nominal = set(breadth_first(protocol_id, ctx.subclasses))
+        for class_id in sorted(ctx.class_ids):
+            if class_id in nominal or is_protocol(class_id, ctx):
+                continue
+            if required <= methods_in_mro(class_id, ctx):
+                found.append((class_id, protocol_id))
+    return found
+
+
 class Resolver(Protocol):
     def resolve_call(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
-        """Return `(node_id, confidence)` candidates for `ref`; [] if unresolved."""
+        """Return `(node_id, confidence)` candidates for `ref`; [] if unresolved.
+
+        Asked of every reference kind the parser records -- a call, a base
+        class, and a name used as a value -- since all three are "what could
+        this name mean here". An implementation that wants to answer them
+        differently reads `ref.ref_kind`, as `AstResolver` does in
+        `_by_last_segment` and `_through_receiver`.
+        """
         ...
 
 
@@ -628,7 +767,13 @@ class AstResolver:
         concrete-class path, where subclass overrides are already candidates.
         """
         if ref.ref_kind != "call":
-            # A base class is named, never called on an instance.
+            # A base class is named, never called on an instance -- and a
+            # value reference names no receiver either: `self.source.read`
+            # read as a value is a mention of a method, which `_through_self`
+            # answers when it can, not an invocation through a typed variable.
+            # The distinction matters because this step is the one that
+            # materializes a Protocol's LOW fan-out (below), and that is
+            # exactly what a mention must not carry.
             return []
         head, _, rest = ref.raw_name.partition(".")
         if head == "self":
@@ -666,7 +811,7 @@ class AstResolver:
             if declared is None:
                 return []
             add(declared, HIGH)
-            if self._is_protocol(class_id, ctx):
+            if is_protocol(class_id, ctx):
                 structural = True
                 for node_id in self._implementers(class_id, method, ctx):
                     add(node_id, MEDIUM)
@@ -734,36 +879,6 @@ class AstResolver:
                 return node_id
         return None
 
-    @staticmethod
-    def _is_protocol(class_id: str, ctx: ResolveContext) -> bool:
-        """Does the class list `typing.Protocol` among its OWN bases?
-
-        Only its own: under PEP 544 a subclass of a Protocol that does not
-        repeat `Protocol` in its bases is an ordinary class, and its
-        implementations are nominal.
-        """
-        key = ("protocol", class_id)
-        if key not in ctx.receiver_cache:
-            path = class_id.partition("::")[0]
-            import_map = ctx.import_maps.get(path, {})
-            found = False
-            for raw in ctx.class_bases.get(class_id, ()):
-                head, _, rest = raw.partition(".")
-                target = import_map.get(head)
-                if target and (f"{target}.{rest}" if rest else target) in PROTOCOL_BASES:
-                    found = True
-                    break
-            ctx.receiver_cache[key] = found
-        return ctx.receiver_cache[key]  # type: ignore[return-value]
-
-    def _methods_in_mro(self, class_id: str, ctx: ResolveContext) -> frozenset[str]:
-        key = ("members", class_id)
-        if key not in ctx.receiver_cache:
-            ctx.receiver_cache[key] = frozenset().union(
-                *(ctx.class_members.get(owner, frozenset()) for owner in self._mro(class_id, ctx))
-            )
-        return ctx.receiver_cache[key]  # type: ignore[return-value]
-
     def _implementers(self, protocol_id: str, method: str, ctx: ResolveContext) -> list[str]:
         """Every definition of `method` on a class that structurally satisfies
         the Protocol: a non-Protocol class whose MRO defines every method the
@@ -771,21 +886,15 @@ class AstResolver:
         that does, since that subclass runs the inherited method."""
         key = ("implementers", protocol_id, method)
         if key not in ctx.receiver_cache:
-            required = frozenset().union(
-                *(
-                    ctx.class_members.get(owner, frozenset())
-                    for owner in self._mro(protocol_id, ctx)
-                    if self._is_protocol(owner, ctx)
-                )
-            )
+            required = protocol_requirements(protocol_id, ctx)
             found: list[str] = []
             for node_id in ctx.name_index.get(method, ()):
                 path, _, qualname = node_id.partition("::")
                 owner = ctx.qualname_index.get((path, qualname.rpartition(".")[0]))
-                if owner is None or owner not in ctx.class_ids or self._is_protocol(owner, ctx):
+                if owner is None or owner not in ctx.class_ids or is_protocol(owner, ctx):
                     continue
                 if any(
-                    required <= self._methods_in_mro(candidate, ctx)
+                    required <= methods_in_mro(candidate, ctx)
                     for candidate in [owner, *self._descendants(owner, ctx)]
                 ):
                     found.append(node_id)
@@ -794,6 +903,27 @@ class AstResolver:
 
     # -- steps 4 and 5: a repo-wide match on the last segment -------------
     def _by_last_segment(self, ref: ParsedRef, ctx: ResolveContext) -> list[tuple[str, str]]:
+        """The last resort, and the only step a value reference never reaches.
+
+        For a call, matching the final segment against every definition in the
+        repository is weak but grounded: something IS being called at that
+        line, and the right answer is somewhere in the set -- which is why the
+        fan-out is recorded rather than dropped (`is_derivable_fanout`) and
+        expanded on demand.
+
+        A mention carries no such guarantee. `self.handler` is far more often
+        an attribute holding an object than a reference to a function named
+        `handler`, and there is no call at that line for the set to be the
+        answer to. Letting it through would put the report that exists to say
+        which regions are genuinely apart at the mercy of every attribute name
+        that collides with a function name -- and it is the step, not the new
+        reference kind, that would be doing the damage. So a value reference
+        is recorded only where the resolver could NAME the definition it
+        means, which also makes `REFERENCES` the one edge kind that is never
+        LOW.
+        """
+        if ref.ref_kind == VALUE_REF:
+            return []
         if is_builtin_call(ref) or is_external_call(ref, ctx):
             return []
         candidates = ctx.name_index.get(ref.raw_name.rpartition(".")[2], ())
@@ -1168,8 +1298,8 @@ def _load_bases(connection: sqlite3.Connection, rev: str) -> dict[str, list[str]
     """
     bases: dict[str, list[str]] = {}
     for row in connection.execute(
-        "SELECT src, dst FROM edges WHERE rev=? AND kind='INHERITS' AND confidence='HIGH'",
-        (rev,),
+        "SELECT src, dst FROM edges WHERE rev=? AND kind=? AND confidence=?",
+        (rev, INHERITS, HIGH),
     ):
         bases.setdefault(row["src"], []).append(row["dst"])
     return bases
@@ -1257,7 +1387,7 @@ def resolve_revision(
                 continue
             for node_id, confidence in hits:
                 edge_rows.append(
-                    (rev, src, node_id, "INHERITS", confidence, PROVENANCE, path, ref.line)
+                    (rev, src, node_id, INHERITS, confidence, PROVENANCE, path, ref.line)
                 )
                 # Only a certain link feeds the MRO walk, which claims HIGH.
                 # A weaker one still gets its edge, and a `self.X` that misses
@@ -1276,6 +1406,79 @@ def resolve_revision(
     # runs once per class for the whole revision rather than once per reference.
     descendant_cache: dict[str, list[str]] = {}
     receiver_cache: dict[tuple, object] = {}
+
+    # Structural Protocol implementation, which is a property of the class
+    # table rather than of any reference, so it is written once here rather
+    # than per file. `callsite_path`/`callsite_line` point at the implementing
+    # class's own declaration: there is no call site to point at, and the
+    # class is where a reader would go to check the claim.
+    #
+    # Under a narrowed rewrite only the edges of paths being rewritten are
+    # deleted, so only those paths' implementers are re-emitted. That is
+    # sound for the same reason the narrowing itself is: `Indexer._narrowable`
+    # requires every dirty path to declare exactly the same symbols and bases
+    # as before, and a Protocol's requirements and a class's method set are
+    # read from nothing else.
+    if target_paths:
+        protocol_ctx = table.context(
+            rev, target_paths[0], bases, subclasses, descendant_cache, receiver_cache
+        )
+        line_start = {
+            node_id: start for owners in table.owner_index.values() for node_id, start, _ in owners
+        }
+        rewriting = set(target_paths)
+        for implementer, protocol_id in protocol_implementations(protocol_ctx):
+            implementer_path = implementer.partition("::")[0]
+            if implementer_path in rewriting:
+                edge_rows.append(
+                    (
+                        rev,
+                        implementer,
+                        protocol_id,
+                        IMPLEMENTS,
+                        MEDIUM,
+                        PROVENANCE,
+                        implementer_path,
+                        line_start.get(implementer, 0),
+                    )
+                )
+
+    # A name used as a value: `connection.row_factory = _Row`, a method listed
+    # in a dispatch table, a function passed as a callback. The relationship is
+    # real -- sqlite calls `_Row` for every row it hands back -- but the text
+    # does not say so, and until now the graph held nothing for it at all.
+    #
+    # Written as its own kind rather than as a weak `CALLS`. A mention is not
+    # a call site: `effects` builds a witness path out of call sites and
+    # presents it as clickable evidence that the effect happens, and a chain
+    # that steps through "this line mentions the name" would be a claim the
+    # source does not support. `impact` and `islands` do cross it, because a
+    # change to `_Row` does reach the line that hands it to sqlite. See
+    # `DEPENDENCY_KINDS`.
+    #
+    # The confidence tier is the resolver's own, unweakened -- HIGH for an
+    # exact module-local or imported name, as it would be for a call. Capping
+    # it was the other option and it conflates two different questions:
+    # confidence answers "does this reference mean that symbol", which is
+    # exactly as certain here as for a call (it is the same name lookup on
+    # the same text), while "and is it then invoked" is what the edge KIND
+    # says. Encoding the second in the first would leave `impact` ranking a
+    # certain dependent as a doubtful one. What does keep the tier honest is
+    # that a mention never reaches the bare-name fan-out
+    # (`_by_last_segment`), so a `REFERENCES` edge is never LOW and never
+    # ambiguous -- no `unresolved` row is written here either, in any of its
+    # flavours: that count is a health signal about the CALL graph ("this
+    # many calls found no callee"), and a name read as a value that turns out
+    # to be a builtin or a plain attribute is not a gap in it.
+    value_refs = _refs_by_path(store, rev, VALUE_REF, scan_paths)
+    for path in target_paths:
+        ctx = table.context(rev, path, bases, subclasses, descendant_cache, receiver_cache)
+        for ref in value_refs.get(path, ()):
+            src = _source_id(ref, table, path)
+            for node_id, confidence in resolver.resolve_call(ref, ctx):
+                edge_rows.append(
+                    (rev, src, node_id, REFERENCES, confidence, PROVENANCE, path, ref.line)
+                )
 
     # `Cls()` -> `Cls.__init__` is the same lookup for every call site that
     # names the same class, and on django that is tens of thousands of them.
@@ -1302,9 +1505,7 @@ def resolve_revision(
                 )
                 continue
             for node_id, confidence in with_constructors(hits, table, bases, constructor_cache):
-                edge_rows.append(
-                    (rev, src, node_id, "CALLS", confidence, PROVENANCE, path, ref.line)
-                )
+                edge_rows.append((rev, src, node_id, CALLS, confidence, PROVENANCE, path, ref.line))
             if is_builtin_call(ref):
                 # Recorded, but not as a gap. A builtin is a reference the
                 # resolver understood and deliberately did not link to a repo
