@@ -165,13 +165,31 @@ def trace(python: Path, repo: Path, out: Path, tests: tuple[str, ...]) -> dict:
     return json.loads(out.read_text())
 
 
-def index(repo: Path) -> Store:
+def index(repo: Path, rebuild: bool = False) -> Store:
+    """Reconcile the target's working tree, optionally from cold.
+
+    `rebuild` is the same two deletes `codegraph index --rebuild` performs
+    (cli.py, #30): the parse cache, and this revision's `revisions` row --
+    the second is what stops the reconcile that follows from taking the
+    unchanged-tree fast path and reporting a build it did not do.
+
+    Since #44 a resolver change invalidates the materialized graph on its
+    own, so this is no longer needed to measure two sides of one; what it is
+    still for is a cold number. The reported seconds are otherwise a warm
+    reconcile of a tree the previous run already indexed, which is a
+    different measurement wearing the same label.
+    """
     store = Store.open(repo)
+    if rebuild:
+        store.connection.execute("DELETE FROM blobs")
+        store.connection.execute("DELETE FROM revisions WHERE rev=?", (WORKTREE,))
+        store.connection.commit()
     started = time.perf_counter()
     stats = Indexer(repo, store, GitTreeSource(repo)).reconcile(WORKTREE)
     print(
         f"indexed {stats.paths_total} paths in {time.perf_counter() - started:.1f}s"
-        f" ({stats.edges} edges, {stats.ambiguous} ambiguous refs)"
+        f" ({stats.edges} edges, {stats.ambiguous} ambiguous refs,"
+        f" {stats.blobs_parsed} blobs parsed)"
     )
     return store
 
@@ -191,6 +209,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--tests", nargs="+", default=None, help="Override the target's pytest arguments"
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Discard the parse cache and the revision's graph first, for a cold index time",
     )
     parser.add_argument(
         "--reuse-trace",
@@ -213,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         traced = trace(make_venv(target, repo, work), repo, trace_path, tests)
 
-    store = index(repo)
+    store = index(repo, rebuild=args.rebuild)
     graph = read_static_graph(store, WORKTREE)
     report = score(Trace.load(traced), graph)
     store.close()

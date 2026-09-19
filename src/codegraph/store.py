@@ -80,10 +80,12 @@ CREATE TABLE IF NOT EXISTS blob_bindings (
 
 -- Layer 2: materialized per revision, evictable.
 -- `fingerprint` pins everything OUTSIDE the tree that the materialized graph
--- depends on: parser version, source roots, ambiguity limit, and the effect
--- catalog's own digest. A reconcile whose tree is unchanged can only skip its
--- work if these are unchanged too -- editing codegraph.toml changes no file in
--- the tree but can change every edge and every effect.
+-- depends on: parser version, source roots, the effect catalog's own digest,
+-- and a digest of the source of the modules that decide what gets stored
+-- (`indexer.RESOLVER_SOURCES`). A reconcile whose tree is unchanged can only
+-- skip its work if these are unchanged too -- editing codegraph.toml changes
+-- no file in the tree but can change every edge and every effect, and so does
+-- upgrading codegraph itself.
 CREATE TABLE IF NOT EXISTS revisions (
     rev TEXT PRIMARY KEY,
     kind TEXT NOT NULL,

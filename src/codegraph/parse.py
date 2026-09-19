@@ -11,6 +11,26 @@ import copy
 import hashlib
 from dataclasses import dataclass, field
 
+#: Bumped by hand when a change in this module makes `parse_blob` produce
+#: different `blob_*` rows for the same bytes. Layer 1 is keyed on
+#: (blob sha, this), so a change that arrives without a bump keeps serving the
+#: previous parser's structure for content it has already seen.
+#:
+#: Deliberately still declared, and not derived from this file's source the
+#: way the resolver's half of the fingerprint now is (#44,
+#: `indexer.RESOLVER_SOURCES`). The discipline problem is identical -- a bump
+#: that nobody remembers is the same class of silent staleness -- and this is
+#: a judgement about price, not a claim that a constant is safer. A digest
+#: that moves on a reflowed comment costs the resolver one re-resolve of the
+#: revision being queried (~12s on django, against 34s for a cold index of
+#: the same tree) and leaves Layer 1 alone. Here it would discard the
+#: content-addressed parse cache instead: the half of the cost guarantee that
+#: is actually measured -- "parsed once for the life of the repository,
+#: across every branch and every path" -- re-paid at ~22s of that same 34s,
+#: and re-paid again for each other revision as it is next reconciled, since
+#: Layer 1 is the one thing every revision in the store shares.
+#:
+#: So: bump it in the same commit as the change that earns it.
 PARSER_VERSION = "4"
 
 _DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)

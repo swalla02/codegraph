@@ -13,6 +13,7 @@ import hashlib
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
 
@@ -24,6 +25,104 @@ from codegraph.effects.propagate import propagate
 from codegraph.parse import PARSER_VERSION, parse_blob
 from codegraph.resolve import MODULE_SCOPE, resolve_revision
 from codegraph.store import WORKTREE, Store
+
+#: The modules whose *source* decides what a materialized revision contains,
+#: relative to the package directory.
+#:
+#: Derived rather than declared, for the reason `Catalog.fingerprint` hashes
+#: its rules instead of trusting a version number written beside them: a
+#: constant only describes the code while somebody remembers to bump it, and
+#: forgetting is precisely how #44 happened -- a pure resolver change left the
+#: fingerprint untouched, the unchanged-tree fast path fired, and every user
+#: who upgraded kept being served the previous resolver's edges, with no error
+#: and no warning.
+#:
+#: Membership is one question asked per module: does this code decide what
+#: gets *stored* for a revision?
+#:
+#: - `resolve.py` decides every edge. It is the module #44 was about.
+#: - `effects/detect.py` and `effects/propagate.py` decide every row in
+#:   `effects`, which is materialized in the same transaction as the edges.
+#: - `ambiguity.py` is in because `propagate` reads its hub edges: the
+#:   bare-name fan-out is not stored, but what it reaches is.
+#: - `effects/catalog.py` is in even though `Catalog.fingerprint()` is
+#:   already folded in below -- that pins the *rules*, this pins the code
+#:   that matches them (precedence, confidence derivation).
+#: - `indexer.py` is in because `_materialize_nodes` writes `nodes` and
+#:   `_narrowable` decides how much of a revision a reconcile may keep. It
+#:   also means an edit to THIS LIST invalidates, which a list that exempted
+#:   its own file would not.
+#:
+#: Deliberately out:
+#:
+#: - `parse.py`, and Layer 1 generally. The parse cache is keyed separately,
+#:   on blob sha and `PARSER_VERSION` (see `_ensure_parsed`), and pinning
+#:   parser source here would buy nothing anyway: re-resolving unchanged
+#:   `blob_*` rows under a new parser produces the same graph, so the cost
+#:   would be a rebuild with no possible change in the answer.
+#: - `store.py`. A schema change already discards the whole database
+#:   (`SCHEMA_VERSION`), which is strictly stronger than this.
+#: - `query/*`, `render.py`, `cli.py`. They read the graph and never write a
+#:   row, so a change there cannot make a stored row wrong -- and they are
+#:   the modules edited most often. Pinning them would make this digest mean
+#:   "any commit to codegraph rebuilds every revision", which is a cost with
+#:   nothing on the other side of it.
+#: - `config.py` and `gitio.py`. Inputs, not logic: what they produce is
+#:   already pinned by value (`source_roots` below, the tree diff above).
+RESOLVER_SOURCES: tuple[str, ...] = (
+    "ambiguity.py",
+    "effects/catalog.py",
+    "effects/detect.py",
+    "effects/propagate.py",
+    "indexer.py",
+    "resolve.py",
+)
+
+_PACKAGE = Path(__file__).resolve().parent
+
+
+def digest_sources(package: Path) -> str:
+    """Hash `RESOLVER_SOURCES` as they sit under `package`.
+
+    Raw file bytes, deliberately -- not a normalized AST, not the code
+    objects. Hashing the bytes costs a rebuild for an edit that changes no
+    behavior (a comment, a docstring, a reflow), and this repository's
+    comments are long. That is still the cheaper side of the trade: a
+    normalization is code that can be wrong, and the way it goes wrong is by
+    declaring two different resolvers identical -- a *missed* rebuild, which
+    is the bug being fixed here, reintroduced in a form that is harder to
+    see. The failure mode of raw bytes is one re-resolve nobody needed: ~12s
+    on django (2,932 files, 109k edges), against 34s to index the same tree
+    cold, and it never touches the parse cache.
+
+    Note who actually pays that. For an installed copy these bytes change
+    only when the package does, which is exactly when the graph has to be
+    rebuilt; the spurious rebuilds fall on this repository's own developers,
+    who are also the people a stale graph would mislead worst.
+
+    Each file's name goes into the digest with its bytes, so moving code
+    between two pinned modules changes the result rather than concatenating
+    to the same stream.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    for name in RESOLVER_SOURCES:
+        digest.update(name.encode())
+        digest.update(b"\x00")
+        digest.update((package / name).read_bytes())
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=1)
+def resolver_fingerprint() -> str:
+    """The installed resolver's identity, as `_fingerprint` folds it in.
+
+    Cached for the life of the process: these files cannot change under a
+    running interpreter in any way the already-imported modules would honor,
+    and every query reconciles, so this would otherwise be re-read from disk
+    on every one of them.
+    """
+    return digest_sources(_PACKAGE)
 
 
 @dataclass(frozen=True)
@@ -392,6 +491,10 @@ class Indexer:
         touches no file in the revision's tree and can change every effect in
         the graph.
 
+        That includes codegraph's own code, not just its configuration:
+        upgrading the tool changes how the same tree resolves, and until #44
+        nothing here said so.
+
         `Catalog.fingerprint` was written for exactly this and had no caller
         until now.
         """
@@ -400,6 +503,11 @@ class Indexer:
         # materialized revision would be a rebuild bought with nothing.
         parts = (
             PARSER_VERSION,
+            # The resolver is the half of "outside the tree" that upgrading
+            # codegraph changes, and it went unpinned until #44: a new
+            # resolver was served the previous one's edges forever. See
+            # `RESOLVER_SOURCES` for what that digest covers.
+            resolver_fingerprint(),
             catalog.fingerprint(),
             ",".join(self.config.source_roots),
         )
