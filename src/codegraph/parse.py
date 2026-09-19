@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 #: Layer 1 is the one thing every revision in the store shares.
 #:
 #: So: bump it in the same commit as the change that earns it.
-PARSER_VERSION = "4"
+PARSER_VERSION = "5"
 
 _DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
@@ -58,6 +58,21 @@ class ParsedRef:
     raw_name: str
     dotted: str | None
     line: int
+
+
+#: `ParsedRef.ref_kind` for a name used as a *value* rather than called:
+#: `connection.row_factory = _Row`, a method named in a dispatch table, a
+#: function passed to `register(...)`. The name is evaluated and handed
+#: somewhere, and whoever receives it decides what happens next -- often a
+#: call this repository never spells. Recorded nowhere before #45, which is
+#: why `store.py::_Row` and `resolve.py::AstResolver._module_local` looked
+#: like symbols with no relationship to anything.
+VALUE_REF = "value"
+
+#: The scope a reference made at a module's top level belongs to, and the
+#: qualname half of the synthetic `path::<module>` node the indexer gives
+#: every file. Spelled here because the parser is what first writes it.
+MODULE_SCOPE = "<module>"
 
 
 @dataclass(frozen=True)
@@ -457,6 +472,9 @@ class _Collector(ast.NodeVisitor):
         #: Qualnames of the enclosing classes, innermost last: where a
         #: `self.x = ...` inside a method is recorded.
         self._classes: list[str] = []
+        #: Depth inside an annotation or a base-class expression, where a name
+        #: is a type rather than a value; see `_visit_typed`.
+        self._typed_depth = 0
 
     # -- scope helpers -------------------------------------------------
     @property
@@ -468,7 +486,7 @@ class _Collector(ast.NodeVisitor):
 
     @property
     def _current_owner(self) -> str:
-        return self._qualname_prefix or "<module>"
+        return self._qualname_prefix or MODULE_SCOPE
 
     # -- conditional definitions ---------------------------------------
     def visit_If(self, node: ast.If) -> None:
@@ -548,7 +566,19 @@ class _Collector(ast.NodeVisitor):
             self._classes.append(qualname)
         if kind in ("function", "method"):
             self._scope.append("<locals>")
-        self.generic_visit(node)
+        # Children in the order `generic_visit` would take them, except
+        # that the bases and the return annotation are walked as types: they
+        # name classes, and `class Child(Base)` must produce one INHERITS edge
+        # rather than that and a REFERENCES edge for the same word.
+        typed = {id(base) for base in getattr(node, "bases", ())}
+        returns = getattr(node, "returns", None)
+        if returns is not None:
+            typed.add(id(returns))
+        for child in ast.iter_child_nodes(node):
+            if id(child) in typed:
+                self._visit_typed(child)
+            else:
+                self.visit(child)
         if kind in ("function", "method"):
             self._scope.pop()
         if kind == "class":
@@ -637,7 +667,10 @@ class _Collector(ast.NodeVisitor):
         types = _annotation_types(node.annotation)
         entries = None if types is None else [(ANNOTATION, type_) for type_ in types]
         self._bind(node.target, entries, node.lineno)
-        self.generic_visit(node)
+        self.visit(node.target)
+        self._visit_typed(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self._bind(node.target, _value_types(node.value, node.target.id), node.lineno)
@@ -693,8 +726,72 @@ class _Collector(ast.NodeVisitor):
         self._visit_def(node, "class")
 
     # -- references ------------------------------------------------------
+    def _visit_typed(self, node: ast.AST | None) -> None:
+        """Walk an annotation or a base-class expression with value-reference
+        recording suppressed.
+
+        Suppressed, rather than skipped: a call written inside one really does
+        run (`x: Annotated[int, Field(gt=0)]`, `class C(make_base())`), and
+        dropping the subtree would lose a call reference the graph has always
+        had. What must not be recorded is the *names* in it. A base is already
+        a `base` ref and an annotation is already a `blob_bindings` row, each
+        read by machinery that knows what it means, so a value reference on
+        top would be a second edge for one declaration -- on every annotated
+        parameter in the repository. An annotation is also not evaluated at
+        all under `from __future__ import annotations`, which is in force in
+        every module of this package.
+        """
+        if node is None:
+            return
+        self._typed_depth += 1
+        self.visit(node)
+        self._typed_depth -= 1
+
+    def _record_value(self, node: ast.expr, name: str) -> None:
+        if self._typed_depth:
+            return
+        self.refs.append(
+            ParsedRef(
+                ordinal=len(self.refs),
+                from_qualname=self._current_owner.removesuffix(".<locals>"),
+                ref_kind=VALUE_REF,
+                raw_name=name,
+                dotted=name if "." in name else None,
+                line=node.lineno,
+            )
+        )
+
+    def visit_Name(self, node: ast.Name) -> None:
+        """A bare name read as a value. Whether it names a definition at all
+        is phase 2's question -- most of these are variables, and this keeps
+        only the ones no scope binds (`_drop_bound_value_refs`)."""
+        if isinstance(node.ctx, ast.Load):
+            self._record_value(node, node.id)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        """`mod.helper` / `self._step` read as a value.
+
+        Recorded as the whole flattened chain, exactly as a dotted call is,
+        so it reaches the resolver through the same steps: an imported name,
+        a module-local name, `self.X` through the class.
+        """
+        name = _dotted_name(node)
+        if name is None:
+            # `factory().attr`, `items[0].name`: nothing to name here, but the
+            # chain can still hold a call, which must not be lost.
+            self.generic_visit(node)
+        elif isinstance(node.ctx, ast.Load):
+            self._record_value(node, name)
+        # A flattenable chain being assigned INTO (`self.x = 1`) is not a use
+        # of any definition, and holds nothing further worth visiting.
+
+    def visit_arg(self, node: ast.arg) -> None:
+        """A parameter, whose only child is its annotation."""
+        self._visit_typed(node.annotation)
+
     def visit_Call(self, node: ast.Call) -> None:
         name = _dotted_name(node.func)
+        flattened = name is not None
         if name is None:
             # The receiver isn't a flattenable Name/Attribute chain --
             # `super().go()`, `PaymentService().charge(x)`,
@@ -753,7 +850,16 @@ class _Collector(ast.NodeVisitor):
                 line=node.lineno,
             )
         )
-        self.generic_visit(node)
+        # The arguments and, when it names nothing this can flatten, the
+        # callee -- but never a callee that flattened, which this reference
+        # already is. Recording `helper` as both a call and a value reference
+        # would put two edges on one mention and double-count every caller.
+        # An unflattenable callee still has to be walked: `factory().run()`
+        # holds a second call inside the receiver chain.
+        if not flattened:
+            self.visit(node.func)
+        for child in (*node.args, *node.keywords):
+            self.visit(child)
 
     def visit_Global(self, node: ast.Global) -> None:
         self._record_global(node, node.names)
@@ -847,6 +953,46 @@ def _apply_shadowing(nodes: list[ParsedNode]) -> tuple[ParsedNode, ...]:
     return tuple(resolved)
 
 
+def _drop_bound_value_refs(
+    refs: list[ParsedRef], bindings: tuple[ParsedBinding, ...]
+) -> tuple[ParsedRef, ...]:
+    """`refs` without the value references whose head name its own scope binds.
+
+    This is what keeps a new reference kind from being "every name in the
+    file". A name a scope binds is a *variable*: `register(handler)` inside
+    `def run(handler)` refers to whatever the caller passed, not to the
+    module-level `def handler` that happens to share the spelling, and what it
+    holds is a question about bindings -- which `blob_bindings` already answers
+    and `AstResolver._through_receiver` already reads. What survives is the
+    names no scope binds, which is a much smaller and far more interesting set:
+    definitions in this module, imported names, builtins, and attributes read
+    through `self`.
+
+    The filter is most of the design, by volume. On django, every name read as
+    a value is 2.2x the call count -- 413k against 189,417 call references --
+    and this keeps 57,068 of them, 30% of the call count. The 356k it drops
+    could not have produced a correct edge anyway: each one names a value some
+    scope put there, not a definition.
+
+    The scope chain is the resolver's (`resolve.local_bindings`): the scope
+    itself, each enclosing FUNCTION scope, then the module. Class scopes are
+    skipped exactly as Python skips them. Flow-insensitive, like every other
+    binding question here -- a name bound anywhere in its scope is a variable
+    throughout it.
+    """
+    bound = {(binding.scope, binding.name) for binding in bindings}
+    kept: list[ParsedRef] = []
+    for ref in refs:
+        if ref.ref_kind != VALUE_REF:
+            kept.append(ref)
+            continue
+        head = ref.raw_name.partition(".")[0]
+        scopes = [ref.from_qualname, *enclosing_function_scopes(ref.from_qualname), MODULE_SCOPE]
+        if not any((scope, head) in bound for scope in scopes):
+            kept.append(ref)
+    return tuple(kept)
+
+
 def parse_blob(source: bytes) -> ParseResult:
     try:
         tree = ast.parse(source)
@@ -855,11 +1001,12 @@ def parse_blob(source: bytes) -> ParseResult:
 
     collector = _Collector()
     collector.visit(tree)
+    bindings = _finalize_bindings(collector.raw_bindings)
     return ParseResult(
         nodes=_apply_shadowing(collector.nodes),
-        refs=tuple(collector.refs),
+        refs=_drop_bound_value_refs(collector.refs, bindings),
         imports=tuple(collector.imports),
-        bindings=_finalize_bindings(collector.raw_bindings),
+        bindings=bindings,
         module_body_hash=_module_body_hash(tree),
         error=None,
     )
