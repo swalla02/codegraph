@@ -661,3 +661,66 @@ def test_rebuild_rebuilds_layer_2_not_just_the_parse_cache(repo, write):
     store = Store.open(repo)
     assert dump_graph(store, WORKTREE) == expected
     store.close()
+
+
+# -- a resolver change invalidates the graph; a parse cache is not a resolver --
+#
+# `pip install -U codegraph` ships a new resolver without touching one file in
+# the user's tree, so the fingerprint is the only thing that can notice. It did
+# not, and Layer 2 was served from the previous build indefinitely. See #44.
+
+
+def test_a_resolver_change_re_resolves_without_re_parsing(repo, write, monkeypatch):
+    """The two layers have to move independently.
+
+    Layer 2 must be rebuilt: the new resolver's edges are the answer now, and
+    the previous ones are exactly as wrong as the ones a config change leaves
+    behind. Layer 1 must not be: what a parse produces is a function of the
+    blob's bytes and `parse.py`, never of resolver code, so re-parsing every
+    blob in the repository to pick up a resolver change would be minutes of
+    work (on django) bought with nothing.
+
+    Deleting the edges by hand is what makes the rebuild provable -- the same
+    trick as the `--rebuild` test above. A reconcile that took the fast path
+    leaves them gone.
+    """
+    import codegraph.indexer as indexer_module
+
+    write("lib.py", "def helper():\n    return 1\n")
+    write(
+        "app.py",
+        "from lib import helper\n\n\ndef caller():\n    return helper()\n",
+        commit="two",
+    )
+    store = Store.open(repo)
+    Indexer(repo, store, GitTreeSource(repo)).reconcile(WORKTREE)
+    expected = dump_graph(store, WORKTREE)
+    assert expected["edges"], "the fixture stopped producing any edges to lose"
+
+    store.connection.execute("DELETE FROM edges WHERE rev=?", (WORKTREE,))
+    store.connection.commit()
+
+    # An upgraded codegraph, as the fingerprint sees one: same tree, same
+    # config, different resolver source.
+    monkeypatch.setattr(indexer_module, "resolver_fingerprint", lambda: "after-the-upgrade")
+    stats = Indexer(repo, store, GitTreeSource(repo)).reconcile(WORKTREE)
+
+    assert dump_graph(store, WORKTREE) == expected, "the upgrade was served the previous graph"
+    assert stats.blobs_parsed == 0, "a resolver change re-parsed Layer 1"
+    assert stats.blobs_cached == stats.paths_total == 3, "the parse cache lost blobs"
+    store.close()
+
+
+def test_an_unchanged_resolver_still_skips(repo, write, monkeypatch):
+    """Non-vacuity guard for the test above: the fast path has to survive the
+    fix. Folding a digest into the fingerprint is only free if the digest is
+    the same on every reconcile -- one that varied (a salted `hash()`, a
+    timestamp) would turn every query into a full rebuild of the revision."""
+    write("m.py", "def helper():\n    pass\n\n\ndef caller():\n    helper()\n", commit="m")
+    store = Store.open(repo)
+    Indexer(repo, store, GitTreeSource(repo)).reconcile(WORKTREE)
+
+    calls = resolve_calls(monkeypatch)
+    Indexer(repo, store, GitTreeSource(repo)).reconcile(WORKTREE)
+    assert calls == [], "an unchanged resolver re-resolved"
+    store.close()

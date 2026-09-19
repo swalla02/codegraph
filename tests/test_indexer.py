@@ -1,5 +1,11 @@
 # tests/test_indexer.py
-from codegraph.indexer import FsTreeSource, GitTreeSource, Indexer
+from codegraph.indexer import (
+    RESOLVER_SOURCES,
+    FsTreeSource,
+    GitTreeSource,
+    Indexer,
+    digest_sources,
+)
 from codegraph.store import WORKTREE, Store
 from tests.conftest import git
 
@@ -158,3 +164,58 @@ def test_staged_rename_drops_old_path_in_worktree(repo, write):
     assert "a.py" not in paths
     assert "renamed.py" in paths
     store.close()
+
+
+# -- what the resolver fingerprint is made of (#44) --------------------------
+
+
+def _fake_package(root, resolver_body):
+    """A directory shaped like `src/codegraph`, with `resolve.py`'s bytes
+    under the caller's control."""
+    for name in RESOLVER_SOURCES:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(resolver_body if name == "resolve.py" else f"# {name}\n")
+    return root
+
+
+def test_the_fingerprint_is_derived_from_the_resolver_source_not_declared(tmp_path):
+    """The whole point of #44: nobody has to remember to bump anything.
+
+    A declared `RESOLVER_VERSION` describes the resolver only as long as
+    every change to it is accompanied by an edit to a constant somewhere
+    else, and the bug being fixed is the proof that that does not hold.
+    """
+    before = _fake_package(tmp_path / "before", "def resolve():\n    return 1\n")
+    after = _fake_package(tmp_path / "after", "def resolve():\n    return 2\n")
+    same = _fake_package(tmp_path / "same", "def resolve():\n    return 1\n")
+
+    assert digest_sources(before) != digest_sources(after)
+    # Same bytes, same digest, every run: the fingerprint is baked into an
+    # on-disk cache key, so a process-salted hash would rebuild everything on
+    # every query.
+    assert digest_sources(before) == digest_sources(same)
+
+
+def test_the_fingerprint_pins_the_modules_that_write_layer_2_and_no_others(tmp_path):
+    """Membership is "does this module's code decide what gets stored".
+
+    `query/` is the interesting exclusion: those modules read the graph and
+    never write a row, so a change there cannot make a stored row wrong --
+    and they are the ones edited most often. Pinning them would make this
+    digest mean "any commit to codegraph rebuilds every revision".
+
+    `parse.py` is excluded for the opposite reason: Layer 1 is keyed
+    separately, on blob sha and `PARSER_VERSION`, and re-resolving unchanged
+    blob rows under a new parser cannot produce a different graph.
+    """
+    from pathlib import Path
+
+    import codegraph
+
+    package = Path(codegraph.__file__).resolve().parent
+    assert "resolve.py" in RESOLVER_SOURCES
+    assert "parse.py" not in RESOLVER_SOURCES
+    assert not [name for name in RESOLVER_SOURCES if name.startswith("query/")]
+    for name in RESOLVER_SOURCES:
+        assert (package / name).is_file(), f"{name} is pinned but no longer exists"
