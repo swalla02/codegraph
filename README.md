@@ -115,6 +115,7 @@ slower on a cold cache.
 | `codegraph islands [--rev REV] [--limit N] [--json] [--strict]` | Report the connected components of the revision's `CALLS`, `INHERITS`, `IMPLEMENTS` and `REFERENCES` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
 | `codegraph orphans [--rev REV] [--limit N] [--include-public] [--include-decorated] [--json]` | Find functions whose every recorded caller is a test — defined, tested, and never invoked by the code that was supposed to invoke it. Such a function is *not* a one-symbol island, precisely because its test calls it, so `islands` structurally cannot surface it. Candidates are private by name, undecorated, defined outside the test tree, and never mentioned by name anywhere in the source text — that last filter has no off switch, because a static call graph cannot see a callback handed to a library. Not a dead-code report (see below). |
 | `codegraph diff [<base>..<head>] [--json]` | Report what changed between two revisions by content hash, never by line number: symbols added/removed/changed, plus any side effect newly reachable. Defaults to `merge-base(default branch, HEAD)..WORKTREE` — "what has this branch changed so far." |
+| `codegraph trace [FILE] [--rev REV] [--forget]` | Import a recorded run (see "What a trace buys" below) and bind it to a revision, so that calls the resolver cannot see — framework dispatch, `getattr`, a decorator's wrapper — become edges marked `runtime` alongside the ones it deduced. With no argument it describes the trace the revision holds, or tells you how to record one. Additive: a repository with no trace answers exactly as it did before. |
 | `codegraph gc [--keep REV]` | Prune the Layer 1 parse cache down to what `HEAD`, the worktree, and any `--keep`-named revisions still reference. Never touches the graph itself, so it can only make a future answer slower to rebuild, never wrong. |
 | `codegraph init` | Make this repository's coding agents aware of codegraph: an `AGENTS.md` section, the `@AGENTS.md` bridge into an existing `CLAUDE.md`, and a commented `codegraph.toml` stub. Idempotent; never overwrites content it did not write; never touches `.git/`. |
 | `codegraph guide` | Print the agent-facing workflow to stdout — the same text the plugin ships as `SKILL.md`, so the short `AGENTS.md` section can defer to it rather than inline it. |
@@ -156,11 +157,23 @@ apart, and no label is ever a claim that code is dead:
   the process is a structural fact, whereas coupling two functions through
   a database means reading SQL and tracking a schema, which is a different
   tool.
+- **`traced: N members seen running`** — a run was watched entering this
+  island. It is listed apart from the mechanisms above because it is not a
+  mechanism: every one of those says "here is a way something *could* reach
+  this", and this one says a run *did*. It only appears on a revision with
+  an imported trace, and it is the only label in this list that is evidence
+  rather than counter-evidence.
 - **`no implicit-invocation mechanism recognised`** — the remainder, 17
   islands on requests, and still a statement about the tool rather than
   about the code. Most of them are the library's own public surface
   (`get_dict`, `dict_from_cookiejar`), called by users of the package and
   by the stdlib — neither of which is in the tree.
+
+Every `islands` and `orphans` summary also carries a `trace:` field, which
+reads `none` until a run has been imported. That is deliberate: "nothing
+reaches this" is a far stronger claim about a repository whose test suite has
+been watched running than about one where the only witness is the source
+text, and a reader cannot discount a claim they were never told the basis of.
 
 Two things that moved the numbers are worth naming separately, because both
 were relationships the source really states and the graph simply did not
@@ -391,9 +404,10 @@ no node in this graph is its target. Each entry says which it is in a
 **An empty `unknowns` means "no hole this tool can name", never "this answer
 is complete."** A name assembled at runtime leaves nothing for any of this
 to find. What shrinks the gap is observing a run, which is what
-`bench/tracer.py` does — and whether trace data should enter the graph as a
-fourth provenance is a separate question from making today's ignorance
-addressable.
+`codegraph.tracer` records and `codegraph trace` imports — see "What a trace
+buys, and what it costs" below. An `unexplained_island` entry names the one
+hole a trace closes outright: once a run has been watched entering the
+symbol, the entry is no longer raised.
 
 `resolve`, `impact`, `effects`, `path` and `unknowns` share one exit-code
 convention for resolving `<symbol>` to a node id: `0` = a single unambiguous match, `1` =
@@ -455,6 +469,87 @@ Two deliberate refusals, both of which used to produce confident nonsense:
   were reported as network calls and the real one was missed. A name belonging
   to a module this repository defines skips the catalog; your own `[[effect]]`
   rules still apply, since naming house abstractions is what they are for.
+
+### Provenance: the axis confidence is not
+
+Every edge also carries a **provenance**, and it answers a question the tier
+above cannot. Confidence is about reading: "how sure is the resolver that
+this reference means that symbol". Provenance is about evidence: `static`
+means the text says so, `runtime` means a run was watched doing it. They are
+orthogonal, and the mixed cases are the point — a LOW static edge a trace
+confirms is, in fact, certain.
+
+So an edge a run confirms keeps **both** rows. Merging them would have to
+throw one of the two facts away, and which one gets thrown away is exactly
+what a reader is asking about. A traced edge the resolver never found is
+stored at HIGH, whatever the resolver would have guessed: a tier is a
+statement about degrees of inference, and `sys.monitoring` hands over the
+code objects, so there is no inference left for a tier to express. Adding a
+fourth tier above HIGH was the alternative and was rejected for putting two
+different axes on one scale.
+
+Everything below this line is `none` until you import a trace, and nothing
+about an untraced repository changes.
+
+## What a trace buys, and what it costs
+
+The static resolver has a ceiling this project has been explicit about:
+framework dispatch, `visit_*` name lookup, `getattr`, a decorator's wrapper.
+Those calls are not in the text to be read, so no amount of resolver work
+reaches them — on pallets/flask they are most of why recall is 0.29. A run
+is the only thing that sees them.
+
+```sh
+# 1. record, with the interpreter that can actually run the program
+python "$(python -c 'import codegraph.tracer as t; print(t.__file__)')" \
+    --root . --out trace.json -- -q
+
+# 2. import, bound to the revision it was taken from
+codegraph trace trace.json
+```
+
+Measured on pallets/flask `d73fa1c` (83 files, 1,622 static `CALLS` pairs),
+tracing its own `tests/` suite:
+
+| | |
+|---|---|
+| calls observed | 2,886 |
+| confirming an edge the resolver already had | 694 |
+| **adding one it did not** | **1,989** |
+| functions seen running | 1,465 |
+| islands | 237 → **85** (singletons 228 → 81, unexplained 17 → **6**) |
+
+A concrete answer that changes. `setupmethod.<locals>.wrapper_func` in
+`src/flask/sansio/scaffold.py` is the wrapper every `@setupmethod`-decorated
+method is replaced by. No call site in flask names it, so
+`codegraph impact` on it reported `symbols: 0 · effects_reachable: none` —
+"nothing depends on this", about a function 273 call sites invoke. With the
+trace imported it reports **412 dependents across 46 modules**, the first
+rows reading `hop 1, HIGH confidence, observed`, and five reachable effect
+kinds behind it.
+
+What it costs:
+
+- **A run.** Flask's suite is 494 tests and ~40s; a suite that needs a
+  database or a network needs them here too. Recall of the trace is recall
+  of whatever you ran, and a path your suite never takes is a path the trace
+  does not have.
+- **One re-index of that revision.** Importing changes what the graph
+  contains, so it invalidates the materialized revision exactly as a
+  `codegraph.toml` edit or an upgrade does — the "adds or removes a
+  definition" row in the cost table above. `codegraph trace` pays it up
+  front rather than leaving it for the next query.
+- **Nothing ongoing.** A trace is bound to the revision it was imported for
+  and to the *content* of each file it named. Edit a file and every
+  observation about it is dropped, reported as `stale` in the summary and by
+  `codegraph trace`, and the rest of the trace keeps working. It never
+  silently describes code that is no longer there, and `codegraph trace
+  --forget` returns the graph to exactly what it was.
+
+What it does **not** buy: a better benchmark number. `bench/` scores the
+resolver, so it reads `static` rows only — importing a trace into a target
+repository leaves every figure in the table below unchanged, which is
+checked rather than asserted (`tests/test_bench_scorer.py`).
 
 ## `codegraph.toml`
 
@@ -600,7 +695,8 @@ one, and its assertions say so when they fail. The effectiveness floors are on
 [Effectiveness floors](#effectiveness-floors).
 
 `bench/` is the real measurement (#35). It runs a target repository's **own
-test suite** under `sys.monitoring`, records every `(caller, callee)` pair that
+test suite** under `sys.monitoring` (`codegraph.tracer`, the same recorder
+`codegraph trace` imports from), records every `(caller, callee)` pair that
 actually executed, and scores the static graph against it. A call the tests
 made is a call that exists, so a traced edge missing from the static graph is a
 real gap — no labelling judgement involved.

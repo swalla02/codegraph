@@ -23,7 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from codegraph.ambiguity import Ambiguity, last_segment
-from codegraph.resolve import MODULE_SCOPE
+from codegraph.resolve import MODULE_SCOPE, STATIC
+from codegraph.trace import ANONYMOUS_SCOPES, collapse_anonymous, is_anonymous
 
 #: The node kinds `parse.py` gives to things that are called. `module` and
 #: `class` are the two it gives to things that are *executed* but not called
@@ -31,13 +32,6 @@ from codegraph.resolve import MODULE_SCOPE
 CALLABLE_KINDS = frozenset({"function", "method"})
 
 CONFIDENCE_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
-
-#: Code objects CPython creates for a scope that has no `def` and therefore no
-#: node in `nodes`: `parse.py` records definitions, and a comprehension or a
-#: lambda is not one. PY_START fires for them all the same.
-ANONYMOUS_SCOPES = frozenset(
-    {"<genexpr>", "<listcomp>", "<setcomp>", "<dictcomp>", "<lambda>"}
-)
 
 #: Confidence attributed to an edge that exists only as a query-time
 #: expansion of an ambiguous reference. `resolve.py` writes no row for such a
@@ -50,35 +44,11 @@ def _qualname(node_id: str) -> str:
     return node_id.partition("::")[2]
 
 
-def is_anonymous(node_id: str) -> bool:
-    """Is this an anonymous scope -- a comprehension or a lambda?"""
-    return last_segment(_qualname(node_id)) in ANONYMOUS_SCOPES
-
-
-def collapse_anonymous(node_id: str) -> str:
-    """`m.py::f.<locals>.<genexpr>` -> `m.py::f`, repeatedly.
-
-    A comprehension runs in its own code object, so the trace attributes a
-    call made inside one to `f.<locals>.<genexpr>`. codegraph attributes the
-    same call site to `f`, because `parse.py` walks the AST and a
-    comprehension is an expression inside `f`'s body, not a definition.
-    Without this the two describe the same call under two different names and
-    it scores as a miss -- a disagreement about node naming, not about the
-    call graph. Measured on requests: 1 of 25 misses was exactly this
-    (`_init.<locals>.<genexpr> -> _init.<locals>.doc`).
-
-    A comprehension at module scope collapses to the module node, which is
-    what `parse.py` attributes it to.
-    """
-    path, separator, qualname = node_id.partition("::")
-    parts = qualname.split(".")
-    while parts and parts[-1] in ANONYMOUS_SCOPES:
-        parts.pop()
-        if parts and parts[-1] == "<locals>":
-            parts.pop()
-    if not parts:
-        return f"{path}{separator}{MODULE_SCOPE}"
-    return f"{path}{separator}{'.'.join(parts)}"
+# `is_anonymous` and `collapse_anonymous` used to live here and now come from
+# `codegraph.trace`, which does the same renaming when a trace is imported
+# for real (#56). One implementation, because two would eventually disagree
+# about what a node is called and the disagreement would show up as a
+# benchmark number rather than as an error.
 
 
 def _rename(traced: set[tuple[str, str]]) -> set[tuple[str, str]]:
@@ -95,8 +65,8 @@ def _rename(traced: set[tuple[str, str]]) -> set[tuple[str, str]]:
 
 @dataclass(frozen=True)
 class Trace:
-    """One run of `bench/tracer.py`, with endpoints named as `parse.py` names
-    them (see `collapse_anonymous`)."""
+    """One run of `codegraph.tracer`, with endpoints named as `parse.py`
+    names them (see `collapse_anonymous`)."""
 
     edges: set[tuple[str, str]]
     #: Every in-repo function that ran, whether or not it has an in-repo
@@ -292,7 +262,15 @@ def check_floor(report: Report, floor: Floor) -> list[FloorCheck]:
 
 
 def read_static_graph(store, rev: str) -> StaticGraph:
-    """Read `edges` and the ambiguity expansion for `rev` into one graph."""
+    """Read `edges` and the ambiguity expansion for `rev` into one graph.
+
+    STATIC rows only, and this is not an optimization. Since #56 a revision
+    can carry edges projected from an imported trace, and those edges are
+    derived from the very trace this benchmark scores against: counting them
+    would mark every observed call as found and report a recall of 1.00 that
+    means nothing whatsoever. The benchmark measures the resolver, so it
+    reads what the resolver wrote.
+    """
     connection = store.connection
     kinds: dict[str, str] = {}
     decorators: dict[str, str] = {}
@@ -309,7 +287,8 @@ def read_static_graph(store, rev: str) -> StaticGraph:
             edges[edge] = confidence
 
     for row in connection.execute(
-        "SELECT src, dst, confidence FROM edges WHERE rev=? AND kind='CALLS'", (rev,)
+        "SELECT src, dst, confidence FROM edges WHERE rev=? AND kind='CALLS' AND provenance=?",
+        (rev, STATIC),
     ):
         offer(row["src"], row["dst"], row["confidence"])
 

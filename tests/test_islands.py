@@ -49,8 +49,12 @@ def test_a_fully_connected_call_graph_is_one_island(repo, write):
         "singletons": 0,
         "implicit": 0,
         "network": 0,
+        # No trace has been imported, so nothing was seen running and the
+        # report says as much rather than leaving the reader to assume.
+        "traced": 0,
         "unexplained": 1,
         "basis": "undirected CALLS, INHERITS, IMPLEMENTS, REFERENCES edges",
+        "trace": "none",
     }
     store.close()
 
@@ -144,8 +148,12 @@ def test_a_repo_with_no_python_files_reports_no_islands(repo, write):
         "singletons": 0,
         "implicit": 0,
         "network": 0,
+        # No trace has been imported, so nothing was seen running and the
+        # report says as much rather than leaving the reader to assume.
+        "traced": 0,
         "unexplained": 0,
         "basis": "undirected CALLS, INHERITS, IMPLEMENTS, REFERENCES edges",
+        "trace": "none",
     }
     assert report.groups == []
     assert report.truncated is False
@@ -563,7 +571,8 @@ def test_a_constructor_call_removes_the_island_the_missing_edge_created(repo, wr
 
 
 def test_a_script_entry_point_is_explained_by_its_module_top_level(repo, write):
-    """`bench/tracer.py::main`, whose only caller is the `__main__` guard at
+    """The `main` of `codegraph.tracer`, whose only caller is the `__main__`
+    guard at
     the foot of its own file. The edge was always there -- it is the
     `path::<module>` node that owns it -- but module nodes carry connectivity
     without being members, so `main` was reported as an island of one with

@@ -1162,7 +1162,7 @@ def test_from_package_import_name_also_follows_the_reexport(repo, write):
 #
 # `import pytest` names a module this repository does not contain. A call on it
 # still reached the last-resort name match, which projected `pytest.main` onto
-# every repo function called `main`: `bench/tracer.py`'s own `pytest.main(...)`
+# every repo function called `main`: `codegraph.tracer`'s own `pytest.main(...)`
 # call reported three candidates, none of them right. See #47.
 
 

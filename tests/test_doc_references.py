@@ -387,7 +387,7 @@ def test_the_scanner_resolves_the_kinds_of_reference_this_repository_writes():
 def test_the_scanner_tells_our_paths_apart_from_the_ones_prose_invents():
     """The other half of the judgement: which cited paths are claims about
     this repository at all."""
-    for ours in ["src/codegraph/cli.py", "query/islands.py", "bench/tracer.py", "propagate.py"]:
+    for ours in ["src/codegraph/cli.py", "query/islands.py", "bench/score.py", "propagate.py"]:
         resolved = _repository_path(ours)
         assert resolved is not None and resolved.exists(), ours
     # A corpus, an invented package, and the fixture module the tests are

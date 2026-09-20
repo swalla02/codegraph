@@ -129,9 +129,12 @@ from codegraph.resolve import (
     HIGH,
     INHERITS,
     LOW,
+    RUNTIME,
     weaker,
 )
 from codegraph.store import Store
+from codegraph.trace import NO_TRACE
+from codegraph.trace import summary as trace_summary
 from codegraph.uncertainty import HOP_LIMIT, LOW_CONFIDENCE, unknown
 
 _RANK = CONFIDENCE_RANK
@@ -159,11 +162,12 @@ FORWARD, REVERSE = "forward", "reverse"
 #: both a CALLS and a REFERENCES prints as the call it is.
 _KIND_ORDER = {kind: rank for rank, kind in enumerate(DEPENDENCY_KINDS)}
 
-#: One edge of the walk, as the adjacency holds it: kind, confidence, and
-#: the `file:line` that makes it. A tuple rather than a dataclass because
-#: there is one per distinct (src, dst) pair in the revision -- ~330k of
-#: them on django -- and this is the report's whole resident footprint.
-_Edge = tuple[str, str, str]
+#: One edge of the walk, as the adjacency holds it: kind, confidence, the
+#: `file:line` that makes it, and whether a run was watched taking it. A
+#: tuple rather than a dataclass because there is one per distinct (src,
+#: dst) pair in the revision -- ~330k of them on django -- and this is the
+#: report's whole resident footprint.
+_Edge = tuple[str, str, str, bool]
 
 
 @dataclass(frozen=True)
@@ -181,6 +185,9 @@ class _Hop:
     confidence: str
     callsite: str
     via: str = ""
+    #: A run was seen taking this hop (`resolve.RUNTIME`). A derived hop is
+    #: never observed: a trace names its callee, so it is never ambiguous.
+    observed: bool = False
 
 
 def _forward_edges(store: Store, rev: str) -> dict[str, dict[str, _Edge]]:
@@ -196,8 +203,8 @@ def _forward_edges(store: Store, rev: str) -> dict[str, dict[str, _Edge]]:
     best: dict[tuple[str, str], _Edge] = {}
     marks = ",".join("?" * len(DEPENDENCY_KINDS))
     for row in store.connection.execute(
-        "SELECT src, dst, kind, confidence, callsite_path, callsite_line FROM edges"
-        f" WHERE rev=? AND kind IN ({marks})",
+        "SELECT src, dst, kind, confidence, callsite_path, callsite_line, provenance"
+        f" FROM edges WHERE rev=? AND kind IN ({marks})",
         (rev, *DEPENDENCY_KINDS),
     ):
         key = (row["src"], row["dst"])
@@ -205,6 +212,7 @@ def _forward_edges(store: Store, rev: str) -> dict[str, dict[str, _Edge]]:
             row["kind"],
             row["confidence"],
             f"{row['callsite_path']}:{row['callsite_line']}",
+            row["provenance"] == RUNTIME,
         )
         current = best.get(key)
         if current is None or _edge_order(edge) < _edge_order(current):
@@ -216,9 +224,13 @@ def _forward_edges(store: Store, rev: str) -> dict[str, dict[str, _Edge]]:
     return forward
 
 
-def _edge_order(edge: _Edge) -> tuple[int, int, str]:
-    kind, confidence, callsite = edge
-    return (-_RANK[confidence], _KIND_ORDER[kind], callsite)
+def _edge_order(edge: _Edge) -> tuple[int, int, int, str]:
+    # An observed row beats an equally confident deduced one, so the hop can
+    # say it was watched. It costs the reader nothing: `trace.project` gives
+    # a confirmed pair's row the static edge's own call site, so the
+    # `file:line` printed is the same either way.
+    kind, confidence, callsite, observed = edge
+    return (-_RANK[confidence], _KIND_ORDER[kind], 0 if observed else 1, callsite)
 
 
 def _derived_names(ambiguity: Ambiguity) -> dict[str, list[tuple[str, str]]]:
@@ -255,11 +267,11 @@ def _successors(
     graph's own answer about a pair is always the better evidence.
     """
     seen: set[str] = set()
-    for dst, (kind, confidence, callsite) in forward.get(node_id, {}).items():
+    for dst, (kind, confidence, callsite, observed) in forward.get(node_id, {}).items():
         if confidence == LOW and not include_low:
             continue
         seen.add(dst)
-        yield _Hop(dst, kind, confidence, callsite)
+        yield _Hop(dst, kind, confidence, callsite, observed=observed)
     if not include_low:
         # The fan-out is LOW by construction, so excluding LOW excludes it.
         # That is the whole of the decision described in the module
@@ -431,6 +443,12 @@ def _rows(store: Store, rev: str, start: str, path: tuple[_Hop, ...]) -> list[Ro
         if hop.via:
             detail += f" via the bare name {hop.via!r}"
         detail += f", {hop.confidence} confidence"
+        if hop.observed:
+            # Beside the confidence, never instead of it: a hop can be
+            # certain because the text names it, because a run took it, or
+            # both, and which of those a reader is looking at changes what
+            # they do next (#56).
+            detail += ", observed"
         if callsite:
             detail += f", call site {callsite}"
         if index == weakest:
@@ -521,6 +539,7 @@ def path_report(
         if reverse is not None:
             groups.append(Group(REVERSE, _rows(store, rev, to_id, reverse)))
         summary["basis"] = _basis(max_hops, include_low)
+        _note_trace(store, rev, summary)
         return Report(summary=summary, groups=groups, truncated=False)
 
     summary["direction"] = "none"
@@ -535,6 +554,7 @@ def path_report(
         # makes the same split for the same reason (#37).
         summary["show_path"] = show_path
     summary["basis"] = _basis(max_hops, include_low)
+    _note_trace(store, rev, summary)
     # Exactly the negatives a flag would turn into a path, and no others.
     # "Different islands" is the strongest claim this tool has and it is
     # complete: no budget and no tier excluded it, so an envelope entry
@@ -547,6 +567,19 @@ def path_report(
         truncated=False,
         unknowns=[unknown(hole, reason)] if hole else [],
     )
+
+
+def _note_trace(store: Store, rev: str, summary: dict) -> None:
+    """Add the `trace` field, when there is a trace to add.
+
+    Only then, so a revision nobody has traced prints exactly the report it
+    printed before #56 -- and a negative answer here ("different islands")
+    is the one place it matters most, because an imported run is what
+    decides whether that claim rests on the text alone.
+    """
+    traced = trace_summary(store, rev)
+    if traced != NO_TRACE:
+        summary["trace"] = traced
 
 
 def _negative(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 WORKTREE = "WORKTREE"
 
@@ -117,6 +117,14 @@ CREATE TABLE IF NOT EXISTS nodes (
     decorators TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (rev, id)
 );
+-- `provenance` is the other axis from `confidence`, and the two answer
+-- different questions (`resolve.STATIC`, `resolve.RUNTIME`). Confidence says
+-- how sure the resolver is that this reference means that symbol; provenance
+-- says who says so -- the text, or a run that was watched. They are
+-- orthogonal, so a pair both deduced and observed holds TWO rows rather than
+-- one merged verdict: the static row keeps the call site and the tier the
+-- text earns, the runtime row keeps the observation, and a query that wants
+-- either can have it. See `trace.project`.
 CREATE TABLE IF NOT EXISTS edges (
     rev TEXT NOT NULL,
     src TEXT NOT NULL,
@@ -167,6 +175,69 @@ CREATE TABLE IF NOT EXISTS unresolved (
     ref_kind TEXT NOT NULL DEFAULT 'call',
     reason TEXT NOT NULL DEFAULT 'unknown',
     candidates INTEGER NOT NULL DEFAULT 0
+);
+
+-- Layer 3: what a run was observed to do, imported rather than derived.
+--
+-- Not Layer 1 and not Layer 2. Layer 1 is a function of a blob's bytes and
+-- Layer 2 is a function of a revision's tree, so either can be thrown away
+-- and recomputed; this cannot. It is evidence, and the only way to get it
+-- back is to run the program again. `gc` therefore never touches it, and
+-- `index --rebuild` does not either.
+--
+-- Keyed by `rev`, because a trace describes one revision of one repository
+-- and nothing else. Making that the primary key is what stops it leaking:
+-- there is no query that could read a trace under a revision it was not
+-- imported for, because no such row exists. One trace per revision -- a
+-- second import replaces the first rather than accumulating, since two runs
+-- of the same suite are not two independent bodies of evidence a reader
+-- would ever want to tell apart.
+--
+-- `trace_files` is what makes staleness detectable instead of silent. It
+-- records the blob sha of every file the trace named a symbol in, AS OF the
+-- import. An observation is about the code that ran; when the file it ran in
+-- has a different sha, that code is gone and the observation is not evidence
+-- about what is there now. See `trace.project`.
+--
+-- The counts on `trace_runs` after `projected_at` are derived -- `project`
+-- recomputes and rewrites them in the same transaction that writes the edge
+-- rows they describe, so they cannot drift from the graph they summarize.
+-- They are stored rather than recomputed because every report's summary line
+-- prints them, and a query should not rescan the whole trace to say one
+-- sentence.
+CREATE TABLE IF NOT EXISTS trace_runs (
+    rev TEXT PRIMARY KEY,
+    trace_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    imported_at INTEGER NOT NULL,
+    observed INTEGER NOT NULL,
+    executed INTEGER NOT NULL,
+    projected_at INTEGER NOT NULL DEFAULT 0,
+    confirmed INTEGER NOT NULL DEFAULT 0,
+    added INTEGER NOT NULL DEFAULT 0,
+    stale INTEGER NOT NULL DEFAULT 0,
+    unmodelable INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS trace_edges (
+    rev TEXT NOT NULL,
+    src TEXT NOT NULL,
+    dst TEXT NOT NULL,
+    PRIMARY KEY (rev, src, dst)
+);
+-- Every in-repo function the run entered, whether or not any in-repo caller
+-- was found for it. A framework-dispatched view function has no caller in
+-- this tree at all, so it appears in no edge -- and "this ran" is precisely
+-- the fact `islands` has never had about such a symbol.
+CREATE TABLE IF NOT EXISTS trace_executed (
+    rev TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    PRIMARY KEY (rev, node_id)
+);
+CREATE TABLE IF NOT EXISTS trace_files (
+    rev TEXT NOT NULL,
+    path TEXT NOT NULL,
+    blob_sha TEXT NOT NULL,
+    PRIMARY KEY (rev, path)
 );
 
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(rev, dst);

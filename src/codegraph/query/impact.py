@@ -56,11 +56,25 @@ from __future__ import annotations
 from codegraph.ambiguity import Ambiguity
 from codegraph.query.rank import fan_in, salience, score
 from codegraph.render import Group, Report, Row, budget
-from codegraph.resolve import CONFIDENCE_RANK, DEPENDENCY_KINDS, HIGH, LOW, stronger, weaker
+from codegraph.resolve import (
+    CONFIDENCE_RANK,
+    DEPENDENCY_KINDS,
+    HIGH,
+    LOW,
+    RUNTIME,
+    stronger,
+    weaker,
+)
 from codegraph.store import Store
+from codegraph.trace import NO_TRACE
+from codegraph.trace import summary as trace_summary
 from codegraph.uncertainty import HOP_LIMIT, unknown
 
 _RANK = CONFIDENCE_RANK
+
+#: One edge into a node, as the walk holds it: the strongest confidence any
+#: row for the pair carries, and whether a run was seen taking it.
+_Link = tuple[str, bool]
 
 #: How many LOW-confidence dependents the default report names before
 #: falling back to a count. Small on purpose: the point is to let a reader
@@ -70,87 +84,111 @@ _RANK = CONFIDENCE_RANK
 _LOW_SAMPLE = 5
 
 
-def _reverse_edges(store: Store, rev: str) -> dict[str, dict[str, str]]:
-    """dst -> {src: confidence}, one entry per (src, dst) pair at its
-    strongest confidence -- duplicate edge rows collapsed before the walk."""
+def _reverse_edges(store: Store, rev: str) -> dict[str, dict[str, _Link]]:
+    """dst -> {src: (confidence, observed)}, one entry per (src, dst) pair at
+    its strongest confidence -- duplicate edge rows collapsed before the walk.
+
+    A pair a trace confirmed holds two rows, and they are not competing
+    answers: the strongest confidence among them is the pair's, and the
+    observation is a separate bit alongside it. It cannot be folded into the
+    tier, because "certain the name means this" and "a run did this" are the
+    two axes #56 exists to keep apart -- and only the second licenses the
+    word the rows print.
+    """
     edge_confidence: dict[tuple[str, str], str] = {}
+    observed: set[tuple[str, str]] = set()
     marks = ",".join("?" * len(DEPENDENCY_KINDS))
     for row in store.connection.execute(
-        f"SELECT src, dst, confidence FROM edges WHERE rev=? AND kind IN ({marks})",
+        f"SELECT src, dst, confidence, provenance FROM edges WHERE rev=? AND kind IN ({marks})",
         (rev, *DEPENDENCY_KINDS),
     ):
         key = (row["src"], row["dst"])
         edge_confidence[key] = stronger(
             edge_confidence.get(key, row["confidence"]), row["confidence"]
         )
+        if row["provenance"] == RUNTIME:
+            observed.add(key)
 
-    reverse: dict[str, dict[str, str]] = {}
+    reverse: dict[str, dict[str, _Link]] = {}
     for (src, dst), confidence in edge_confidence.items():
-        reverse.setdefault(dst, {})[src] = confidence
+        reverse.setdefault(dst, {})[src] = (confidence, (src, dst) in observed)
     return reverse
 
 
 def _predecessors(
-    reverse: dict[str, dict[str, str]], ambiguity: Ambiguity, node_id: str
-) -> dict[str, str]:
+    reverse: dict[str, dict[str, _Link]], ambiguity: Ambiguity, node_id: str
+) -> dict[str, _Link]:
     """Every caller and subclass of `node_id`, materialized and derived
     alike, at the strongest confidence any of them claims.
 
     The derived half is the bare-name fan-out the graph deliberately does
     not store, expanded here for this one node -- ambiguous calls and
-    ambiguous base references both, always LOW, and never strengthening a
-    materialized edge that already reaches the same node.
+    ambiguous base references both, always LOW, never observed (a trace
+    names the callee outright, so an observation is never ambiguous), and
+    never strengthening a materialized edge that already reaches the same
+    node.
     """
     predecessors = dict(reverse.get(node_id, {}))
     for src in ambiguity.callers(node_id):
-        predecessors.setdefault(src, LOW)
+        predecessors.setdefault(src, (LOW, False))
     for src in ambiguity.inheritors(node_id):
-        predecessors.setdefault(src, LOW)
+        predecessors.setdefault(src, (LOW, False))
     return predecessors
 
 
 def _walk(
-    reverse: dict[str, dict[str, str]],
+    reverse: dict[str, dict[str, _Link]],
     ambiguity: Ambiguity,
     node_id: str,
     max_hops: int,
-) -> tuple[dict[str, tuple[int, str]], bool]:
-    """Reverse BFS from `node_id`: node -> (hop, path confidence), each node
-    recorded once at its shortest hop, with the strongest confidence
-    achievable among the edges reaching it at that hop -- and whether the
-    budget, rather than the graph, is what stopped it.
+) -> tuple[dict[str, tuple[int, str, bool]], bool]:
+    """Reverse BFS from `node_id`: node -> (hop, path confidence, observed),
+    each node recorded once at its shortest hop, with the strongest
+    confidence achievable among the edges reaching it at that hop -- and
+    whether the budget, rather than the graph, is what stopped it.
 
-    That second value is the point of #55. A walk that exhausted the graph
-    and a walk that ran out of hops print the identical report, and the
-    second one is not the answer it looks like: "these six things depend on
-    it" is a different claim from "these six, and I stopped looking". It
+    `observed` composes with AND along a chain, the way confidence composes
+    with `weaker`: a path was watched running only if every hop of it was
+    (#56). Anything looser puts the report's strongest word next to a
+    dependent whose connection to the queried symbol is still an inference.
+
+    The second return value is the point of #55. A walk that exhausted the
+    graph and a walk that ran out of hops print the identical report, and
+    the second one is not the answer it looks like: "these six things depend
+    on it" is a different claim from "these six, and I stopped looking". It
     costs one further expansion of the final frontier to tell them apart,
     and the question is only asked once per report, so it is paid here
     rather than approximated by "the frontier was non-empty" -- a frontier
     can be non-empty and have nothing unvisited behind it, which would
     report a complete walk as truncated on every cyclic graph.
     """
-    found: dict[str, tuple[int, str]] = {}
-    level_confidence: dict[str, str] = {node_id: HIGH}
+    found: dict[str, tuple[int, str, bool]] = {}
+    level: dict[str, _Link] = {node_id: (HIGH, True)}
     current_level = {node_id}
     visited = {node_id}
     hop = 0
     while current_level and hop < max_hops:
-        next_level: dict[str, str] = {}
+        next_level: dict[str, _Link] = {}
         for current in current_level:
-            path_confidence = level_confidence[current]
-            for src, edge_confidence in _predecessors(reverse, ambiguity, current).items():
+            path_confidence, path_observed = level[current]
+            predecessors = _predecessors(reverse, ambiguity, current)
+            for src, (edge_confidence, edge_observed) in predecessors.items():
                 if src in visited:
                     continue
-                candidate = weaker(path_confidence, edge_confidence)
+                candidate = (
+                    weaker(path_confidence, edge_confidence),
+                    path_observed and edge_observed,
+                )
                 best = next_level.get(src)
-                if best is None or _RANK[candidate] > _RANK[best]:
+                # Strongest confidence first, exactly as before; between two
+                # equally confident ways to the same node, the watched one.
+                if best is None or _stronger_link(candidate, best):
                     next_level[src] = candidate
         hop += 1
-        for src, confidence in next_level.items():
+        for src, (confidence, observed) in next_level.items():
             visited.add(src)
-            found[src] = (hop, confidence)
-        level_confidence = next_level
+            found[src] = (hop, confidence, observed)
+        level = next_level
         current_level = set(next_level)
     truncated = any(
         src not in visited
@@ -158,6 +196,10 @@ def _walk(
         for src in _predecessors(reverse, ambiguity, current)
     )
     return found, truncated
+
+
+def _stronger_link(candidate: _Link, best: _Link) -> bool:
+    return (_RANK[candidate[0]], candidate[1]) > (_RANK[best[0]], best[1])
 
 
 def _is_test(path: str, qualname: str) -> bool:
@@ -195,7 +237,7 @@ def impact_report(
     entry_points = 0
     modules: set[str] = set()
 
-    for dependent_id, (hop, confidence) in found.items():
+    for dependent_id, (hop, confidence, observed) in found.items():
         info = node_info.get(dependent_id)
         if info is None:
             # Should not happen: every edge endpoint owns a node row for a
@@ -204,10 +246,15 @@ def impact_report(
         path, qualname, line_start = info
 
         salience_value = salience(store, rev, dependent_id, ambiguity)
+        # Appended, never substituted for the tier: the two answer different
+        # questions and the reader wants both. That is #56 in one string.
+        detail = f"hop {hop}, {confidence} confidence"
+        if observed:
+            detail += ", observed"
         row = Row(
             id=dependent_id,
             location=f"{path}:{line_start}",
-            detail=f"hop {hop}, {confidence} confidence",
+            detail=detail,
             score=score(hop, confidence, salience_value),
         )
 
@@ -285,6 +332,14 @@ def impact_report(
         **({"show_hidden": "--all"} if low_confidence_hidden else {}),
         "effects_reachable": effects_reachable,
     }
+    # Only when a trace exists. `islands` and `orphans` say either way,
+    # because their finding is an absence and a reader has to know how hard
+    # it was looked for; this report's rows are presences, so a revision
+    # with no trace prints the summary it printed before #56, field for
+    # field.
+    traced = trace_summary(store, rev)
+    if traced != NO_TRACE:
+        summary["trace"] = traced
 
     return Report(
         summary=summary,

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
-from codegraph import __version__, gitio
+from codegraph import __version__, gitio, trace, tracer
 from codegraph.ambiguity import Ambiguity
 from codegraph.guide import guide_text
 from codegraph.indexer import FsTreeSource, GitTreeSource, Indexer
@@ -66,6 +67,12 @@ def _print_stats(stats, store: Store, rev: str) -> None:
     print(f"paths: {stats.paths_total} ({stats.paths_dirty} dirty)")
     print(f"blobs: {stats.blobs_parsed} parsed, {stats.blobs_cached} cached")
     print(f"edges: {stats.edges}, unresolved: {stats.unresolved}")
+    if stats.observed_edges:
+        # Separate from the edge count on purpose: those are what the
+        # resolver deduced, these are what a run was seen doing, and the
+        # pair is the point (#56). Printed only when a trace has been
+        # imported, so `status` on an untraced repository is unchanged.
+        print(f"observed: {stats.observed_edges} edge(s) from a trace -- see `codegraph trace`")
     if stats.ambiguous:
         print(
             f"ambiguous: {stats.ambiguous} bare-name reference(s), expanded at query time"
@@ -508,6 +515,87 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _cmd_trace(args: argparse.Namespace) -> int:
+    """Import, describe or forget the observed run bound to a revision.
+
+    A command rather than a flag on every query, for two reasons. An import
+    is a write: it changes every answer for the revision until it is
+    forgotten, and durable state belongs in the store beside the graph, not
+    in an argument each caller has to remember to repeat. And a flag would
+    make the answer depend on whether the person asking happened to know the
+    file existed -- which is exactly the failure mode the `git status` model
+    (see the README) was chosen to avoid everywhere else.
+
+    Importing reconciles afterwards rather than leaving the graph for the
+    next query to rebuild: the numbers it prints ("N add one the resolver
+    did not have") come from the projection, and a command that reported
+    them without having done the work would be reporting an estimate.
+    """
+    root = Path(args.path).resolve()
+    store, indexer = open_workspace(root)
+    try:
+        try:
+            indexer.reconcile(args.rev)
+        except gitio.GitError:
+            print(f"revision not found: {args.rev}", file=sys.stderr)
+            return 1
+
+        if args.forget:
+            observed = trace.forget(store, args.rev)
+            if not observed:
+                print(f"no trace imported for {args.rev}", file=sys.stderr)
+                return 1
+            indexer.reconcile(args.rev)
+            print(f"forgot the trace for {args.rev} ({observed} observed calls)")
+            return 0
+
+        if args.file:
+            path = Path(args.file)
+            try:
+                payload = json.loads(path.read_text())
+            except OSError as exc:
+                print(f"cannot read {path}: {exc.strerror}", file=sys.stderr)
+                return 1
+            except json.JSONDecodeError as exc:
+                print(f"{path} is not valid JSON: {exc}", file=sys.stderr)
+                return 1
+            try:
+                result = trace.import_trace(store, args.rev, payload, str(path))
+            except trace.TraceMismatch as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            indexer.reconcile(args.rev)
+            print(f"imported {result.observed} observed calls from {path}")
+
+        text = trace.describe(store, args.rev)
+        if not text:
+            print(_no_trace_text(args.rev))
+            return 0
+        print(text)
+        return 0
+    finally:
+        store.close()
+
+
+def _no_trace_text(rev: str) -> str:
+    """What to print when there is nothing to describe.
+
+    The recipe, not just the absence. Producing a trace means running the
+    program under `codegraph.tracer` in the environment that can actually
+    run it, which is the one piece of this feature a reader cannot infer
+    from the command's own help -- and the tracer's path on disk is the
+    part they would otherwise have to go looking for.
+    """
+    return (
+        f"no trace imported for {rev}\n\n"
+        "Record one by running the program -- usually its test suite -- under the\n"
+        "tracer, using the interpreter that can run it:\n\n"
+        f"    python {tracer.__file__} --root . --out trace.json -- -q\n\n"
+        "then `codegraph trace trace.json`. Nothing else changes: a graph with no\n"
+        "trace answers exactly as it does today."
+    )
+
+
 def _cmd_guide(args: argparse.Namespace) -> int:
     """Print the agent-facing workflow. The AGENTS.md block `init` writes
     stays short by pointing here instead of inlining this."""
@@ -764,6 +852,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
     init_parser.set_defaults(handler=_cmd_init)
+
+    trace_parser = subparsers.add_parser(
+        "trace",
+        help="Import, describe or forget an observed run for a revision",
+    )
+    trace_parser.add_argument(
+        "file",
+        nargs="?",
+        help="A trace JSON file to import (omit to describe the current one)",
+    )
+    trace_parser.add_argument("--forget", action="store_true", help="Discard the trace")
+    trace_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    trace_parser.add_argument("--rev", default=WORKTREE, help="Revision to bind the trace to")
+    trace_parser.set_defaults(handler=_cmd_trace)
 
     guide_parser = subparsers.add_parser("guide", help="Print the agent-facing workflow")
     guide_parser.set_defaults(handler=_cmd_guide)

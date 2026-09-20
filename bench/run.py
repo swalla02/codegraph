@@ -5,7 +5,7 @@
     uv run python -m bench.run flask --check-floors      # exits 1 on a regression
 
 Per target: copy the clone, build a virtualenv, install the package
-**editable**, run its test suite under `bench/tracer.py`, index the same
+**editable**, run its test suite under `codegraph.tracer`, index the same
 working tree with codegraph, and score one against the other.
 
 `-e` is not a preference. A normal install COPIES the source into
@@ -50,6 +50,7 @@ from bench.score import (
     read_static_graph,
     score,
 )
+from codegraph import tracer
 from codegraph.indexer import GitTreeSource, Indexer
 from codegraph.store import WORKTREE, Store
 
@@ -208,7 +209,10 @@ def trace(python: Path, repo: Path, out: Path, tests: tuple[str, ...]) -> dict:
     _run(
         [
             str(python),
-            str(HERE / "tracer.py"),
+            # By path, with the target's interpreter: the tracer is
+            # stdlib-only precisely so it can run in a venv that has never
+            # heard of codegraph.
+            str(Path(tracer.__file__)),
             "--root",
             str(repo),
             "--out",

@@ -72,10 +72,17 @@ from dataclasses import dataclass
 
 from codegraph.config import Config
 from codegraph.query.impact import hits_hop_limit
-from codegraph.query.islands import MECHANISMS, NETWORK, IslandLabel, island_label
+from codegraph.query.islands import (
+    MECHANISMS,
+    NETWORK,
+    TRACED,
+    IslandLabel,
+    island_label,
+)
 from codegraph.render import Group, Report, Row, Unknown
 from codegraph.resolve import UNRESOLVED_REASONS
 from codegraph.store import Store
+from codegraph.trace import summary as trace_summary
 from codegraph.uncertainty import HOP_LIMIT, UNEXPLAINED_ISLAND, unknown
 
 #: `impact`'s own default, repeated deliberately: this report's answer about
@@ -178,14 +185,24 @@ def _island_summary(label: IslandLabel) -> str:
     """The island line of the summary: the claim first, then what carries
     it. `explained by decorator, import` reads as an answer; `unexplained`
     reads as the admission it is, with `mechanisms_not_found` beside it
-    listing what "recognised" covers."""
+    listing what "recognised" covers.
+
+    An imported run comes first when there is one, because it is the only
+    item in the list that is evidence rather than counter-evidence: the
+    mechanisms say something *could* reach this symbol, and `traced` says a
+    run did (#56).
+    """
     if not label.explained:
         return "unexplained"
     # `NETWORK` and nothing else from the boundary kinds: `ENV_READ` rides
     # in an `islands` row as a legend entry and is explicitly not a
     # boundary there, so naming it as something that explains an island
     # would make this report say what that one refuses to.
-    carried = [*label.found, *(kind for kind in label.boundary if kind == NETWORK)]
+    carried = [
+        *([f"{TRACED} ({label.traced} seen running)"] if label.traced else []),
+        *label.found,
+        *(kind for kind in label.boundary if kind == NETWORK),
+    ]
     return f"explained by {', '.join(carried)}"
 
 
@@ -243,6 +260,13 @@ def unknowns_report(
         "resolved": resolved,
         "unresolved": len(references),
         "island": _island_summary(label),
+        # Whether there was a run to be seen in, printed either way -- the
+        # same reason `islands` and `orphans` print it. This report's
+        # island line is an absence claim like theirs, and `unexplained`
+        # means something quite different when a suite has been watched
+        # running and did not touch this symbol than when nothing has run
+        # at all (#56).
+        "trace": trace_summary(store, rev),
         # Always printed, including when the island IS explained: "no
         # mechanism recognised" is only readable beside the list of what
         # was looked for, and a reader who has to go and find that list
