@@ -78,6 +78,28 @@ CALLS, INHERITS, IMPLEMENTS, REFERENCES = "CALLS", "INHERITS", "IMPLEMENTS", "RE
 #: mention is one.
 DEPENDENCY_KINDS: tuple[str, ...] = (CALLS, INHERITS, IMPLEMENTS, REFERENCES)
 
+#: Why a reference produced no edge, as the `unresolved` rows spell it.
+#:
+#: - `UNKNOWN`: no candidate at all. The resolver is blind to something.
+#: - `AMBIGUOUS`: too many candidates -- the bare-name fan-out, recorded once
+#:   here instead of as N low-confidence edges (see `ambiguity.py`).
+#: - `EXTERNAL`: the target is outside the repository, so no node in this
+#:   graph can be it (see `is_external_call`).
+#: - `BUILTIN`: a Python builtin the resolver understood and deliberately did
+#:   not link to a repo symbol (see `is_builtin_call`).
+#:
+#: These were four string literals scattered across the write path until
+#: #55, which gave each reason a next-action string and a test asserting
+#: that mapping is total. A test can only be total over a set it can read,
+#: so the set is declared here, beside the code that writes the rows, rather
+#: than reconstructed by whoever consumes them.
+UNKNOWN, AMBIGUOUS, EXTERNAL, BUILTIN = "unknown", "ambiguous", "external", "builtin"
+
+#: Every reason, in the order a report lists them: the two gaps first,
+#: because they are the ones a reader can act on, then the two the resolver
+#: has already settled.
+UNRESOLVED_REASONS: tuple[str, ...] = (UNKNOWN, AMBIGUOUS, EXTERNAL, BUILTIN)
+
 #: Python builtins, as the names they are actually called by.
 #:
 #: These matter because the last-resort step matches a call's final dotted
@@ -1565,7 +1587,7 @@ def resolve_revision(
             hits = resolver.resolve_call(ref, ctx)
             if is_derivable_fanout(hits):
                 ambiguous_rows.append(
-                    (rev, src, path, ref.line, ref.raw_name, "base", "ambiguous", len(hits))
+                    (rev, src, path, ref.line, ref.raw_name, "base", AMBIGUOUS, len(hits))
                 )
                 continue
             for node_id, confidence in hits:
@@ -1684,7 +1706,7 @@ def resolve_revision(
                 # never through the bare-name fallback -- so an all-LOW fan-out
                 # has no class in it to construct.
                 ambiguous_rows.append(
-                    (rev, src, path, ref.line, ref.raw_name, "call", "ambiguous", len(hits))
+                    (rev, src, path, ref.line, ref.raw_name, "call", AMBIGUOUS, len(hits))
                 )
                 continue
             for node_id, confidence in with_constructors(hits, table, bases, constructor_cache):
@@ -1695,24 +1717,18 @@ def resolve_revision(
                 # symbol -- counting it as "unresolved" buries the real gaps
                 # under a large constant. Still written, so the choice is
                 # visible rather than silent.
-                builtin_rows.append(
-                    (rev, src, path, ref.line, ref.raw_name, "call", "builtin", 0)
-                )
+                builtin_rows.append((rev, src, path, ref.line, ref.raw_name, "call", BUILTIN, 0))
             elif not hits and is_external_call(ref, ctx):
                 # The same choice one boundary further out: not a repo symbol,
                 # and known not to be one, so not a gap either. Its own reason
                 # rather than 'builtin', because the two are different claims
                 # -- and 'ambiguous' is exactly what it used to be mistaken
                 # for. See `is_external_call`.
-                external_rows.append(
-                    (rev, src, path, ref.line, ref.raw_name, "call", "external", 0)
-                )
+                external_rows.append((rev, src, path, ref.line, ref.raw_name, "call", EXTERNAL, 0))
             elif not hits:
                 # Never dropped: the ref stays in `blob_refs` for effect
                 # detection, and the gap is counted as a health signal.
-                unresolved_rows.append(
-                    (rev, src, path, ref.line, ref.raw_name, "call", "unknown", 0)
-                )
+                unresolved_rows.append((rev, src, path, ref.line, ref.raw_name, "call", UNKNOWN, 0))
 
     connection.executemany(
         "INSERT INTO edges(rev, src, dst, kind, confidence, provenance, callsite_path,"
@@ -1724,17 +1740,17 @@ def resolve_revision(
         " candidates) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
         unresolved_rows + ambiguous_rows + builtin_rows + external_rows,
     )
+
     # Counted over the whole revision, not over this pass: a narrowed rewrite
     # touches a handful of paths but `status` has to describe the whole graph.
-    def total(sql: str) -> int:
-        return connection.execute(sql, (rev,)).fetchone()["n"]
+    def total(sql: str, *args: str) -> int:
+        return connection.execute(sql, (rev, *args)).fetchone()["n"]
 
+    by_reason = "SELECT COUNT(*) AS n FROM unresolved WHERE rev=? AND reason=?"
     return ResolveStats(
         edges=total("SELECT COUNT(*) AS n FROM edges WHERE rev=?"),
-        unresolved=total(
-            "SELECT COUNT(*) AS n FROM unresolved WHERE rev=? AND reason='unknown'"
-        ),
-        ambiguous=total("SELECT COUNT(*) AS n FROM unresolved WHERE rev=? AND reason='ambiguous'"),
+        unresolved=total(by_reason, UNKNOWN),
+        ambiguous=total(by_reason, AMBIGUOUS),
     )
 
 
