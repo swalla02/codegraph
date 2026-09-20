@@ -166,7 +166,11 @@ action for each:
 - unexplained island — no implicit-invocation mechanism was recognised; a
   runtime trace is the only thing that can confirm this symbol is reached.
   `mechanisms_not_found` lists what was checked, so you can see what
-  "recognised" covers rather than take the claim on trust.
+  "recognised" covers rather than take the claim on trust. This is the one
+  entry an imported trace closes outright: once a run has been watched
+  entering the symbol, its island reads `explained by traced (N seen
+  running)` and the entry is no longer raised. The `trace:` field beside it
+  says whether there was a run to be seen in at all.
 - hop limit — the walk stopped at its budget; re-run with a larger `--hops`.
 
 **The uncertainty envelope, and `--strict`.** Every report that can be
@@ -273,6 +277,35 @@ then read the functions; never delete on the strength of a row. Like
 `islands` it takes no symbol, so it exits `0` for a report — including an
 empty one — and `1` only for a bad `--rev`.
 
+`codegraph trace [FILE]` imports a recording of a run that actually
+happened, and is the only thing that gets past the static ceiling: framework
+dispatch, `getattr`, a `visit_*` lookup and a decorator's wrapper are calls
+no analysis of the text can find, because the text does not name them.
+
+Run it with no argument first — it says whether the repository already has a
+trace and, if not, prints the one command that records one. **Do not record
+one unprompted.** Recording means running the project's test suite, which
+takes minutes and can touch a database, a network or the filesystem; that is
+the user's call, not yours.
+
+With a trace imported:
+
+- an edge a run confirmed keeps *both* facts, and a row that says
+  `hop 1, HIGH confidence, observed` is the strongest answer this tool has —
+  `observed` on an `impact` row means every hop of the chain was watched
+  running, not just the last one.
+- calls the resolver never found appear as ordinary edges, so `impact`,
+  `effects`, `path` and `islands` all improve without any flag. On
+  pallets/flask, `impact` on the wrapper behind `@setupmethod` goes from
+  `symbols: 0` — "nothing depends on this", about a function 273 call sites
+  invoke — to 412 dependents across 46 modules.
+- every `islands` and `orphans` summary carries `trace:`, which reads `none`
+  when there is none. Read it before you trust an absence: "nothing reaches
+  this" is a much weaker claim with no run behind it.
+- editing a file retires the observations about that file, reported as
+  `stale` rather than quietly used. A repository with no trace, or a wholly
+  stale one, answers exactly as it always has.
+
 `codegraph diff [<base>..<head>]` reports what a branch actually changed —
 symbols added/removed/changed by content hash (never by line number) plus
 any side effect that newly became reachable. With no argument it diffs
@@ -344,7 +377,10 @@ the full set and how confident it is in each edge.
 - Each `impact` row's `detail` column reads `hop N, <CONFIDENCE> confidence`
   — `HIGH`/`MEDIUM`/`LOW` reflects how certain the resolver is that the call
   really targets this symbol (e.g. a dynamic dispatch site is weaker
-  evidence than a direct, unambiguous call).
+  evidence than a direct, unambiguous call). A trailing `, observed` is a
+  second, independent claim: a recorded run was watched taking every hop of
+  that chain. Confidence is about reading the code, `observed` is about
+  having seen it happen, and an edge can carry either or both.
 - `islands`' summary reads `symbols: 807 · islands: 132 · largest: 665 ·
   singletons: 127 · implicit: 115 · network: 1 · unexplained: 17 · basis:
   undirected CALLS, INHERITS, IMPLEMENTS, REFERENCES edges` (the real figures
