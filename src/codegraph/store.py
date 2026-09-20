@@ -178,6 +178,13 @@ CREATE INDEX IF NOT EXISTS idx_effects_node ON effects(rev, node_id);
 -- in one pass; without this it is a full scan of a table that also holds
 -- the (much larger) 'unknown' and 'builtin' rows.
 CREATE INDEX IF NOT EXISTS idx_unresolved_reason ON unresolved(rev, reason);
+-- `unknowns` asks for one symbol's unresolved references, and `query/path.py`
+-- asks for one node's ambiguous ones to put a call site on a derived hop.
+-- Both filter on `src`, and without this each is a full scan of a table with
+-- ~50k rows on django -- a per-symbol question whose cost is the size of the
+-- repository rather than the size of the symbol. The index is additive, so an
+-- existing database picks it up on the next open with no rebuild.
+CREATE INDEX IF NOT EXISTS idx_unresolved_src ON unresolved(rev, src);
 """
 
 _IGNORE_TEXT = "*\n"

@@ -121,8 +121,18 @@ from dataclasses import dataclass
 from codegraph.ambiguity import Ambiguity, last_segment
 from codegraph.query.islands import connected_components
 from codegraph.render import Group, Report, Row
-from codegraph.resolve import CALLS, CONFIDENCE_RANK, DEPENDENCY_KINDS, HIGH, INHERITS, LOW, weaker
+from codegraph.resolve import (
+    AMBIGUOUS,
+    CALLS,
+    CONFIDENCE_RANK,
+    DEPENDENCY_KINDS,
+    HIGH,
+    INHERITS,
+    LOW,
+    weaker,
+)
 from codegraph.store import Store
+from codegraph.uncertainty import HOP_LIMIT, LOW_CONFIDENCE, unknown
 
 _RANK = CONFIDENCE_RANK
 
@@ -369,8 +379,8 @@ def _derived_callsite(store: Store, rev: str, src: str, name: str) -> str:
     """
     best: tuple[str, int] | None = None
     for row in store.connection.execute(
-        "SELECT path, line, raw_name FROM unresolved WHERE rev=? AND reason='ambiguous' AND src=?",
-        (rev, src),
+        "SELECT path, line, raw_name FROM unresolved WHERE rev=? AND reason=? AND src=?",
+        (rev, AMBIGUOUS, src),
     ):
         if last_segment(row["raw_name"]) != name:
             continue
@@ -514,7 +524,7 @@ def path_report(
         return Report(summary=summary, groups=groups, truncated=False)
 
     summary["direction"] = "none"
-    reason, show_path = _negative(
+    reason, show_path, hole = _negative(
         store, rev, forward_edges, derived, ambiguity, from_id, to_id, max_hops, include_low
     )
     summary["reason"] = reason
@@ -525,7 +535,18 @@ def path_report(
         # makes the same split for the same reason (#37).
         summary["show_path"] = show_path
     summary["basis"] = _basis(max_hops, include_low)
-    return Report(summary=summary, groups=groups, truncated=False)
+    # Exactly the negatives a flag would turn into a path, and no others.
+    # "Different islands" is the strongest claim this tool has and it is
+    # complete: no budget and no tier excluded it, so an envelope entry
+    # there would tell a reader to go looking for something that is not
+    # there. A path that WAS found needs no entry either -- it is an
+    # answer, and the basis line already says what it was found over.
+    return Report(
+        summary=summary,
+        groups=groups,
+        truncated=False,
+        unknowns=[unknown(hole, reason)] if hole else [],
+    )
 
 
 def _negative(
@@ -538,9 +559,10 @@ def _negative(
     to_id: str,
     max_hops: int,
     include_low: bool,
-) -> tuple[str, str]:
-    """Which of the three negatives holds, and the flag that would turn it
-    into a path.
+) -> tuple[str, str, str]:
+    """Which of the three negatives holds, the flag that would turn it into
+    a path, and the envelope reason that flag corresponds to -- empty when
+    the negative is complete and no flag would change it.
 
     Tried weakest-claim first. The island partition is consulted last and
     only when every walk this command can perform has come back empty, so
@@ -551,20 +573,31 @@ def _negative(
     """
     distance = _shortest_distance(forward_edges, derived, ambiguity, from_id, to_id, include_low)
     if distance is not None:
-        return f"no directed path within {_plural_hops(max_hops)}", f"--hops {distance}"
+        return (
+            f"no directed path within {_plural_hops(max_hops)}",
+            f"--hops {distance}",
+            HOP_LIMIT,
+        )
 
     if not include_low:
         with_low = _shortest_distance(forward_edges, derived, ambiguity, from_id, to_id, True)
         if with_low is not None:
             flag = "--all" if with_low <= max_hops else f"--all --hops {with_low}"
-            return "no directed path in either direction", flag
+            return "no directed path in either direction", flag, LOW_CONFIDENCE
 
     components = connected_components(store, rev, ambiguity)
     if components.find(from_id) != components.find(to_id):
-        return (
+        unconnectable = (
             "different islands -- no walk in any direction, at any confidence, can connect them"
-        ), ""
-    return "no directed path in either direction", ""
+        )
+        return unconnectable, "", ""
+    # No flag, and no entry: every walk this command can perform has run,
+    # over every tier, and come back empty. The pair share an island, so
+    # something relates them -- a common caller, or a file's top level
+    # reaching both -- and `reason` says exactly that. There is nothing
+    # further for a reader to try, which is what an envelope entry would
+    # otherwise be promising.
+    return "no directed path in either direction", "", ""
 
 
 __all__ = ["DEFAULT_HOPS", "path_report"]

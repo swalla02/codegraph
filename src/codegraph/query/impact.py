@@ -58,6 +58,7 @@ from codegraph.query.rank import fan_in, salience, score
 from codegraph.render import Group, Report, Row, budget
 from codegraph.resolve import CONFIDENCE_RANK, DEPENDENCY_KINDS, HIGH, LOW, stronger, weaker
 from codegraph.store import Store
+from codegraph.uncertainty import HOP_LIMIT, unknown
 
 _RANK = CONFIDENCE_RANK
 
@@ -113,10 +114,22 @@ def _walk(
     ambiguity: Ambiguity,
     node_id: str,
     max_hops: int,
-) -> dict[str, tuple[int, str]]:
+) -> tuple[dict[str, tuple[int, str]], bool]:
     """Reverse BFS from `node_id`: node -> (hop, path confidence), each node
     recorded once at its shortest hop, with the strongest confidence
-    achievable among the edges reaching it at that hop."""
+    achievable among the edges reaching it at that hop -- and whether the
+    budget, rather than the graph, is what stopped it.
+
+    That second value is the point of #55. A walk that exhausted the graph
+    and a walk that ran out of hops print the identical report, and the
+    second one is not the answer it looks like: "these six things depend on
+    it" is a different claim from "these six, and I stopped looking". It
+    costs one further expansion of the final frontier to tell them apart,
+    and the question is only asked once per report, so it is paid here
+    rather than approximated by "the frontier was non-empty" -- a frontier
+    can be non-empty and have nothing unvisited behind it, which would
+    report a complete walk as truncated on every cyclic graph.
+    """
     found: dict[str, tuple[int, str]] = {}
     level_confidence: dict[str, str] = {node_id: HIGH}
     current_level = {node_id}
@@ -139,7 +152,12 @@ def _walk(
             found[src] = (hop, confidence)
         level_confidence = next_level
         current_level = set(next_level)
-    return found
+    truncated = any(
+        src not in visited
+        for current in current_level
+        for src in _predecessors(reverse, ambiguity, current)
+    )
+    return found, truncated
 
 
 def _is_test(path: str, qualname: str) -> bool:
@@ -160,7 +178,7 @@ def impact_report(
     connection = store.connection
     ambiguity = Ambiguity(store, rev)
     reverse = _reverse_edges(store, rev)
-    found = _walk(reverse, ambiguity, node_id, max_hops)
+    found, hop_limited = _walk(reverse, ambiguity, node_id, max_hops)
 
     node_info: dict[str, tuple[str, str, int]] = {}
     if found:
@@ -268,7 +286,40 @@ def impact_report(
         "effects_reachable": effects_reachable,
     }
 
-    return Report(summary=summary, groups=groups, truncated=truncated)
+    return Report(
+        summary=summary,
+        groups=groups,
+        truncated=truncated,
+        # The one hole this report can name. `low_confidence_hidden` is
+        # deliberately not one: those dependents were walked, ranked and
+        # counted, the strongest are on the page and the count says how many
+        # are not, with `show_hidden: --all` beside it. A hop budget is the
+        # other thing entirely -- the callers past it were never looked at,
+        # and nothing in the report says so. See `uncertainty` for the rule.
+        unknowns=(
+            [
+                unknown(
+                    HOP_LIMIT,
+                    f"the walk still had unvisited dependents at its {max_hops}-hop budget",
+                )
+            ]
+            if hop_limited
+            else []
+        ),
+    )
 
 
-__all__ = ["impact_report"]
+def hits_hop_limit(store: Store, rev: str, node_id: str, max_hops: int) -> bool:
+    """Would an `impact` walk of `max_hops` stop on its budget rather than
+    on the graph?
+
+    The same walk `impact_report` runs, so the two can never disagree about
+    one symbol -- `query/unknowns.py` reports this about a symbol without
+    printing the dependents, and a second implementation of "did it finish"
+    would be a claim about a walk nobody ran.
+    """
+    ambiguity = Ambiguity(store, rev)
+    return _walk(_reverse_edges(store, rev), ambiguity, node_id, max_hops)[1]
+
+
+__all__ = ["hits_hop_limit", "impact_report"]

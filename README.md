@@ -108,10 +108,11 @@ slower on a cold cache.
 | `codegraph status [--rev REV]` | Reconcile a revision and print summary counts: paths, blobs parsed/cached, edges, unresolved refs, parse errors. |
 | `codegraph index [--rev REV] [--rebuild] [--quiet]` | Reconcile a revision into the graph explicitly, paying the cold-build cost up front. `--rebuild` discards the Layer 1 parse cache *and* the revision's materialized graph first, so it really does rebuild; `--quiet` is what the warming hooks invoke in the background. |
 | `codegraph resolve <name>` | Fuzzy-match a name (trailing name, qualname, or full node id) to node ids. |
-| `codegraph effects <symbol> [--json]` | Report every side-effect kind reachable from a symbol, each with a witness chain down to the causing `file:line`. |
-| `codegraph impact <symbol> [--hops N] [--limit N] [--all] [--json]` | Report the ranked dependents of a symbol — everything a change to it could break. |
-| `codegraph path <A> <B> [--hops N] [--all] [--json]` | Report how two symbols are connected: the shortest chain of edges between them, in whichever direction it runs, with each hop's kind, confidence and call site, and the path's own confidence — its weakest hop. Both directions are always checked and the one found is named. When there is none, the report distinguishes three answers that are not the same: no chain within `--hops` (and how many it would take), no directed chain in either direction, and the two being on different islands, which means no walk can ever connect them. |
-| `codegraph islands [--rev REV] [--limit N] [--json]` | Report the connected components of the revision's `CALLS`, `INHERITS`, `IMPLEMENTS` and `REFERENCES` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
+| `codegraph effects <symbol> [--json] [--strict]` | Report every side-effect kind reachable from a symbol, each with a witness chain down to the causing `file:line`. |
+| `codegraph impact <symbol> [--hops N] [--limit N] [--all] [--json] [--strict]` | Report the ranked dependents of a symbol — everything a change to it could break. |
+| `codegraph unknowns <symbol> [--hops N] [--limit N] [--json] [--strict]` | The mirror of `impact`: what codegraph *cannot* tell you about this symbol. Every reference in its body that produced no edge, with the reason, the raw name, the line and the candidate count; how many of the body's references resolved; whether it sits in an island no recognised mechanism explains, and which mechanisms were checked; and whether an `impact` walk would stop on its hop budget rather than on the graph. Every number is a count of rows already stored, and every reason carries one fixed next action (see below). |
+| `codegraph path <A> <B> [--hops N] [--all] [--json] [--strict]` | Report how two symbols are connected: the shortest chain of edges between them, in whichever direction it runs, with each hop's kind, confidence and call site, and the path's own confidence — its weakest hop. Both directions are always checked and the one found is named. When there is none, the report distinguishes three answers that are not the same: no chain within `--hops` (and how many it would take), no directed chain in either direction, and the two being on different islands, which means no walk can ever connect them. |
+| `codegraph islands [--rev REV] [--limit N] [--json] [--strict]` | Report the connected components of the revision's `CALLS`, `INHERITS`, `IMPLEMENTS` and `REFERENCES` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
 | `codegraph orphans [--rev REV] [--limit N] [--include-public] [--include-decorated] [--json]` | Find functions whose every recorded caller is a test — defined, tested, and never invoked by the code that was supposed to invoke it. Such a function is *not* a one-symbol island, precisely because its test calls it, so `islands` structurally cannot surface it. Candidates are private by name, undecorated, defined outside the test tree, and never mentioned by name anywhere in the source text — that last filter has no off switch, because a static call graph cannot see a callback handed to a library. Not a dead-code report (see below). |
 | `codegraph diff [<base>..<head>] [--json]` | Report what changed between two revisions by content hash, never by line number: symbols added/removed/changed, plus any side effect newly reachable. Defaults to `merge-base(default branch, HEAD)..WORKTREE` — "what has this branch changed so far." |
 | `codegraph gc [--keep REV]` | Prune the Layer 1 parse cache down to what `HEAD`, the worktree, and any `--keep`-named revisions still reference. Never touches the graph itself, so it can only make a future answer slower to rebuild, never wrong. |
@@ -281,13 +282,129 @@ psf/requests, of 3,000 randomly sampled symbol pairs the 99 that are
 connected at all sit a median of 3 hops apart (mean 3.26, max 8); a budget of
 3 would find 51% of them and 6 finds 99%.
 
-`resolve`, `impact`, `effects` and `path` share one exit-code convention for
-resolving `<symbol>` to a node id: `0` = a single unambiguous match, `1` =
+### What `unknowns` answers, and what `--strict` does with it
+
+The point of this tool is to give an agent a truthful representation of a
+codebase, which means being explicit about what it cannot answer. It always was —
+confidence tiers on every edge, a named reason on every unresolved
+reference, `low_confidence_hidden`, `islands`' `unexplained` — but all of
+that is *aggregate*. `low_confidence_hidden: 235` is a property of a report,
+not of any symbol, so an agent asking about one function could not find out
+that *that* function's body is half dynamic dispatch, and nothing ever said
+what would settle it.
+
+```
+$ codegraph unknowns Model.save --path django
+symbol: django/db/models/base.py::Model.save · references: 14 · resolved: 3 · unresolved: 11
+  · island: explained by entry, dunder, decorator, test, override, nested, import, NETWORK
+  · mechanisms_not_found: none · basis: stored rows for this symbol only; ...
+ambiguous
+  router.db_for_write  django/db/models/base.py:866  call reference, 15 candidates
+  field_names.add      django/db/models/base.py:905  call reference, 20 candidates
+  ...
+builtin
+  ValueError           django/db/models/base.py:868  call reference
+  ...
+unknowns
+  ambiguous  5 references in this body  the bare name matches several definitions; `codegraph resolve <name>` lists them, and `impact --all` walks them
+  builtin    6 references in this body  the target is a Python builtin; no repository symbol is being called
+  hop_limit  an `impact` walk of 3 hops does not exhaust this symbol's dependents  the walk stopped at its budget; re-run with a larger --hops
+```
+
+Three parts, all of them queries over rows the indexer already wrote —
+nothing is inferred, and nothing asks the reader to exercise judgement:
+
+- **The references that produced no edge**, each with its reason, raw name,
+  line and candidate count, grouped by reason. Beside them, **the resolved
+  ratio**: `3 of 14` of this body's reference sites became edges. A site is
+  `(path, line)`, so one `self.render()` that writes an edge per override
+  counts once, and two calls written on one line collapse into one — a
+  stated undercount rather than a guess.
+- **The island**, labelled by `islands`' own partition and its own mechanism
+  passes, never a second implementation that could come to disagree. When it
+  is unexplained, `mechanisms_not_found` lists what was checked, because
+  "nothing recognised reaches this" is only readable beside the list of what
+  *recognised* covers.
+- **Whether `impact` would stop on its budget.** An `impact --hops 3` that
+  ran out of hops prints exactly like one that exhausted the graph, and the
+  difference is the whole of "is this the answer or just what fit".
+
+A **low ratio is not a defect**. `3 of 14` on a body full of `ValueError`
+and `frozenset` says the resolver identified eleven references exactly and
+knows that none of them is a symbol in this repository. That is why every
+reason has its own count and its own next action:
+
+| reason | what the tool says |
+|---|---|
+| `unknown` | the name matches nothing in the repository; expect dynamic dispatch, and read the body to see what it is |
+| `ambiguous` | the bare name matches several definitions; `codegraph resolve <name>` lists them, and `impact --all` walks them |
+| `external` | the target is outside the repository; no future index will resolve it |
+| `builtin` | the target is a Python builtin; no repository symbol is being called |
+| unexplained island | no implicit-invocation mechanism was recognised; a runtime trace is the only thing that can confirm this symbol is reached |
+| hop limit | the walk stopped at its budget; re-run with a larger `--hops` |
+
+Each string is written once, in `uncertainty.NEXT_ACTION`, and looked up —
+never composed around a case, which is how one reason comes to be described
+two different ways. The per-case numbers ride in a separate `detail` field.
+A test asserts the mapping is total against the resolver's own
+`resolve.UNRESOLVED_REASONS`, so a fifth reason cannot be added without one.
+
+### The uncertainty envelope
+
+Every report that can be incomplete now carries an `unknowns` array beside
+its results — in `--json` as a real array, in text under a heading of its
+own — and `--strict` exits **3** when one of those entries is blocking. "Do
+not act on this answer" becomes an exit code rather than a judgement. 3, not
+1 or 2: those already mean "no symbol matched" and "more than one matched",
+and `codegraph impact X --strict && edit` has to be able to tell a missing
+symbol from an answer with a hole in it.
+
+What counts as a hole is one rule, applied everywhere: **an entry names
+something the run did not examine.**
+
+| report | entries it can carry | why |
+|---|---|---|
+| `unknowns` | one per reason present, plus an unexplained island and a hop limit | the whole report |
+| `impact` | the hop limit | the callers past `--hops` were never looked at |
+| `effects` | `unknown` and `external` calls in the body | the witness walk cannot follow them; `ambiguous` is followed through the same hubs `islands` uses, and a `builtin` with an effect is in the catalog |
+| `path` | the hop limit, or a LOW chain the default walk excluded | exactly the negatives a flag would turn into a path |
+| `islands` | its own `unexplained` count | the number it already prints, in the form a machine can act on |
+| `orphans` | none | its uncertainty is a standing `caveat` on every row — a name resolved at runtime leaves nothing for either half of the report to find — and a caveat that fires on every run is not news. A `--strict` there would refuse on every non-empty report |
+| `diff` | none | a content-hash comparison of two revisions: no walk, no budget, nothing hidden |
+
+Two things deliberately do **not** make a report incomplete:
+
+- **A LOW-confidence row.** It is an answer, given with its tier attached.
+  `low_confidence_hidden` counts rows the report chose to summarize rather
+  than print, and it already carries `show_hidden: --all` (#37). Were
+  `--strict` to refuse on LOW, it would refuse on every real repository and
+  stop carrying information.
+- **`truncated`.** `--limit` is the caller's own budget and already has a
+  field; a report that honoured the budget it was given did not fail to see
+  anything.
+
+`external` and `builtin` entries are printed and never block: they are
+answers, not gaps — the resolver identified the reference exactly and knows
+no node in this graph is its target. Each entry says which it is in a
+`blocking` field, so a `--json` consumer does not need this table.
+
+**An empty `unknowns` means "no hole this tool can name", never "this answer
+is complete."** A name assembled at runtime leaves nothing for any of this
+to find. What shrinks the gap is observing a run, which is what
+`bench/tracer.py` does — and whether trace data should enter the graph as a
+fourth provenance is a separate question from making today's ignorance
+addressable.
+
+`resolve`, `impact`, `effects`, `path` and `unknowns` share one exit-code
+convention for resolving `<symbol>` to a node id: `0` = a single unambiguous match, `1` =
 nothing matched, `2` = more than one match (every candidate is printed; pick
 the right one and re-run with the full node id). `path` applies it to each of
 its two arguments. The convention is about resolving a *name*, and nothing
 else — so a report saying the two symbols are not connected at all is still
-exit `0`, because that is an answer.
+exit `0`, because that is an answer, and so is a full list of what codegraph
+does not know about a symbol. `3` is the one code outside the convention,
+and only under `--strict`: the name resolved, the report was produced, and
+it has a hole in it.
 
 `islands` and `orphans` take no symbol, so that convention does not apply
 to either: they exit `0` for a report — an empty one included, since "nothing

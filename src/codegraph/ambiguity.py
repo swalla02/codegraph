@@ -48,7 +48,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from codegraph.resolve import CONSTRUCTOR, breadth_first
+from codegraph.resolve import AMBIGUOUS, CONSTRUCTOR, breadth_first
 from codegraph.store import Store
 
 #: Prefix for the synthetic per-name node ids `hub_edges` routes through.
@@ -146,8 +146,8 @@ class Ambiguity:
         calls: dict[str, set[str]] = {}
         bases: dict[str, set[str]] = {}
         for row in connection.execute(
-            "SELECT src, raw_name, ref_kind FROM unresolved WHERE rev=? AND reason='ambiguous'",
-            (rev,),
+            "SELECT src, raw_name, ref_kind FROM unresolved WHERE rev=? AND reason=?",
+            (rev, AMBIGUOUS),
         ):
             bucket = calls if row["ref_kind"] == "call" else bases
             bucket.setdefault(last_segment(row["raw_name"]), set()).add(row["src"])

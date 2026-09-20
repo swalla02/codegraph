@@ -22,7 +22,7 @@ identically; two of the three are things this report can now say.
 
 *It is invoked by a mechanism that is not a call site.* Each island is
 tagged with every such mechanism codegraph recognises among its members
-(`_MECHANISMS` below): a module's top level reaching it, a dunder, a
+(`MECHANISMS` below): a module's top level reaching it, a dunder, a
 decorator, a test-runner entry point, an override of an inherited method, a
 nested definition its enclosing scope can pass around as a value, or an
 import naming it. None of these is a proof that the symbol runs. Each is
@@ -121,6 +121,7 @@ instead of a caller.
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 from itertools import chain
 
 from codegraph.ambiguity import Ambiguity
@@ -128,6 +129,7 @@ from codegraph.config import Config
 from codegraph.render import Group, Report, Row, budget
 from codegraph.resolve import DEPENDENCY_KINDS, IMPLEMENTS, INHERITS, module_for_path
 from codegraph.store import Store
+from codegraph.uncertainty import UNEXPLAINED_ISLAND, unknown
 
 #: How many of an island's members a single row names: the row's `id` is
 #: the first, `detail` names the rest. An island can hold hundreds of
@@ -152,7 +154,7 @@ TEST = "test"  # matches pytest's default collection convention
 OVERRIDE = "override"  # same name on both ends of an INHERITS/IMPLEMENTS link
 NESTED = "nested"  # defined inside a function that can pass it as a value
 IMPORT = "import"  # its dotted name is imported somewhere in this revision
-_MECHANISMS = (ENTRY, DUNDER, DECORATOR, TEST, OVERRIDE, NESTED, IMPORT)
+MECHANISMS = (ENTRY, DUNDER, DECORATOR, TEST, OVERRIDE, NESTED, IMPORT)
 
 #: The effect kinds a row reports, in display order. `NETWORK` is the only
 #: one that marks a boundary or makes an island explained; `ENV_READ` is
@@ -370,7 +372,7 @@ def _describe(
     else:
         detail = f"size {size} across {_plural(files, 'file')}"
 
-    named = [name for name in _MECHANISMS if name in mechanisms]
+    named = [name for name in MECHANISMS if name in mechanisms]
     if named:
         detail += f"; implicit: {', '.join(named)}"
     else:
@@ -383,12 +385,85 @@ def _describe(
     return detail
 
 
-def islands_report(
-    store: Store, rev: str, config: Config | None = None, limit: int = 20
-) -> Report:
-    """Connected components of `rev`'s CALLS and INHERITS edges, read as
-    undirected, each labelled with the implicit-invocation mechanisms and
-    process boundaries found inside it.
+@dataclass(frozen=True)
+class _Labelled:
+    """The whole partition, labelled: what `islands_report` prints rows
+    from, and what one symbol's label is read out of.
+
+    Held as one value because the five parts are computed in one pass and
+    only mean anything together -- `mechanisms` is keyed by component root,
+    so it is unreadable without `components`.
+    """
+
+    components: Components
+    #: node id -> (path, first line). Members only: a `path::<module>` node
+    #: carries connectivity and is never one.
+    members: dict[str, tuple[str, int]]
+    #: component root -> its members.
+    grouped: dict[str, list[str]]
+    #: component root -> the implicit-invocation mechanisms found in it.
+    mechanisms: dict[str, set[str]]
+    #: component root -> the process-boundary effect kinds found in it.
+    boundaries: dict[str, set[str]]
+    #: node id -> how many distinct nodes reach it, for picking hubs.
+    fan_in: Counter
+
+
+@dataclass(frozen=True)
+class IslandLabel:
+    """What this report can say about one symbol's island.
+
+    The per-symbol form of an `islands` row, for #55: `unexplained: 17` is
+    a property of the report, and an agent asking about one function needs
+    to know whether *that* function is one of the seventeen -- and, when it
+    is, what was looked for and not found, since an unexplained island and
+    an unexamined one read identically otherwise.
+    """
+
+    size: int
+    #: The mechanisms found, in `MECHANISMS` order.
+    found: tuple[str, ...]
+    #: The ones checked and not found, in the same order. The complement of
+    #: `found`, spelled out rather than left to the reader, because the
+    #: claim "nothing recognised reaches this" is only readable beside the
+    #: list of what "recognised" covers.
+    missing: tuple[str, ...]
+    #: Process-boundary effect kinds on the island, in `_BOUNDARY_KINDS` order.
+    boundary: tuple[str, ...]
+
+    @property
+    def explained(self) -> bool:
+        """Exactly the condition `islands`' `unexplained` counts, negated:
+        a recognised mechanism, or a `NETWORK` boundary. Computed here so
+        the two cannot come to disagree about one island."""
+        return bool(self.found) or NETWORK in self.boundary
+
+
+def island_label(store: Store, rev: str, node_id: str, config: Config | None = None) -> IslandLabel:
+    """One symbol's island, labelled exactly as the `islands` report labels
+    it -- same partition, same mechanism passes, same code.
+
+    It costs what `islands` costs (one pass over the revision's edges and
+    one over its nodes) because the labels are properties of a component,
+    and a component is not knowable from one node. That is the honest price
+    and it is stated rather than approximated: a cheaper per-symbol
+    re-derivation would be a second implementation, and this project has
+    already learned what two implementations of one graph produce.
+    """
+    labelled = _labelled(store, rev, config)
+    root = labelled.components.find(node_id)
+    found = tuple(name for name in MECHANISMS if name in labelled.mechanisms.get(root, set()))
+    boundary = labelled.boundaries.get(root, set())
+    return IslandLabel(
+        size=len(labelled.grouped.get(root, [node_id])),
+        found=found,
+        missing=tuple(name for name in MECHANISMS if name not in found),
+        boundary=tuple(kind for kind in _BOUNDARY_KINDS if kind in boundary),
+    )
+
+
+def _labelled(store: Store, rev: str, config: Config | None = None) -> _Labelled:
+    """The partition plus every label the report puts on it.
 
     Four queries and one pass over the edges, never a query per node: on a
     2,930-file repository this walks ~395k edge rows, and a per-node
@@ -484,6 +559,19 @@ def islands_report(
     ):
         boundaries.setdefault(components.find(row["node_id"]), set()).add(row["kind"])
 
+    return _Labelled(components, members, grouped, mechanisms, boundaries, fan_in)
+
+
+def islands_report(
+    store: Store, rev: str, config: Config | None = None, limit: int = 20
+) -> Report:
+    """Connected components of `rev`'s CALLS and INHERITS edges, read as
+    undirected, each labelled with the implicit-invocation mechanisms and
+    process boundaries found inside it."""
+    labelled = _labelled(store, rev, config)
+    members, grouped = labelled.members, labelled.grouped
+    mechanisms, boundaries, fan_in = labelled.mechanisms, labelled.boundaries, labelled.fan_in
+
     island_rows: list[Row] = []
     singleton_rows: list[Row] = []
     largest = 0
@@ -557,7 +645,36 @@ def islands_report(
         "basis": f"undirected {', '.join(DEPENDENCY_KINDS)} edges",
     }
 
-    return Report(summary=summary, groups=groups, truncated=truncated)
+    return Report(
+        summary=summary,
+        groups=groups,
+        truncated=truncated,
+        # `unexplained` has always been this report's own admission of
+        # ignorance; the envelope is that count in the form a machine can
+        # act on, with the next move attached. It is the whole envelope
+        # here: an island is computed from the complete edge set with no
+        # budget and no walk to cut short, so nothing else about this
+        # report can be incomplete.
+        unknowns=(
+            [
+                unknown(
+                    UNEXPLAINED_ISLAND,
+                    f"{unexplained_count} of {len(grouped)} islands carry no recognised"
+                    f" mechanism; the ones checked are {', '.join(MECHANISMS)}",
+                )
+            ]
+            if unexplained_count
+            else []
+        ),
+    )
 
 
-__all__ = ["Components", "connected_components", "is_test_path", "islands_report"]
+__all__ = [
+    "MECHANISMS",
+    "Components",
+    "IslandLabel",
+    "connected_components",
+    "is_test_path",
+    "island_label",
+    "islands_report",
+]

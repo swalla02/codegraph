@@ -25,17 +25,19 @@ Reach for codegraph:
    `<name>` can be a trailing name (`open_workspace`), a qualname
    (`cli.py::open_workspace`), or a full node id.
 
-   All four symbol-taking commands — `resolve`, `impact`, `effects` and
-   `path` — share the same exit-code convention for resolving that name/id
-   to a symbol: `0` means a single unambiguous match (the node id is
-   printed, e.g. `src/codegraph/cli.py::open_workspace`, and for
-   `impact`/`effects`/`path` the report follows); `1` means nothing matched
-   (a message on stderr); `2` means more than one symbol matched, and every
-   match is printed (`resolve` to stdout, the others to stderr) — pick the
-   right one and re-run with the full id. `path` takes two symbols and
-   applies the convention to each. The convention is about resolving a
-   *name* and nothing else, so a `path` report saying the two symbols are
-   not connected is still exit `0`: that is an answer, not a failure.
+   All five symbol-taking commands — `resolve`, `impact`, `effects`,
+   `path` and `unknowns` — share the same exit-code convention for
+   resolving that name/id to a symbol: `0` means a single unambiguous match
+   (the node id is printed, e.g. `src/codegraph/cli.py::open_workspace`,
+   and for the report-producing commands the report follows); `1` means
+   nothing matched (a message on stderr); `2` means more than one symbol
+   matched, and every match is printed (`resolve` to stdout, the others to
+   stderr) — pick the right one and re-run with the full id. `path` takes
+   two symbols and applies the convention to each. The convention is about
+   resolving a *name* and nothing else, so a `path` report saying the two
+   symbols are not connected is still exit `0`: that is an answer, not a
+   failure. The one code outside it is `3`, which only `--strict` produces
+   (see below).
 
 2. Ask what depends on it and what it can reach:
 
@@ -62,7 +64,22 @@ Reach for codegraph:
    out — and `path` has none of those failure modes, because it looks for
    one chain rather than ranking a frontier.
 
-4. Read only the top-ranked hits, not the whole list — rows are sorted by
+4. Before you act on any of it, ask what the answer is missing:
+
+   ```
+   codegraph unknowns <id>
+   ```
+
+   The mirror of `impact`. It reports the references in that symbol's body
+   that produced no edge (with the reason, the raw name, the line and the
+   candidate count), how many of the body's references resolved, whether
+   the symbol sits in an island nothing recognised explains, and whether an
+   `impact` walk would stop on its hop budget rather than on the graph —
+   which otherwise reads as a complete answer and is not one. Every
+   reason comes with one fixed next action; you read a lookup table rather
+   than deciding what to do.
+
+5. Read only the top-ranked hits, not the whole list — rows are sorted by
    score (`impact`) or severity (`effects`), most important first, and long
    result sets are truncated with a `truncated` flag rather than dumped in
    full. A `path` report is the exception: its rows are a chain, in walk
@@ -107,6 +124,78 @@ a hop may run through `item.save()` and will name the bare name it used.
 `--hops` defaults to 6, not `impact`'s 3: this walk follows a single chain
 rather than a widening frontier, and on psf/requests a budget of 3 finds 51%
 of the connected pairs while 6 finds 99%.
+
+`codegraph unknowns <symbol>` is the one command whose whole subject is
+what this tool cannot tell you. Every other report is honest about
+uncertainty *in aggregate* — a `low_confidence_hidden` count, an
+`unexplained` island tally — which is a property of the report and not of
+the symbol you asked about. This one is per symbol, and every number in it
+is a count of rows already stored:
+
+```
+symbol: django/db/models/base.py::Model.save · references: 14 · resolved: 3
+  · unresolved: 11 · island: explained by entry, dunder, decorator, test, override,
+  nested, import, NETWORK · mechanisms_not_found: none · basis: ...
+ambiguous
+  router.db_for_write  django/db/models/base.py:866  call reference, 15 candidates
+builtin
+  ValueError           django/db/models/base.py:868  call reference
+unknowns
+  ambiguous  5 references in this body  the bare name matches several definitions; ...
+  builtin    6 references in this body  the target is a Python builtin; ...
+  hop_limit  an `impact` walk of 3 hops does not exhaust this symbol's dependents  ...
+```
+
+`references` is reference *sites* in this body: `(file, line)`, so one
+`self.render()` that writes an edge per override counts once, and two calls
+on one line collapse into one. **A low ratio is not a defect.** `3 of 14`
+here says the resolver identified eleven references exactly and knows none
+of them is a symbol in this repository — six are builtins. Read the reason
+breakdown, never the ratio alone. The reasons are fixed, and so is the next
+action for each:
+
+- `unknown` — the name matches nothing in the repository; expect dynamic
+  dispatch, and read the body to see what it is. **This is the one to
+  care about.**
+- `ambiguous` — the bare name matches several definitions; `codegraph
+  resolve <name>` lists them, and `impact --all` walks them.
+- `external` — the target is outside the repository; no future index will
+  resolve it. Nothing to do.
+- `builtin` — the target is a Python builtin; no repository symbol is being
+  called. Nothing to do.
+- unexplained island — no implicit-invocation mechanism was recognised; a
+  runtime trace is the only thing that can confirm this symbol is reached.
+  `mechanisms_not_found` lists what was checked, so you can see what
+  "recognised" covers rather than take the claim on trust.
+- hop limit — the walk stopped at its budget; re-run with a larger `--hops`.
+
+**The uncertainty envelope, and `--strict`.** Every report that can be
+incomplete carries an `unknowns` array beside its results — a real array in
+`--json`, a trailing section in text — and `--strict` exits **3** when one
+of those entries is blocking. That is the flag to reach for when you are
+about to act on the answer without reading it: `codegraph impact X --strict
+&& <edit>` refuses rather than letting you act on a walk that stopped early.
+`3` is distinct from `1` (no such symbol) and `2` (ambiguous symbol) on
+purpose — those call for a different next move.
+
+`impact` raises it for a hop budget the walk did not exhaust; `effects` for
+calls in the body it could not follow; `path` for a negative a flag would
+turn into a path; `islands` for its own `unexplained` count; `unknowns` for
+all of the above. `orphans` and `diff` have no `--strict`: `orphans`'
+uncertainty is the standing `caveat` on every row, and `diff` compares two
+revisions by content hash with no walk and no budget to cut short.
+
+Two things deliberately do *not* count as incomplete. A LOW-confidence row
+is an answer given with its tier attached, so `--strict` says nothing about
+it; a report is incomplete when it does not show you something, not when
+what it shows is uncertain. `truncated` is your own `--limit`, and already
+has a field. Likewise `external` and `builtin` entries are printed and never
+block — they are answers, not gaps, and each entry carries a `blocking`
+field saying which it is.
+
+**An empty `unknowns` means "no hole this tool can name", not "this answer
+is complete."** A name assembled at runtime (`getattr`, a registry, a
+template) leaves nothing for any of this to find.
 
 `codegraph islands` answers a question the other commands cannot: the
 global shape of the graph. It splits the revision's `CALLS`, `INHERITS`,
@@ -190,10 +279,11 @@ any side effect that newly became reachable. With no argument it diffs
 `merge-base(default branch, HEAD)` against the worktree, which is what you
 want when asked "what did this branch change".
 
-All of `resolve`, `impact`, `effects`, `path`, `islands`, `orphans` and
-`diff` accept `--path <dir>` to run against a different repository root, and
-`impact`/`effects`/`path`/`islands`/`orphans`/`diff` accept `--json` for
-machine-readable output instead of the default text.
+All of `resolve`, `impact`, `effects`, `path`, `unknowns`, `islands`,
+`orphans` and `diff` accept `--path <dir>` to run against a different
+repository root, and all but `resolve` accept `--json` for machine-readable
+output instead of the default text. `impact`, `effects`, `path`, `unknowns`
+and `islands` additionally accept `--strict`.
 
 ## The anti-pattern this displaces
 
@@ -305,6 +395,19 @@ the full set and how confident it is in each edge.
   source-text scan removed. Every row's `detail` names the tests that call
   it, which is where to start reading: the test says what the function was
   supposed to be for.
+- `unknowns`' summary reads `symbol: <id> · references: 14 · resolved: 3 ·
+  unresolved: 11 · island: <claim> · mechanisms_not_found: <list or none> ·
+  basis: ...`. Its groups are named after the reasons (`unknown`,
+  `ambiguous`, `external`, `builtin`), rows are in source order within each,
+  and `--limit` is spent on the gaps first — a body with sixty `isinstance`
+  calls and one `getattr` never spends its budget on the sixty. The next
+  action for each reason is in the `unknowns` envelope, said once per
+  reason, not repeated down a column.
+- The envelope's entries are `{reason, detail, action, blocking}` in
+  `--json`, and `reason  detail  action` under an `unknowns` heading in
+  text. `detail` is the per-case data (how many references, which budget);
+  `action` is one constant string per reason and never varies. `blocking`
+  is what `--strict` refuses on.
 - Each `effects` row's `detail` reads `<KIND> <CONFIDENCE> via <chain>` —
   the chain is the call path from the queried symbol down to the concrete
   call site; `location` is that call site's `file:line`, clickable evidence
