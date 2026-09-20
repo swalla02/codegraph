@@ -469,10 +469,10 @@ def test_evidence_at_the_end_of_a_propagated_witness_chain_justifies_its_tier(tm
 
 
 def test_propagate_reduces_duplicate_direct_rows_with_stronger_not_scan_order(tmp_path):
-    """C2 regression (final verification, MED): `propagate.py:102` used to
-    keep whichever `direct=1` row SQL scan order returned last for a given
-    (node_id, kind) rather than reducing with `stronger()`, the way
-    `witness_path`'s own `direct_confidence` does. `callee` carries a HIGH
+    """C2 regression (final verification, MED): `propagate`'s direct-effect
+    seeding used to keep whichever `direct=1` row SQL scan order returned
+    last for a given (node_id, kind) rather than reducing with `stronger()`,
+    the way `witness_path`'s own `direct_confidence` does. `callee` carries a HIGH
     NETWORK row inserted BEFORE a LOW one; a last-write-wins reduction
     would leave `callee`'s own confidence at LOW, making it ineligible at
     the HIGH tier and silently downgrading `caller` (reached over a HIGH
