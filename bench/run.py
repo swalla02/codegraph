@@ -90,7 +90,7 @@ TARGETS: dict[str, Target] = {
             recall_high_medium=0.74,
             conditional_precision=0.95,
             measured=(
-                "2026-09-19, codegraph ce69dfc, psf/requests dae7ef6: recall 0.79"
+                "2026-09-20, codegraph 090ded0, psf/requests dae7ef6: recall 0.79"
                 " (91/115 judgeable), at HIGH/MEDIUM 0.77, conditional precision"
                 " 0.99 (85/86). All 24 misses are dunders invoked by syntax or"
                 " calls reached through an out-of-repo frame."
@@ -106,14 +106,20 @@ TARGETS: dict[str, Target] = {
         tests=("tests/",),
         extra_deps=("pytest-asyncio", "python-dotenv", "asgiref", "greenlet"),
         note="tests/ minus the ones needing extras; see --tests to narrow",
+        # The conditional-precision floor was 0.70 for one release: #50 had
+        # just dropped the measurement to 0.74 by claiming HIGH on
+        # receiver-resolved calls to decorated methods, and a floor is written
+        # under what the benchmark prints, not under what one wishes it
+        # printed. #54 found the cause and fixed it, so the floor moves back
+        # up with the number rather than staying where the regression left it.
         floor=Floor(
             recall=0.27,
             recall_high_medium=0.24,
-            conditional_precision=0.70,
+            conditional_precision=0.90,
             measured=(
-                "2026-09-19, codegraph ce69dfc, pallets/flask d73fa1c: recall 0.29"
+                "2026-09-20, codegraph 090ded0, pallets/flask d73fa1c: recall 0.29"
                 " (775/2683 judgeable), at HIGH/MEDIUM 0.26, conditional precision"
-                " 0.74 (515/699). 1637 of the 1908 misses are a view defined inside"
+                " 0.93 (515/551). 1637 of the 1908 misses are a view defined inside"
                 " a test, a decorated target, or a pair only an out-of-repo frame"
                 " connects -- dispatch a call-site graph does not model."
             ),

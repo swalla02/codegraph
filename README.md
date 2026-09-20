@@ -439,15 +439,15 @@ is unit-tested there (`tests/test_bench_scorer.py`).
 | traced call edges (judgeable) | 115 | 2683 |
 | **recall** | **0.79** (91/115) | **0.29** (775/2683) |
 | recall at HIGH/MEDIUM | 0.77 | 0.26 |
-| conditional precision | 0.99 (85/86) | 0.74 (515/699) |
+| conditional precision | 0.99 (85/86) | 0.93 (515/551) |
 
-Measured 2026-09-19 at codegraph `ce69dfc`, against psf/requests `dae7ef6` and
+Measured 2026-09-20 at codegraph `090ded0`, against psf/requests `dae7ef6` and
 pallets/flask `d73fa1c`. Every run prints the target's commit beside the score,
 because a clone tracks its default branch and two runs a month apart measure
 two different repositories.
 
 Worth reading those rows together rather than reading the headline alone,
-because on flask the headline has now sat at 0.29 through two changes that
+because on flask the headline has now sat at 0.29 through three changes that
 moved the graph substantially.
 
 #38 (following a package re-export, so `flask.Flask` resolves instead of
@@ -463,15 +463,33 @@ same scope) moved the same two rows again, and one of them **down**. Scoring
 one flask trace with the graph from before and after: recall 0.29 -> 0.29,
 recall at HIGH/MEDIUM 673 -> 694 edges, and static HIGH edges with both
 endpoints executed 490 -> 699 — of which the trace observed 455 -> 515. So
-conditional precision fell **0.93 -> 0.74**. Receiver-type resolution promotes
-far more calls to HIGH on a framework than it gets right there: 209 more HIGH
-edges were put up for judgement and 60 of them were taken. The number is doing
-its job by dropping; the floor below is set under it, not at the older value.
+conditional precision fell **0.93 -> 0.74**: 209 more HIGH edges were put up
+for judgement on a framework and only 60 of them were taken.
 
-Together those two are the property of this benchmark most worth knowing:
+#54 asked what those 149 wrong claims were, by instrumenting the resolver to
+record which mechanism produced each edge and scoring the same trace again.
+The answer was one shape, not a spread: **148 of the 149 were calls to a
+`@setupmethod`-wrapped flask method** — `Scaffold.route`,
+`Blueprint.register_blueprint` — reached through `app = Flask(__name__)` or an
+annotated `Blueprint`. Resolving the receiver had found the right class and
+the right method; what it could not know is that `route` is decorated, so the
+frame that opens at runtime is `setupmethod.<locals>.wrapper_func` and never
+the decorated body. Split by whether the target carried a decorator, the
+step's HIGH claims on flask were 60 right and 1 wrong undecorated, against 0
+right and 148 wrong decorated. (The suspected cause — a class scored MEDIUM
+for structurally satisfying a `Protocol` — was not involved in any of it, and
+could not have been: flask defines no Protocol, and conditional precision
+scores HIGH edges only.) So a receiver-resolved call to a decorated
+definition is now MEDIUM rather than HIGH, which is the whole fix: recall and
+recall at HIGH/MEDIUM are untouched at 0.29 and 0.26, no candidate is
+dropped, and conditional precision returns to **0.93** (515/551).
+
+Together those three are the property of this benchmark most worth knowing:
 **recall does not distinguish a fact from a lucky guess, and a change that
 improves the tier an answer is claimed at can cost conditional precision
-without touching recall at all.**
+without touching recall at all** — in either direction, since #54 bought the
+0.19 back and recall did not move for that either. Only the second number
+ever saw any of it happen.
 
 On `tests/test_utils.py` alone — the scope #35 recorded — requests is **0.93**
 recall (83/89), and every one of the 6 misses has a dunder as its target,
@@ -519,7 +537,7 @@ uv run python -m bench.run flask --check-floors      # ~3 min
 |---|---|---|
 | recall | 0.76 | 0.27 |
 | recall at HIGH/MEDIUM | 0.74 | 0.24 |
-| conditional precision | 0.95 | 0.70 |
+| conditional precision | 0.95 | 0.90 |
 
 An order of magnitude apart on recall, and that is the point: a library whose
 tests call its functions by name and a framework whose tests reach their
@@ -548,10 +566,11 @@ simply not cover it, and most of a library's surface is not exercised by its
 own tests. Unconditional precision is therefore not measurable this way, and
 the benchmark does not print a number for it. What is defensible: among static
 HIGH edges whose **two endpoints both executed at least once**, how many did
-the trace observe? 0.99 on requests, 0.74 on flask. That says most HIGH edges
+the trace observe? 0.99 on requests, 0.93 on flask. That says most HIGH edges
 that could have been checked were taken; it does not say the resolver invents no
 edges. It is also the one number here that a resolution improvement can push
-*down*, by claiming HIGH on more calls than it gets right — see #50 above.
+*down*, by claiming HIGH on more calls than it gets right — which is exactly
+what #50 did and what #54 read back off it; see both above.
 
 ### The one filter that decides whether the number is honest
 
