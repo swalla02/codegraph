@@ -1428,6 +1428,101 @@ def test_a_module_level_instance_is_seen_from_a_function(repo, write):
     store.close()
 
 
+# What the attribute holds (#54). Resolving the receiver says which class the
+# method is looked up on; it does not say that the class attribute of that
+# name still holds the function written under it. A decorator is free to
+# return something else, and then the call enters that something else.
+#
+# This is flask's `@setupmethod`, which is how the regression #54 records was
+# produced: 148 of the 149 wrong HIGH claims #50 added there were calls to a
+# `@setupmethod`-wrapped Flask method through `app = Flask(__name__)` or an
+# annotated `Blueprint`.
+
+WRAPPED_APP = (
+    "import functools\n\n\n"
+    "def setupmethod(f):\n"
+    "    @functools.wraps(f)\n"
+    "    def wrapper_func(self, *args, **kwargs):\n"
+    "        return f(self, *args, **kwargs)\n\n"
+    "    return wrapper_func\n\n\n"
+    "class App:\n"
+    "    @setupmethod\n"
+    "    def route(self, rule):\n        return rule\n\n"
+    "    def run(self):\n        return 1\n"
+)
+
+
+@pytest.mark.parametrize(
+    "receiver",
+    [
+        ("constructed", "def make():\n    app = App()\n    return app.route('/')\n"),
+        ("annotated", "def make(app: App):\n    return app.route('/')\n"),
+    ],
+    ids=lambda case: case[0],
+)
+def test_a_wrapped_target_reached_through_a_receiver_is_medium(repo, write, receiver):
+    """`App.route` is decorated, so `app.route` is the decorator's return value.
+
+    The candidate is right -- `route`'s body is where a reader goes and where
+    an edit lands -- but "this call site runs that definition" is a claim the
+    resolver cannot make without reading the decorator, so MEDIUM is the tier.
+    Nothing is dropped: the edge is still there, and `impact` still shows it.
+    """
+    write("app.py", WRAPPED_APP)
+    write("use.py", f"from app import App\n\n\n{receiver[1]}", commit="wrapped")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = targets_of(store, "use.py::make")
+    assert ("app.py::App.route", "MEDIUM") in found
+    assert ("app.py::App.route", "HIGH") not in found
+    assert "app.route" not in ambiguous_names(store)
+    store.close()
+
+
+def test_an_undecorated_sibling_of_a_wrapped_target_stays_high(repo, write):
+    """The weakening is per definition, not per class: `App.run` carries no
+    decorator, so the same receiver still reaches it at HIGH."""
+    write("app.py", WRAPPED_APP)
+    write(
+        "use.py",
+        "from app import App\n\n\ndef make():\n    app = App()\n    return app.run()\n",
+        commit="undecorated",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("app.py::App.run", "HIGH") in targets_of(store, "use.py::make")
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "imports, decorator",
+    [
+        ("", "staticmethod"),
+        ("", "classmethod"),
+        ("import abc\n\n\n", "abc.abstractmethod"),
+        ("import typing as t\n\n\n", "t.final"),
+    ],
+)
+def test_a_decorator_that_replaces_nothing_leaves_the_claim_high(repo, write, imports, decorator):
+    """Not every decorator wraps. These four are the language's own markers and
+    descriptors: each leaves the same body as what `x.build(...)` invokes, so
+    weakening the claim would cost a certain answer for nothing."""
+    write(
+        "app.py",
+        f"{imports}class Registry:\n    @{decorator}\n    def build(x):\n        return x\n",
+    )
+    write(
+        "use.py",
+        "from app import Registry\n\n\n"
+        "def make():\n    registry = Registry()\n    return registry.build(1)\n",
+        commit="descriptor",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("app.py::Registry.build", "HIGH") in targets_of(store, "use.py::make")
+    store.close()
+
+
 # The Protocol question. A `typing.Protocol` is satisfied structurally: its
 # implementations need not subclass it, so the hierarchy has no link from the
 # Protocol to the code that runs. Binding a call to the stub alone would repeat

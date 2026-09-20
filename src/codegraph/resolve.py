@@ -279,6 +279,11 @@ class ResolveContext:
     class_bases: dict[str, list[str]] = field(default_factory=dict)
     #: class node id -> the names of the methods it defines itself.
     class_members: dict[str, frozenset[str]] = field(default_factory=dict)
+    #: node id -> the decorator names its definition carries, as written
+    #: (`setupmethod`, `t.final`). Only decorated definitions are present.
+    #: Read by `wraps_the_definition`, which is what decides whether the name
+    #: of a definition still reaches the definition; see `_through_receiver`.
+    decorators: dict[str, tuple[str, ...]] = field(default_factory=dict)
     #: Memo for the receiver step's per-class answers (is it a Protocol, what
     #: does its MRO define, who implements it), shared across the revision like
     #: `descendant_cache`.
@@ -324,6 +329,53 @@ def is_protocol(class_id: str, ctx: ResolveContext) -> bool:
                 break
         ctx.receiver_cache[key] = found
     return ctx.receiver_cache[key]  # type: ignore[return-value]
+
+
+#: Decorators that leave a definition reachable by its own name.
+#:
+#: Everything else may not. `@decorator` rebinds the name to whatever the
+#: decorator returns, so `App.route` need not hold the function written under
+#: `def route`, and a call through it need not enter that body at all -- it
+#: enters the wrapper, which may delegate, may register and return the
+#: original, or may do something else entirely. Reading the decorator to find
+#: out is a different analysis (it is a call to a function whose return value
+#: this would have to model), and it is not one this resolver does.
+#:
+#: These seven are the exceptions, and they are exceptions for a reason that
+#: can be checked rather than assumed: each is defined by the language, and
+#: each leaves the decorated body as what an attribute access of that name
+#: invokes. `staticmethod`, `classmethod` and `property` are descriptors over
+#: the same function; `abstractmethod`, `overload`, `final` and `override`
+#: are markers that return their argument. A repository's own decorator is
+#: never on this list, however harmless it looks, because nothing here has
+#: read it.
+#:
+#: Matched on the last dotted segment, as `parse.py` records them, so
+#: `abc.abstractmethod`, `t.final` and a bare `final` are one entry.
+TRANSPARENT_DECORATORS: frozenset[str] = frozenset(
+    {
+        "staticmethod",
+        "classmethod",
+        "property",
+        "abstractmethod",
+        "overload",
+        "final",
+        "override",
+    }
+)
+
+
+def wraps_the_definition(node_id: str, ctx: ResolveContext) -> bool:
+    """Might this definition's own name reach something other than its body?
+
+    True when it carries a decorator `TRANSPARENT_DECORATORS` does not
+    account for -- which is the resolver's cue that it has found the right
+    definition but cannot promise the call arrives inside it.
+    """
+    return any(
+        name.rpartition(".")[2] not in TRANSPARENT_DECORATORS
+        for name in ctx.decorators.get(node_id, ())
+    )
 
 
 def methods_in_mro(class_id: str, ctx: ResolveContext) -> frozenset[str]:
@@ -726,6 +778,37 @@ class AstResolver:
           does not track, and each is still a real, declared candidate --
           neither a certainty nor a guess. `x: T | None` counts as one binding:
           `None` is not a class, and the parser drops it.
+        - Any of these where the declaration the MRO reaches is DECORATED by
+          anything the language does not define (`wraps_the_definition`):
+          MEDIUM, whatever the receiver's evidence was. See below.
+
+        The decorated declaration. Resolving the receiver establishes which
+        class the method is looked up on. It does not establish that the class
+        attribute of that name still holds the function written under `def`:
+        a decorator returns whatever it likes, and `app.route(...)` then calls
+        that instead. The candidate is not wrong -- `route`'s body is where a
+        reader goes and where an edit lands, so the edge belongs in the graph
+        -- but HIGH is read as "this call site runs that definition", and that
+        is the half a decorator can take away.
+
+        This is measurement, not caution (#54). #50 moved flask's conditional
+        precision 0.93 -> 0.74; instrumenting the resolver over the same trace
+        attributed 148 of the 149 new wrong HIGH claims to one shape --
+        `@setupmethod`-wrapped Flask methods (`Scaffold.route`,
+        `Blueprint.register_blueprint`) reached through `app = Flask(__name__)`
+        or an annotated `Blueprint`. At runtime the frame that opens is
+        `setupmethod.<locals>.wrapper_func`, never the decorated body, so
+        every such claim was contradicted by the trace. Split by whether the
+        target was decorated, this step's HIGH claims there were 60 right and
+        1 wrong undecorated, against 0 right and 148 wrong decorated. Nothing
+        else separated them, and no Protocol was involved in any of it: flask
+        defines none, so the structural-implementer branch below never runs on
+        the repository whose number fell.
+
+        What this does NOT do is drop anything. The candidate stays, one tier
+        down, where `impact` still shows it -- the failure mode being avoided
+        throughout this step is a narrower, more confident, more wrong answer,
+        and silently deciding a wrapped method away would be exactly that.
 
         The Protocol question. `typing.Protocol` is satisfied structurally, so
         `GitTreeSource` implements `TreeSource` without subclassing it and the
@@ -810,7 +893,11 @@ class AstResolver:
             declared = self._inherited(class_id, method, ctx)
             if declared is None:
                 return []
-            add(declared, HIGH)
+            # HIGH says the call site runs that definition. A decorated
+            # definition is not what its own name holds, so that is exactly
+            # the part this cannot promise; see `wraps_the_definition` and
+            # the paragraph above.
+            add(declared, MEDIUM if wraps_the_definition(declared, ctx) else HIGH)
             if is_protocol(class_id, ctx):
                 structural = True
                 for node_id in self._implementers(class_id, method, ctx):
@@ -1016,8 +1103,8 @@ class _SymbolTable:
         self.owner_index: dict[tuple[str, str], list[tuple[str, int, int]]] = {}
         class_ids: dict[tuple[str, str], str] = {}
         all_rows = connection.execute(
-            "SELECT id, path, qualname, kind, line_start, line_end, name_binding FROM nodes"
-            " WHERE rev=? ORDER BY id",
+            "SELECT id, path, qualname, kind, line_start, line_end, name_binding, decorators"
+            " FROM nodes WHERE rev=? ORDER BY id",
             (rev,),
         ).fetchall()
         for row in all_rows:
@@ -1056,6 +1143,13 @@ class _SymbolTable:
                 members.setdefault(owner, set()).add(name)
         self.class_members: dict[str, frozenset[str]] = {
             owner: frozenset(names) for owner, names in members.items()
+        }
+
+        # Decorated definitions only. Most are not, and an empty entry would
+        # cost a dict the size of `nodes` to say nothing; `wraps_the_definition`
+        # reads a missing key as "carries no decorator", which is what it means.
+        self.decorators: dict[str, tuple[str, ...]] = {
+            row["id"]: tuple(row["decorators"].split(",")) for row in live_rows if row["decorators"]
         }
 
         self.class_bases: dict[str, list[str]] = {}
@@ -1114,6 +1208,7 @@ class _SymbolTable:
             class_ids=self.class_node_ids,
             class_bases=self.class_bases,
             class_members=self.class_members,
+            decorators=self.decorators,
             receiver_cache=receiver_cache if receiver_cache is not None else {},
         )
 
