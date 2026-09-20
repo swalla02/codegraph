@@ -10,9 +10,11 @@ module's own tests and Task 11's both split on it.
 from __future__ import annotations
 
 from codegraph.effects.propagate import witness_path
-from codegraph.render import Group, Report, Row
-from codegraph.resolve import CONFIDENCE_RANK, stronger
+from codegraph.query.unknowns import unresolved_references
+from codegraph.render import Group, Report, Row, Unknown
+from codegraph.resolve import CONFIDENCE_RANK, EXTERNAL, UNKNOWN, stronger
 from codegraph.store import Store
+from codegraph.uncertainty import unknown
 
 #: Worst-first. DB writes and network calls are the effects a reviewer
 #: should see before anything else; nondeterminism is the mildest of the nine.
@@ -65,7 +67,40 @@ def effects_report(store: Store, rev: str, node_id: str) -> Report:
         summary={"symbol": node_id, "effect_kinds": len(ordered)},
         groups=groups,
         truncated=False,
+        unknowns=_envelope(store, rev, node_id),
     )
+
+
+def _envelope(store: Store, rev: str, node_id: str) -> list[Unknown]:
+    """The holes in this symbol's own body that the propagation walk could
+    not cross.
+
+    Two of the four reasons, and the other two are deliberate omissions.
+    `ambiguous` is not a hole here: `effects/propagate.py` folds the
+    bare-name fan-out in through the same hubs `islands` uses, so those
+    calls ARE followed. `builtin` is not one either -- a builtin with an
+    effect is in the catalog (`open` is how `FS_WRITE` is usually found),
+    and one that is not is a name the catalog has already been asked about.
+
+    `unknown` is a call this walk could not follow at all, so it blocks;
+    `external` leaves the repository, where the catalog is the only thing
+    that can speak for it, so it is reported and does not (see
+    `uncertainty.SETTLED`). Both are counted from this body's own stored
+    rows -- this is a statement about the FIRST hop, not a proof that the
+    rest of the chain is complete, which no envelope can be.
+    """
+    counts: dict[str, int] = {}
+    for reference in unresolved_references(store, rev, node_id):
+        counts[reference.reason] = counts.get(reference.reason, 0) + 1
+    return [
+        unknown(
+            reason,
+            f"{counts[reason]} call{'' if counts[reason] == 1 else 's'} in this body that the"
+            " witness walk cannot follow",
+        )
+        for reason in (UNKNOWN, EXTERNAL)
+        if reason in counts
+    ]
 
 
 def _evidence_location(

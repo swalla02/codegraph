@@ -18,9 +18,22 @@ from codegraph.query.impact import impact_report
 from codegraph.query.islands import islands_report
 from codegraph.query.orphans import orphans_report
 from codegraph.query.path import DEFAULT_HOPS, path_report
-from codegraph.render import render_json, render_text
+from codegraph.query.unknowns import DEFAULT_HOPS as UNKNOWNS_HOPS
+from codegraph.query.unknowns import unknowns_report
+from codegraph.render import Report, render_json, render_text
 from codegraph.resolve import find_symbol
 from codegraph.store import WORKTREE, Store
+from codegraph.uncertainty import is_incomplete
+
+#: Exit code for a `--strict` run whose report carries a blocking unknown.
+#:
+#: Not `1` and not `2`, which the symbol-resolving convention below has
+#: already spent on "nothing matched" and "more than one match". An agent
+#: writing `codegraph impact X --strict && edit` has to be able to tell "I
+#: could not find that symbol" from "I found it and my answer has a hole in
+#: it": those call for opposite next moves, and a shared exit code would
+#: hand back exactly the judgement call this flag exists to remove.
+INCOMPLETE = 3
 
 
 def open_workspace(root: Path) -> tuple[Store, Indexer]:
@@ -30,6 +43,23 @@ def open_workspace(root: Path) -> tuple[Store, Indexer]:
     store = Store.open(root)
     source = GitTreeSource(root) if gitio.is_repo(root) else FsTreeSource(root)
     return store, Indexer(root, store, source)
+
+
+def _emit(report: Report, as_json: bool, strict: bool = False) -> int:
+    """Print one report and return the exit code for it.
+
+    The report is printed either way: `--strict` is a verdict on the
+    answer, not a reason to withhold it, and a run that exits nonzero with
+    nothing on stdout would leave a reader unable to see what the tool
+    could not answer. The reasons repeat on stderr because that is the
+    stream a `&&` chain's failure gets read from.
+    """
+    print(render_json(report) if as_json else render_text(report))
+    if not strict or not is_incomplete(report):
+        return 0
+    blocking = [item.reason for item in report.unknowns if item.blocking]
+    print(f"incomplete report: {', '.join(blocking)} -- see `unknowns`", file=sys.stderr)
+    return INCOMPLETE
 
 
 def _print_stats(stats, store: Store, rev: str) -> None:
@@ -158,8 +188,7 @@ def _cmd_effects(args: argparse.Namespace) -> int:
                 print(f"  {row['id']}", file=sys.stderr)
             return 2
         report = effects_report(store, args.rev, matches[0]["id"])
-        print(render_json(report) if args.json else render_text(report))
-        return 0
+        return _emit(report, args.json, args.strict)
     finally:
         store.close()
 
@@ -201,8 +230,7 @@ def _cmd_impact(args: argparse.Namespace) -> int:
             limit=args.limit,
             include_low=args.all,
         )
-        print(render_json(report) if args.json else render_text(report))
-        return 0
+        return _emit(report, args.json, args.strict)
     finally:
         store.close()
 
@@ -267,8 +295,41 @@ def _cmd_path(args: argparse.Namespace) -> int:
             max_hops=args.hops,
             include_low=args.all,
         )
-        print(render_json(report) if args.json else render_text(report))
-        return 0
+        return _emit(report, args.json, args.strict)
+    finally:
+        store.close()
+
+
+def _cmd_unknowns(args: argparse.Namespace) -> int:
+    """Report what codegraph does not know about one symbol.
+
+    Takes a symbol, so it takes the `0`/`1`/`2` convention with it, through
+    the same `_one_symbol` helper `path` uses -- and the convention keeps
+    meaning what it means everywhere else: it is about resolving a name.
+    A symbol with forty unresolved references still exits `0` without
+    `--strict`, because a full list of what is unknown is an answer, and an
+    agent's `&&` chain should be able to read it.
+    """
+    root = Path(args.path).resolve()
+    store, indexer = open_workspace(root)
+    try:
+        try:
+            indexer.reconcile(args.rev)
+        except gitio.GitError:
+            print(f"revision not found: {args.rev}", file=sys.stderr)
+            return 1
+        node_id, code = _one_symbol(store, args.rev, args.symbol)
+        if node_id is None:
+            return code
+        report = unknowns_report(
+            store,
+            args.rev,
+            node_id,
+            indexer.config,
+            max_hops=args.hops,
+            limit=args.limit,
+        )
+        return _emit(report, args.json, args.strict)
     finally:
         store.close()
 
@@ -292,8 +353,7 @@ def _cmd_islands(args: argparse.Namespace) -> int:
             print(f"revision not found: {args.rev}", file=sys.stderr)
             return 1
         report = islands_report(store, args.rev, indexer.config, limit=args.limit)
-        print(render_json(report) if args.json else render_text(report))
-        return 0
+        return _emit(report, args.json, args.strict)
     finally:
         store.close()
 
@@ -327,8 +387,7 @@ def _cmd_orphans(args: argparse.Namespace) -> int:
             include_public=args.include_public,
             include_decorated=args.include_decorated,
         )
-        print(render_json(report) if args.json else render_text(report))
-        return 0
+        return _emit(report, args.json)
     finally:
         store.close()
 
@@ -371,8 +430,7 @@ def _cmd_diff(args: argparse.Namespace) -> int:
         except MissingRevisionError as exc:
             print(f"revision not found: {exc.rev}", file=sys.stderr)
             return 1
-        print(render_json(report) if args.json else render_text(report))
-        return 0
+        return _emit(report, args.json)
     finally:
         store.close()
 
@@ -457,6 +515,16 @@ def _cmd_guide(args: argparse.Namespace) -> int:
     return 0
 
 
+#: One sentence, used by every command that can be incomplete, because
+#: `--strict` has to mean one thing across all of them. Spelling it out per
+#: command is how two flags with one name come to behave differently.
+_STRICT_HELP = (
+    f"Exit {INCOMPLETE} when the report carries an unknown that could make acting"
+    " on it wrong. A LOW-confidence row is an answer and does not count; a hop"
+    " budget the walk did not exhaust does"
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codegraph")
     parser.add_argument("--version", action="version", version=__version__)
@@ -494,6 +562,7 @@ def build_parser() -> argparse.ArgumentParser:
     effects_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
     effects_parser.add_argument("--rev", default=WORKTREE, help="Revision to query")
     effects_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    effects_parser.add_argument("--strict", action="store_true", help=_STRICT_HELP)
     effects_parser.set_defaults(handler=_cmd_effects)
 
     impact_parser = subparsers.add_parser("impact", help="Report the ranked dependents of a symbol")
@@ -519,6 +588,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     impact_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    impact_parser.add_argument("--strict", action="store_true", help=_STRICT_HELP)
     impact_parser.set_defaults(handler=_cmd_impact)
 
     path_parser = subparsers.add_parser(
@@ -558,7 +628,44 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     path_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    path_parser.add_argument("--strict", action="store_true", help=_STRICT_HELP)
     path_parser.set_defaults(handler=_cmd_path)
+
+    unknowns_parser = subparsers.add_parser(
+        "unknowns",
+        help="Report what codegraph cannot answer about a symbol",
+        description=(
+            "The mirror of `impact`: what this graph does NOT know about one"
+            " symbol, and what would settle each part of it. Every reference in"
+            " the body that produced no edge, with the reason, the raw name, the"
+            " line and the candidate count; how many of the body's references"
+            " resolved; whether the symbol sits in an island no recognised"
+            " mechanism explains, and which mechanisms were checked; and whether"
+            " an `impact` walk would stop on its hop budget rather than on the"
+            " graph -- an incomplete answer that otherwise reads as a complete"
+            " one. Every number is a count of rows the indexer already wrote, and"
+            " every next action is one fixed string per reason."
+        ),
+    )
+    unknowns_parser.add_argument("symbol", help="Node id, qualname, or trailing name")
+    unknowns_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    unknowns_parser.add_argument("--rev", default=WORKTREE, help="Revision to query")
+    unknowns_parser.add_argument(
+        "--hops",
+        type=int,
+        default=UNKNOWNS_HOPS,
+        help=(
+            f"The `impact` hop budget to answer about (default: {UNKNOWNS_HOPS},"
+            " matching `impact`'s own -- the answer is only useful if it is about"
+            " the walk you are going to run)"
+        ),
+    )
+    unknowns_parser.add_argument(
+        "--limit", type=int, default=40, help="Maximum reference rows to keep (default: 40)"
+    )
+    unknowns_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    unknowns_parser.add_argument("--strict", action="store_true", help=_STRICT_HELP)
+    unknowns_parser.set_defaults(handler=_cmd_unknowns)
 
     islands_parser = subparsers.add_parser(
         "islands",
@@ -582,6 +689,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum rows to keep, total across islands and singletons (default: 20)",
     )
     islands_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    islands_parser.add_argument("--strict", action="store_true", help=_STRICT_HELP)
     islands_parser.set_defaults(handler=_cmd_islands)
 
     orphans_parser = subparsers.add_parser(
