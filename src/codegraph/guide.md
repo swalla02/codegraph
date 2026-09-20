@@ -25,14 +25,17 @@ Reach for codegraph:
    `<name>` can be a trailing name (`open_workspace`), a qualname
    (`cli.py::open_workspace`), or a full node id.
 
-   All three symbol-taking commands — `resolve`, `impact`, and `effects` —
-   share the same exit-code convention for resolving that name/id to a
-   symbol: `0` means a single unambiguous match (the node id is printed,
-   e.g. `src/codegraph/cli.py::open_workspace`, and for `impact`/`effects`
-   the report follows); `1` means nothing matched (a message on stderr);
-   `2` means more than one symbol matched, and every match is printed
-   (`resolve` to stdout, `impact`/`effects` to stderr) — pick the right one
-   and re-run with the full id.
+   All four symbol-taking commands — `resolve`, `impact`, `effects` and
+   `path` — share the same exit-code convention for resolving that name/id
+   to a symbol: `0` means a single unambiguous match (the node id is
+   printed, e.g. `src/codegraph/cli.py::open_workspace`, and for
+   `impact`/`effects`/`path` the report follows); `1` means nothing matched
+   (a message on stderr); `2` means more than one symbol matched, and every
+   match is printed (`resolve` to stdout, the others to stderr) — pick the
+   right one and re-run with the full id. `path` takes two symbols and
+   applies the convention to each. The convention is about resolving a
+   *name* and nothing else, so a `path` report saying the two symbols are
+   not connected is still exit `0`: that is an answer, not a failure.
 
 2. Ask what depends on it and what it can reach:
 
@@ -46,10 +49,64 @@ Reach for codegraph:
    downstream of the symbol, each with a witness chain down to the exact
    `file:line` that causes it.
 
-3. Read only the top-ranked hits, not the whole list — rows are sorted by
+3. When you already have **two** symbols and the question is how they
+   relate, ask that directly instead of running `impact` on one and reading
+   the rows for the other:
+
+   ```
+   codegraph path <A> <B>
+   ```
+
+   Reading `impact` for a second name fails exactly when the answer
+   matters — a long chain, a chain past `--hops`, a row `--limit` crowded
+   out — and `path` has none of those failure modes, because it looks for
+   one chain rather than ranking a frontier.
+
+4. Read only the top-ranked hits, not the whole list — rows are sorted by
    score (`impact`) or severity (`effects`), most important first, and long
    result sets are truncated with a `truncated` flag rather than dumped in
-   full.
+   full. A `path` report is the exception: its rows are a chain, in walk
+   order, and reading them out of order means nothing.
+
+`codegraph path <A> <B>` reports the shortest chain of `CALLS`, `INHERITS`,
+`IMPLEMENTS` and `REFERENCES` edges connecting two symbols, in whichever
+direction it runs. **Direction is the answer, not a detail**: if A reaches B
+then editing B is the risky move, if B reaches A then editing A is, and if
+each reaches the other they are in a cycle and both are. `forward` always
+means the direction you wrote the arguments in; both directions are always
+walked, and the one that was *not* found is reported as `none` so you can
+see the tool looked rather than guess.
+
+Each hop names its **kind** (four kinds now mean four different things by
+"connected") and its **confidence**, and the path's confidence is its
+weakest hop — five HIGH hops and four HIGH plus one LOW are different
+answers, so the weak hop is marked as the one to go and read. Every hop also
+carries the `file:line` that makes it, the same clickable evidence `effects`
+gives.
+
+**"Not connected" is three answers, never one**, and the difference decides
+what you do next:
+
+- `reason: no directed path within N hops`, with `show_path: --hops M` — a
+  chain exists and your budget was too small. Re-run with the budget it
+  names; do not read this as "unrelated".
+- `reason: no directed path in either direction` — nothing connects them as
+  a walk over the edges this run walked. Something may still relate them (a
+  common caller, or a file's top level calling both). When `show_path:
+  --all` appears beside it, a LOW chain exists that the default did not
+  walk.
+- `reason: different islands -- no walk in any direction, at any
+  confidence, can connect them` — the strongest negative codegraph has, and
+  the only one that licenses "these cannot affect each other". It is
+  `islands`' own partition, so this report and that one can never disagree.
+
+LOW hops are excluded by default and included with `--all`, matching
+`impact` — and that one flag also governs the bare-name fan-out, which is
+LOW by construction and is not in the stored graph at all, so under `--all`
+a hop may run through `item.save()` and will name the bare name it used.
+`--hops` defaults to 6, not `impact`'s 3: this walk follows a single chain
+rather than a widening frontier, and on psf/requests a budget of 3 finds 51%
+of the connected pairs while 6 finds 99%.
 
 `codegraph islands` answers a question the other commands cannot: the
 global shape of the graph. It splits the revision's `CALLS`, `INHERITS`,
@@ -133,9 +190,9 @@ any side effect that newly became reachable. With no argument it diffs
 `merge-base(default branch, HEAD)` against the worktree, which is what you
 want when asked "what did this branch change".
 
-All of `resolve`, `impact`, `effects`, `islands`, `orphans` and `diff`
-accept `--path <dir>` to run against a different repository root, and
-`impact`/`effects`/`islands`/`orphans`/`diff` accept `--json` for
+All of `resolve`, `impact`, `effects`, `path`, `islands`, `orphans` and
+`diff` accept `--path <dir>` to run against a different repository root, and
+`impact`/`effects`/`path`/`islands`/`orphans`/`diff` accept `--json` for
 machine-readable output instead of the default text.
 
 ## The anti-pattern this displaces
@@ -223,6 +280,23 @@ the full set and how confident it is in each edge.
   `__main__` guard). `--limit N` (default 20) is a total budget
   across both groups, islands first, exactly as `impact` budgets dependents
   ahead of tests.
+- `path`'s summary reads `from: <id> · to: <id> · direction: forward ·
+  hops: 2 · confidence: HIGH · reverse: none · basis: shortest directed path
+  over CALLS, INHERITS, IMPLEMENTS, REFERENCES edges, LOW excluded, within 6
+  hops`. `direction` is `forward`, `reverse`, `both`, `same symbol`, or
+  `none`; `hops` and `confidence` describe the path in the group printed
+  first, and the *other* direction gets a field named after itself
+  (`reverse: none`, or `reverse: 3 hops`) so one number is never quietly
+  reporting two chains. When `direction` is `none` there are no rows, and
+  `reason` — plus `show_path`, when a flag would turn the answer into a
+  path — carries the whole report. A `path` group's rows are a **chain in
+  walk order**, not a ranking: the first row is the symbol that does the
+  reaching, each later row's `detail` reads `hop N, <KIND>, <CONFIDENCE>
+  confidence, call site <file:line>`, and the hop that sets the path's
+  confidence is marked `weakest hop`. A hop expanded from the bare-name
+  fan-out says so — `hop 2, CALLS via the bare name 'send', LOW
+  confidence` — because that hop is not an edge in the stored graph and
+  must not read as one.
 - `orphans`' summary reads `functions: 812 · test_callers_only: 280 ·
   candidates: 10 · name_referenced: 5 · reported: 5 · basis: ... ·
   caveat: ...` — the funnel, in order, so each filter's work is visible.

@@ -110,6 +110,7 @@ slower on a cold cache.
 | `codegraph resolve <name>` | Fuzzy-match a name (trailing name, qualname, or full node id) to node ids. |
 | `codegraph effects <symbol> [--json]` | Report every side-effect kind reachable from a symbol, each with a witness chain down to the causing `file:line`. |
 | `codegraph impact <symbol> [--hops N] [--limit N] [--all] [--json]` | Report the ranked dependents of a symbol — everything a change to it could break. |
+| `codegraph path <A> <B> [--hops N] [--all] [--json]` | Report how two symbols are connected: the shortest chain of edges between them, in whichever direction it runs, with each hop's kind, confidence and call site, and the path's own confidence — its weakest hop. Both directions are always checked and the one found is named. When there is none, the report distinguishes three answers that are not the same: no chain within `--hops` (and how many it would take), no directed chain in either direction, and the two being on different islands, which means no walk can ever connect them. |
 | `codegraph islands [--rev REV] [--limit N] [--json]` | Report the connected components of the revision's `CALLS`, `INHERITS`, `IMPLEMENTS` and `REFERENCES` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
 | `codegraph orphans [--rev REV] [--limit N] [--include-public] [--include-decorated] [--json]` | Find functions whose every recorded caller is a test — defined, tested, and never invoked by the code that was supposed to invoke it. Such a function is *not* a one-symbol island, precisely because its test calls it, so `islands` structurally cannot surface it. Candidates are private by name, undecorated, defined outside the test tree, and never mentioned by name anywhere in the source text — that last filter has no off switch, because a static call graph cannot see a callback handed to a library. Not a dead-code report (see below). |
 | `codegraph diff [<base>..<head>] [--json]` | Report what changed between two revisions by content hash, never by line number: symbols added/removed/changed, plus any side effect newly reachable. Defaults to `merge-base(default branch, HEAD)..WORKTREE` — "what has this branch changed so far." |
@@ -211,10 +212,82 @@ leaves nothing for either half of this report to find. Three of those five
 survivors were deliberate: two documented back-compat shims and an import
 probe whose docstring says test-only is the point.
 
-`resolve`, `impact`, and `effects` share one exit-code convention for
+### What `path` answers that `impact` cannot
+
+Every other query starts at one symbol and fans out. `path` starts at two,
+which is the position you are actually in when you suspect a coupling and
+cannot name the chain. The workaround — run `impact` on one and look for
+the other in the rows — fails in exactly the cases worth asking about: a
+long chain, a chain past `--hops`, or a row `--limit` crowded out.
+
+```
+$ codegraph path HTTPAdapter.send get_encoding_from_headers
+from: src/requests/adapters.py::HTTPAdapter.send · to: src/requests/utils.py::get_encoding_from_headers
+  · direction: forward · hops: 2 · confidence: HIGH · reverse: none
+  · basis: shortest directed path over CALLS, INHERITS, IMPLEMENTS, REFERENCES edges, LOW excluded, within 6 hops
+forward
+  src/requests/adapters.py::HTTPAdapter.send  src/requests/adapters.py:634  start
+  src/requests/adapters.py::HTTPAdapter.build_response  src/requests/adapters.py:365  hop 1, CALLS, HIGH confidence, call site src/requests/adapters.py:748
+  src/requests/utils.py::get_encoding_from_headers  src/requests/utils.py:569  hop 2, CALLS, HIGH confidence, call site src/requests/adapters.py:385
+```
+
+Direction is the answer rather than a detail: if A reaches B then editing B
+is the risky move, if B reaches A then editing A is, and `forward` always
+means the direction you wrote the arguments in. The direction that was *not*
+found is printed too (`reverse: none`), because that is what tells you the
+tool looked rather than leaving you to wonder.
+
+Each hop names its kind, since after `REFERENCES` and `IMPLEMENTS` landed
+"connected" means four different things, and its confidence, since a path is
+only as strong as its weakest hop — five HIGH hops and four HIGH plus one LOW
+are different answers, and the report marks which hop is the weak one so you
+know where to go and look. Every hop carries the `file:line` that makes it,
+the same clickable evidence `effects` gives, because `edges` already stores
+it.
+
+**"Not connected" is three different answers, and they are never collapsed
+into one:**
+
+```
+$ codegraph path HTTPAdapter.send get_encoding_from_headers --hops 1
+... direction: none · reason: no directed path within 1 hop · show_path: --hops 2 · basis: ...
+
+$ codegraph path Session.request get_encoding_from_headers
+... direction: none · reason: no directed path in either direction · show_path: --all · basis: ...
+
+$ codegraph path FlaskyStyle get_encoding_from_headers
+... direction: none · reason: different islands -- no walk in any direction, at any confidence, can connect them · basis: ...
+```
+
+The first is a budget you set, and the report says what budget would answer
+it. The second is a real negative over the edges it walked, with
+`show_path: --all` when a LOW chain exists that the default did not walk —
+the same "a count you cannot see is half an answer" rule as `impact`'s
+`show_hidden`. The third is the strongest statement this tool can make about
+two symbols, and it is not computed here: it is `islands`' own partition, so
+`path` and `islands` cannot come to disagree about the same pair. It is also
+consulted *last*, only once every walk `path` can perform has come back
+empty, so the strong claim is never printed over evidence against it.
+
+LOW hops are excluded by default and included with `--all`, matching
+`impact`. That one flag also governs the bare-name fan-out, which is LOW by
+construction and is not in the stored graph at all: with `--all` a path may
+run through `item.save()`, and the hop says so, naming the bare name it went
+through.
+
+`--hops` defaults to 6 rather than `impact`'s 3, because this walk follows
+one chain instead of a widening frontier and can afford to look further. On
+psf/requests, of 3,000 randomly sampled symbol pairs the 99 that are
+connected at all sit a median of 3 hops apart (mean 3.26, max 8); a budget of
+3 would find 51% of them and 6 finds 99%.
+
+`resolve`, `impact`, `effects` and `path` share one exit-code convention for
 resolving `<symbol>` to a node id: `0` = a single unambiguous match, `1` =
 nothing matched, `2` = more than one match (every candidate is printed; pick
-the right one and re-run with the full node id).
+the right one and re-run with the full node id). `path` applies it to each of
+its two arguments. The convention is about resolving a *name*, and nothing
+else — so a report saying the two symbols are not connected at all is still
+exit `0`, because that is an answer.
 
 `islands` and `orphans` take no symbol, so that convention does not apply
 to either: they exit `0` for a report — an empty one included, since "nothing

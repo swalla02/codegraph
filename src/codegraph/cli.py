@@ -17,6 +17,7 @@ from codegraph.query.effects import effects_report
 from codegraph.query.impact import impact_report
 from codegraph.query.islands import islands_report
 from codegraph.query.orphans import orphans_report
+from codegraph.query.path import DEFAULT_HOPS, path_report
 from codegraph.render import render_json, render_text
 from codegraph.resolve import find_symbol
 from codegraph.store import WORKTREE, Store
@@ -198,6 +199,72 @@ def _cmd_impact(args: argparse.Namespace) -> int:
             matches[0]["id"],
             max_hops=args.hops,
             limit=args.limit,
+            include_low=args.all,
+        )
+        print(render_json(report) if args.json else render_text(report))
+        return 0
+    finally:
+        store.close()
+
+
+def _one_symbol(store: Store, rev: str, name: str) -> tuple[str | None, int]:
+    """Resolve one name to one node id under the `0`/`1`/`2` convention
+    `resolve`, `impact` and `effects` share, reporting the failure on
+    stderr as they do: nothing matched is `1`, more than one match is `2`
+    with every candidate printed so the reader can re-run with a full id.
+
+    A helper because `path` takes two symbols and has to apply the
+    convention twice, and a rule stated twice in one function is a rule
+    that will eventually be stated two different ways.
+    """
+    matches = find_symbol(store, rev, name)
+    if not matches:
+        print(f"no symbol matching {name!r}", file=sys.stderr)
+        return None, 1
+    if len(matches) > 1:
+        print(f"ambiguous symbol {name!r}:", file=sys.stderr)
+        for row in matches:
+            print(f"  {row['id']}", file=sys.stderr)
+        return None, 2
+    return matches[0]["id"], 0
+
+
+def _cmd_path(args: argparse.Namespace) -> int:
+    """Report how two symbols are connected, in whichever direction, or
+    which of the three ways they are not.
+
+    Two symbols, so the resolving convention applies to each of them; the
+    exit code is about resolving a name and nothing else, which is why a
+    report saying the two are not connected at all still exits `0`. "They
+    are on different islands" is an answer, and a command that signalled
+    failure for it would be unusable in the `&&` chain an agent writes.
+    """
+    root = Path(args.path).resolve()
+    store, indexer = open_workspace(root)
+    try:
+        if args.hops < 1:
+            # The same refusal as `impact`, for the same reason: a walk
+            # that never runs reports "no path" at exit 0, which reads as a
+            # checked answer and is not one.
+            print(f"--hops must be >= 1 (got {args.hops})", file=sys.stderr)
+            return 1
+        try:
+            indexer.reconcile(args.rev)
+        except gitio.GitError:
+            print(f"revision not found: {args.rev}", file=sys.stderr)
+            return 1
+        from_id, code = _one_symbol(store, args.rev, args.a)
+        if from_id is None:
+            return code
+        to_id, code = _one_symbol(store, args.rev, args.b)
+        if to_id is None:
+            return code
+        report = path_report(
+            store,
+            args.rev,
+            from_id,
+            to_id,
+            max_hops=args.hops,
             include_low=args.all,
         )
         print(render_json(report) if args.json else render_text(report))
@@ -453,6 +520,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     impact_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     impact_parser.set_defaults(handler=_cmd_impact)
+
+    path_parser = subparsers.add_parser(
+        "path",
+        help="Report how two symbols are connected, in either direction",
+        description=(
+            "Find the shortest chain of CALLS, INHERITS, IMPLEMENTS and REFERENCES"
+            " edges connecting two symbols, in whichever direction it runs, with"
+            " each hop's kind, confidence and call site -- and the path's own"
+            " confidence, which is its weakest hop. Both directions are always"
+            " checked and the one found is named. When there is no path, the report"
+            " says which of three things is true: no chain within --hops (and how"
+            " many it would take), no directed chain in either direction, or the two"
+            " are on different islands, which means no walk can ever connect them."
+        ),
+    )
+    path_parser.add_argument("a", metavar="A", help="Node id, qualname, or trailing name")
+    path_parser.add_argument("b", metavar="B", help="Node id, qualname, or trailing name")
+    path_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    path_parser.add_argument("--rev", default=WORKTREE, help="Revision to query")
+    path_parser.add_argument(
+        "--hops",
+        type=int,
+        default=DEFAULT_HOPS,
+        help=(
+            f"Maximum hops to walk (default: {DEFAULT_HOPS}). Higher than"
+            " `impact`'s, because this walk follows one chain rather than a"
+            " widening frontier"
+        ),
+    )
+    path_parser.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Walk LOW-confidence hops too, including the bare-name fan-out that is"
+            " not in the stored graph at all -- matching `impact`'s flag"
+        ),
+    )
+    path_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    path_parser.set_defaults(handler=_cmd_path)
 
     islands_parser = subparsers.add_parser(
         "islands",

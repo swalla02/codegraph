@@ -7,6 +7,8 @@ import pytest
 from codegraph.ambiguity import Ambiguity
 from codegraph.indexer import GitTreeSource, Indexer
 from codegraph.query.impact import impact_report
+from codegraph.query.islands import connected_components
+from codegraph.query.path import path_report
 from codegraph.store import WORKTREE, Store
 from tests.conftest import git
 
@@ -763,3 +765,37 @@ def test_a_body_only_edit_keeps_the_protocol_and_value_edges_a_cold_build_has(re
     store.close()
     assert [edge for edge in incremental["edges"] if edge[2] in ("IMPLEMENTS", "REFERENCES")]
     assert incremental == cold_dump(repo, WORKTREE)
+
+
+def test_path_never_calls_a_pair_unconnectable_that_it_can_itself_connect(repo, write):
+    """`path`'s strongest negative -- "different islands, so no walk can
+    ever connect them" -- is `islands`' partition, not a second opinion.
+    The two expand the bare-name fan-out differently, though: the partition
+    routes it through per-name hubs built from `Ambiguity.by_name`, while
+    the walk expands it pointwise through `Ambiguity.candidates`, which
+    also offers the `__init__` that instantiating a candidate class runs.
+    A class fan-out is exactly where those disagree.
+
+    So the report must never print the strong claim over its own evidence.
+    Here the partition really does put the two in separate components, and
+    `--all` really does connect them in one hop: whichever way the flag
+    goes, the answer has to be the walk's.
+    """
+    write("a.py", "class Widget:\n    def __init__(self):\n        self.x = 1\n")
+    write("pkg/b.py", "class Widget:\n    def __init__(self):\n        self.y = 2\n")
+    write("c.py", "def build(box):\n    return box.Widget()\n", commit="fanout")
+    store = Store.open(repo)
+    Indexer(repo, store, GitTreeSource(repo)).reconcile("HEAD")
+
+    components = connected_components(store, "HEAD", Ambiguity(store, "HEAD"))
+    assert components.find("c.py::build") != components.find("a.py::Widget.__init__"), (
+        "the fixture stopped exercising the corner this test is about"
+    )
+
+    walked = path_report(store, "HEAD", "c.py::build", "a.py::Widget.__init__", include_low=True)
+    assert walked.summary["direction"] == "forward"
+
+    default = path_report(store, "HEAD", "c.py::build", "a.py::Widget.__init__")
+    assert "different islands" not in default.summary["reason"]
+    assert default.summary["show_path"] == "--all"
+    store.close()

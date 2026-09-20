@@ -34,6 +34,7 @@ def test_skill_documents_every_shipped_command():
         "codegraph resolve",
         "codegraph impact",
         "codegraph effects",
+        "codegraph path",
         "codegraph orphans",
         "codegraph diff",
     ]:
