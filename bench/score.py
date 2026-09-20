@@ -127,8 +127,8 @@ class StaticGraph:
     Scoring `edges` alone grades the storage layer rather than the resolver:
     an all-LOW fan-out is stored once in `unresolved` and expanded when a
     query asks, so those targets are answers codegraph gives while being
-    rows it never wrote. `tests/test_accuracy.py` performs the same union
-    for the same reason.
+    rows it never wrote. `tests/test_resolution_rules.py` performs the same
+    union for the same reason.
     """
 
     #: (src, dst) -> the best confidence any source of that edge carries.
@@ -227,6 +227,68 @@ class Report:
         them than of these.
         """
         return self.observed_high / self.testable_high if self.testable_high else 1.0
+
+
+@dataclass(frozen=True)
+class Floor:
+    """What a target's score must not fall below (#39).
+
+    These are effectiveness floors, and they only mean anything because they
+    were read off a measurement: each one sits a little under a number
+    `bench/run.py` actually printed, with enough headroom that ordinary drift
+    in the target repository does not trip it and a resolution regression
+    does. They are NOT aspirations, and they are not comparable between
+    targets -- see `bench/run.py`'s `TARGETS`, where the values and the run
+    they came from are recorded.
+
+    Three metrics rather than one, because recall on its own is the least
+    sensitive of the three. #38 moved 158 flask edges from a LOW bare-name
+    fan-out to a resolved HIGH answer and recall did not move at all: the
+    fan-out already contained the right target, buried among the wrong ones.
+    What moved was the tier it was claimed at, and the tier is what a caller
+    of `impact` reads. A floor that only watched recall would sleep through
+    losing that again.
+    """
+
+    recall: float
+    recall_high_medium: float
+    conditional_precision: float
+    #: Where the numbers came from: the run, its date, and the commit of
+    #: codegraph and of the target it measured. Prose, for a reader deciding
+    #: whether a failure is a regression or a stale floor.
+    measured: str = ""
+
+
+@dataclass(frozen=True)
+class FloorCheck:
+    metric: str
+    value: float
+    floor: float
+
+    @property
+    def ok(self) -> bool:
+        return self.value >= self.floor
+
+    def __str__(self) -> str:
+        verdict = "ok" if self.ok else "BELOW FLOOR"
+        return f"{self.metric:<22} {self.value:.2f}  floor {self.floor:.2f}  {verdict}"
+
+
+def check_floor(report: Report, floor: Floor) -> list[FloorCheck]:
+    """Every floored metric of `report`, checked, in report order.
+
+    Every metric is returned, passing or not, so the caller can print the
+    whole row: a floor that is only visible when it fails tells a reader
+    nothing about how much headroom is left, and headroom is what says
+    whether a number is drifting towards the floor.
+    """
+    return [
+        FloorCheck("recall", report.recall, floor.recall),
+        FloorCheck("recall at HIGH/MEDIUM", report.recall_high_medium, floor.recall_high_medium),
+        FloorCheck(
+            "conditional precision", report.conditional_precision, floor.conditional_precision
+        ),
+    ]
 
 
 def read_static_graph(store, rev: str) -> StaticGraph:
@@ -495,10 +557,13 @@ __all__ = [
     "ANONYMOUS_SCOPES",
     "CALLABLE_KINDS",
     "MISS_CAUSES",
+    "Floor",
+    "FloorCheck",
     "Partition",
     "Report",
     "StaticGraph",
     "Trace",
+    "check_floor",
     "classify",
     "collapse_anonymous",
     "format_report",
