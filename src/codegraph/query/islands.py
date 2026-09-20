@@ -41,6 +41,16 @@ and #26 for the annotation treadmill that parks). `ENV_READ` rides along
 in the row as a legend entry -- "this region is lit up by a variable" --
 but is not itself a boundary and never makes an island `explained`.
 
+*A run was watched entering it.* Since #56 a revision can carry an
+imported trace, and a member of the island having actually executed is the
+only entry on this list that is evidence rather than counter-evidence:
+everything else here says "here is a way something could reach this", while
+this one says "something did". It is reported as its own clause rather than
+among the implicit mechanisms, because it is not an invocation mechanism at
+all -- it is an observation, and calling it one would be the same
+flattening of evidence into inference #56 exists to undo. A revision with no
+trace has no such islands and reads exactly as it did before.
+
 *Nothing codegraph recognises reaches it.* The remainder, counted as
 `unexplained`. That is the strongest claim available and it is still a
 statement about this tool: no resolved call, and no implicit-invocation
@@ -129,6 +139,8 @@ from codegraph.config import Config
 from codegraph.render import Group, Report, Row, budget
 from codegraph.resolve import DEPENDENCY_KINDS, IMPLEMENTS, INHERITS, module_for_path
 from codegraph.store import Store
+from codegraph.trace import observed_nodes
+from codegraph.trace import summary as trace_summary
 from codegraph.uncertainty import UNEXPLAINED_ISLAND, unknown
 
 #: How many of an island's members a single row names: the row's `id` is
@@ -155,6 +167,13 @@ OVERRIDE = "override"  # same name on both ends of an INHERITS/IMPLEMENTS link
 NESTED = "nested"  # defined inside a function that can pass it as a value
 IMPORT = "import"  # its dotted name is imported somewhere in this revision
 MECHANISMS = (ENTRY, DUNDER, DECORATOR, TEST, OVERRIDE, NESTED, IMPORT)
+
+#: Members of an island a trace was seen executing. Deliberately NOT in
+#: `_MECHANISMS`: those are ways a symbol could be reached without a call
+#: site, and this is not a way at all -- it is the fact that it was. It is
+#: still enough to explain an island, and it is the strongest explanation
+#: the report has.
+TRACED = "traced"
 
 #: The effect kinds a row reports, in display order. `NETWORK` is the only
 #: one that marks a boundary or makes an island explained; `ENV_READ` is
@@ -352,6 +371,7 @@ def _describe(
     files: int,
     mechanisms: set[str],
     boundary: set[str],
+    traced: int = 0,
 ) -> str:
     """The `detail` column for one island's row.
 
@@ -382,6 +402,10 @@ def _describe(
     kinds = [kind for kind in _BOUNDARY_KINDS if kind in boundary]
     if kinds:
         detail += f"; boundary: {', '.join(kinds)}"
+    if traced:
+        # Last, and phrased as the observation it is: not "something could
+        # reach this" but "a run went in here".
+        detail += f"; {TRACED}: {_plural(traced, 'member')} seen running"
     return detail
 
 
@@ -407,6 +431,9 @@ class _Labelled:
     boundaries: dict[str, set[str]]
     #: node id -> how many distinct nodes reach it, for picking hubs.
     fan_in: Counter
+    #: component root -> how many of its members an imported run was seen
+    #: entering. Empty on every revision with no trace (#56).
+    traced: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -430,13 +457,24 @@ class IslandLabel:
     missing: tuple[str, ...]
     #: Process-boundary effect kinds on the island, in `_BOUNDARY_KINDS` order.
     boundary: tuple[str, ...]
+    #: How many of the island's members an imported run was seen entering;
+    #: 0 when there is no trace (#56).
+    traced: int = 0
 
     @property
     def explained(self) -> bool:
         """Exactly the condition `islands`' `unexplained` counts, negated:
-        a recognised mechanism, or a `NETWORK` boundary. Computed here so
-        the two cannot come to disagree about one island."""
-        return bool(self.found) or NETWORK in self.boundary
+        a recognised mechanism, a `NETWORK` boundary, or a run watched
+        entering the island. Computed here so the two cannot come to
+        disagree about one island.
+
+        The trace term is what closes #55's own loop. `NEXT_ACTION` for
+        `unexplained_island` says a runtime trace is the only thing that
+        can confirm the symbol is reached; once somebody has taken that
+        action, the entry has to stop being raised, or the report would go
+        on asking for evidence it has already been given.
+        """
+        return bool(self.found) or NETWORK in self.boundary or bool(self.traced)
 
 
 def island_label(store: Store, rev: str, node_id: str, config: Config | None = None) -> IslandLabel:
@@ -459,6 +497,7 @@ def island_label(store: Store, rev: str, node_id: str, config: Config | None = N
         found=found,
         missing=tuple(name for name in MECHANISMS if name not in found),
         boundary=tuple(kind for kind in _BOUNDARY_KINDS if kind in boundary),
+        traced=labelled.traced.get(root, 0),
     )
 
 
@@ -523,7 +562,8 @@ def _labelled(store: Store, rev: str, config: Config | None = None) -> _Labelled
     # reaching into it -- `app = create_app()`, a registration call, or the
     # `main()` inside a `__main__` guard. It is not a member (see the module
     # docstring), which is exactly why the island it connects to needed a
-    # label: `bench/tracer.py::main` in this repository was reported as a
+    # label: the `main` of `codegraph.tracer` in this repository was
+    # reported as a
     # singleton with nothing recognised reaching it, when the edge from its
     # own module node was sitting in the graph the whole time. The claim is
     # the strongest in the list -- it is a resolved call, not an inference
@@ -547,6 +587,17 @@ def _labelled(store: Store, rev: str, config: Config | None = None) -> _Labelled
                 node_id = methods[class_id][leaf]
                 mechanisms.setdefault(components.find(node_id), set()).add(OVERRIDE)
 
+    # The imported run, by component. A symbol the trace saw executing may
+    # have no edge at all -- a framework dispatches to it from outside this
+    # tree -- which is exactly the island this report could never say
+    # anything about. Attributed by root like the boundaries above, so an
+    # observation on a module node still lands on the island it connects.
+    traced: dict[str, int] = {}
+    for node_id in observed_nodes(store, rev):
+        root = components.find(node_id)
+        if root in grouped:
+            traced[root] = traced.get(root, 0) + 1
+
     # Attributed by component root, not by membership: a direct effect can
     # sit on a `path::<module>` node, which carries connectivity but is
     # never a member. `direct=1` only -- a propagated effect is reached over
@@ -559,7 +610,7 @@ def _labelled(store: Store, rev: str, config: Config | None = None) -> _Labelled
     ):
         boundaries.setdefault(components.find(row["node_id"]), set()).add(row["kind"])
 
-    return _Labelled(components, members, grouped, mechanisms, boundaries, fan_in)
+    return _Labelled(components, members, grouped, mechanisms, boundaries, fan_in, traced)
 
 
 def islands_report(
@@ -571,11 +622,12 @@ def islands_report(
     labelled = _labelled(store, rev, config)
     members, grouped = labelled.members, labelled.grouped
     mechanisms, boundaries, fan_in = labelled.mechanisms, labelled.boundaries, labelled.fan_in
+    traced = labelled.traced
 
     island_rows: list[Row] = []
     singleton_rows: list[Row] = []
     largest = 0
-    implicit_count = network_count = unexplained_count = 0
+    implicit_count = network_count = unexplained_count = traced_count = 0
     for root, island in grouped.items():
         size = len(island)
         largest = max(largest, size)
@@ -588,12 +640,14 @@ def islands_report(
 
         marks = mechanisms.get(root, set())
         boundary = boundaries.get(root, set())
+        seen_running = traced.get(root, 0)
         implicit_count += bool(marks)
         network_count += NETWORK in boundary
-        unexplained_count += not marks and NETWORK not in boundary
+        traced_count += bool(seen_running)
+        unexplained_count += not marks and NETWORK not in boundary and not seen_running
 
         files = len({members[node_id][0] for node_id in island})
-        detail = _describe(size, files, marks, boundary)
+        detail = _describe(size, files, marks, boundary, seen_running)
         named = rest[: _HUBS_PER_ROW - 1]
         if size > 1 and named:
             detail += f"; also {', '.join(named)}"
@@ -639,10 +693,21 @@ def islands_report(
         # how many islands can this tool say nothing at all".
         "implicit": implicit_count,
         "network": network_count,
+        # Islands with a member an imported run was seen entering; 0 on
+        # every revision with no trace, which is every revision until
+        # somebody imports one.
+        "traced": traced_count,
         "unexplained": unexplained_count,
         # Says what the partition was computed from, so a row is read as
         # "these share no call edge" and never as "nothing reaches this".
         "basis": f"undirected {', '.join(DEPENDENCY_KINDS)} edges",
+        # ...and whether anything beyond the text was available to say it
+        # with. "Nothing reaches this" is a far stronger claim about a
+        # revision whose test suite has been watched running than about one
+        # where the only witness is the source code, and a reader cannot
+        # weigh an `unexplained` count without knowing which they hold. So
+        # this field is printed either way, `none` included.
+        "trace": trace_summary(store, rev),
     }
 
     return Report(

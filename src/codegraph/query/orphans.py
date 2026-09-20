@@ -35,7 +35,13 @@ callers are all tests is a much stronger position -- something DOES call
 it, codegraph found the call sites, and every one of them is a test.
 Callers include the bare-name fan-out (`ambiguity.py`), because a
 production reference the resolver could not pin down is still counter-
-evidence and must not be discarded for being LOW.
+evidence and must not be discarded for being LOW. Since #56 they include
+the callers an imported run was watched making, which is the half of this
+question a static call graph is worst at: a helper the framework reaches is
+exactly the shape that looks unwired. A trace can therefore only take rows
+OFF this report, never add one -- and the summary says whether there was
+one, because an absence found with a run behind it is a much stronger
+finding than the same absence found without.
 
 *Private by name.* A public function called only by tests is very often the
 package's public surface, called by code that is not in this repository at
@@ -101,6 +107,7 @@ from codegraph.config import Config
 from codegraph.query.islands import is_test_path
 from codegraph.render import Group, Report, Row, budget
 from codegraph.store import Store
+from codegraph.trace import summary as trace_summary
 
 #: How many of a candidate's test callers a row names before falling back to
 #: a count. The reviewer's first move is to open the test and see what it
@@ -401,6 +408,12 @@ def orphans_report(
         "name_referenced": len(candidates) - len(rows),
         "reported": len(rows),
         "basis": BASIS,
+        # Printed whether or not there is one, for the reason `islands`
+        # prints it: every row here is an absence, and how much an absence
+        # is worth depends entirely on how hard it was looked for. With a
+        # trace, "no caller outside the test tree" also means no run was
+        # seen making one.
+        "trace": trace_summary(store, rev),
         "caveat": CAVEAT,
     }
     return Report(

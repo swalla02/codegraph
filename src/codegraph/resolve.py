@@ -57,7 +57,21 @@ def weaker(a: str, b: str) -> str:
     return a if CONFIDENCE_RANK[a] <= CONFIDENCE_RANK[b] else b
 
 
-PROVENANCE = "static"
+#: Where an edge comes from, which is a different axis from `confidence`
+#: and must not be collapsed into it.
+#:
+#: `confidence` answers "how sure is the resolver that this reference means
+#: that symbol" -- a question about reading the text. Provenance answers one
+#: the resolver cannot ask at all: "did anyone see this happen". A LOW static
+#: edge a run confirms is, in fact, certain, and the only way to say that is
+#: to keep both facts.
+#:
+#: `STATIC` is everything this module writes: it reads source and deduces.
+#: `RUNTIME` is written by `trace.project` from an imported observation, and
+#: is the only mechanism that reaches framework dispatch, `visit_*` name
+#: lookup and `getattr` (#45, #39) -- which no amount of resolver work will,
+#: because the name is not in the text to be read.
+STATIC, RUNTIME = "static", "runtime"
 
 #: The kinds of edge this resolver writes.
 #:
@@ -133,7 +147,7 @@ def is_external_call(ref: ParsedRef, ctx: ResolveContext) -> bool:
     and the module it names is nowhere in the tree. Nothing in this graph can
     be the callee, because the graph never parses site-packages or the standard
     library -- so projecting `main` onto the repository's own `main` functions
-    is not a weak answer, it is a wrong one. `bench/tracer.py`'s own
+    is not a weak answer, it is a wrong one. `codegraph.tracer`'s own
     `pytest.main(...)` call reported three such candidates; `json.dumps(x)`
     with a single repo `dumps` became a MEDIUM edge. See #47.
 
@@ -1591,9 +1605,7 @@ def resolve_revision(
                 )
                 continue
             for node_id, confidence in hits:
-                edge_rows.append(
-                    (rev, src, node_id, INHERITS, confidence, PROVENANCE, path, ref.line)
-                )
+                edge_rows.append((rev, src, node_id, INHERITS, confidence, STATIC, path, ref.line))
                 # Only a certain link feeds the MRO walk, which claims HIGH.
                 # A weaker one still gets its edge, and a `self.X` that misses
                 # the walk falls through to the repo-wide name match anyway.
@@ -1642,7 +1654,7 @@ def resolve_revision(
                         protocol_id,
                         IMPLEMENTS,
                         MEDIUM,
-                        PROVENANCE,
+                        STATIC,
                         implementer_path,
                         line_start.get(implementer, 0),
                     )
@@ -1682,7 +1694,7 @@ def resolve_revision(
             src = _source_id(ref, table, path)
             for node_id, confidence in resolver.resolve_call(ref, ctx):
                 edge_rows.append(
-                    (rev, src, node_id, REFERENCES, confidence, PROVENANCE, path, ref.line)
+                    (rev, src, node_id, REFERENCES, confidence, STATIC, path, ref.line)
                 )
 
     # `Cls()` -> `Cls.__init__` is the same lookup for every call site that
@@ -1710,7 +1722,7 @@ def resolve_revision(
                 )
                 continue
             for node_id, confidence in with_constructors(hits, table, bases, constructor_cache):
-                edge_rows.append((rev, src, node_id, CALLS, confidence, PROVENANCE, path, ref.line))
+                edge_rows.append((rev, src, node_id, CALLS, confidence, STATIC, path, ref.line))
             if is_builtin_call(ref):
                 # Recorded, but not as a gap. A builtin is a reference the
                 # resolver understood and deliberately did not link to a repo
@@ -1748,7 +1760,13 @@ def resolve_revision(
 
     by_reason = "SELECT COUNT(*) AS n FROM unresolved WHERE rev=? AND reason=?"
     return ResolveStats(
-        edges=total("SELECT COUNT(*) AS n FROM edges WHERE rev=?"),
+        # STATIC only, and deliberately. `edges` can also hold the rows
+        # `trace.project` writes from an observed run, and this number is
+        # what the resolver produced -- folding an imported observation into
+        # it would make "edges" mean two different things depending on
+        # whether somebody had run the program. The observed rows are
+        # counted separately, by the pass that writes them.
+        edges=total("SELECT COUNT(*) AS n FROM edges WHERE rev=? AND provenance=?", STATIC),
         unresolved=total(by_reason, UNKNOWN),
         ambiguous=total(by_reason, AMBIGUOUS),
     )

@@ -1,10 +1,20 @@
-"""Record the call edges a test suite ACTUALLY makes, as ground truth (#35).
+"""Record the call edges a program ACTUALLY makes (#35), as evidence (#56).
 
-Runs inside the *target* repository's virtualenv, so it imports nothing from
-codegraph and depends on nothing but the stdlib and pytest. Invoked by
-`bench/run.py`:
+**This file imports nothing from codegraph and never may.** It runs inside
+the *target* program's own virtualenv -- which has codegraph installed only
+by coincidence, if at all -- so it depends on the standard library and on
+pytest, and is invoked by path rather than as a module:
 
-    python bench/tracer.py --root <repo> --out edges.json -- <pytest args>
+    python .../codegraph/tracer.py --root <repo> --out trace.json -- <pytest args>
+
+`tests/test_trace.py` pins that property, because the failure it prevents is
+silent in exactly the environment nobody tests in.
+
+It ships inside the package rather than beside the benchmark because a trace
+is no longer only a benchmark input: `codegraph trace <file>` imports what
+this writes, and a tool whose evidence can only be produced from a checkout
+of the tool is a tool that produces no evidence. `bench/run.py` runs this
+same file.
 
 Two things here were expensive to discover and must not be "simplified":
 
@@ -21,7 +31,9 @@ Two things here were expensive to discover and must not be "simplified":
   sits between them.
 
 Emitted node ids are codegraph's `path::qualname` form, with `path`
-repo-relative and POSIX-separated. `code.co_qualname` aligns with what
+repo-relative and POSIX-separated -- which is what lets `trace.import_trace`
+match them against a revision's `nodes` without knowing anything about where
+the run happened. `code.co_qualname` aligns with what
 `parse.py` records, `<locals>` segments for nested functions included.
 """
 
@@ -37,7 +49,7 @@ TOOL_ID = 3
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="bench/tracer.py")
+    parser = argparse.ArgumentParser(prog="codegraph/tracer.py")
     parser.add_argument("--root", required=True, help="Target repository root")
     parser.add_argument("--out", required=True, help="Where to write the trace JSON")
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER)

@@ -67,6 +67,12 @@ def gc(store: Store, keep_revs: set[str]) -> int:
     time that blob's content is seen; it never invalidates an existing
     answer.
 
+    Neither is the imported run a revision may hold (`trace_runs` and its
+    tables). Layer 1 is a cache and can be rebuilt from the tree; a trace is
+    evidence, and the only way to get it back is to run the program again.
+    Pruning it to save a few thousand rows would be trading something
+    irreplaceable for something free.
+
     `keep_revs` empty is well-defined, not accidental: nothing is retained,
     so every Layer 1 row is unreferenced and gets removed.
 

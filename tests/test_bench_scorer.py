@@ -241,3 +241,40 @@ def _report(*, recall: float, recall_high_medium: float, conditional_precision: 
         testable_high=testable_high,
         observed_high=round(conditional_precision * testable_high),
     )
+
+
+# -- #56: the benchmark must not be handed its own answer --------------------
+
+
+def test_the_scorer_reads_only_what_the_resolver_wrote(tmp_path):
+    """A revision carrying an imported trace projects those observations
+    into `edges` as `runtime` rows. Scoring them would compare the trace
+    against itself: every observed call found, recall 1.00, and a number
+    that says nothing about the resolver. `read_static_graph` filters on
+    provenance, and this is the test that keeps it filtering.
+    """
+    from bench.score import read_static_graph
+
+    from codegraph.store import Store
+
+    store = Store.open(tmp_path)
+    connection = store.connection
+    connection.execute(
+        "INSERT INTO nodes(rev, id, path, qualname, kind, line_start, line_end,"
+        " body_hash, name_binding) VALUES('r', 'm.py::f', 'm.py', 'f', 'function',"
+        " 1, 2, 'h', 'live')"
+    )
+    connection.executemany(
+        "INSERT INTO edges(rev, src, dst, kind, confidence, provenance, callsite_path,"
+        " callsite_line) VALUES(?,?,?,?,?,?,?,?)",
+        [
+            ("r", "m.py::a", "m.py::f", "CALLS", "HIGH", "static", "m.py", 3),
+            ("r", "m.py::b", "m.py::f", "CALLS", "HIGH", "runtime", "m.py", 1),
+        ],
+    )
+    connection.commit()
+
+    graph = read_static_graph(store, "r")
+    assert ("m.py::a", "m.py::f") in graph.edges
+    assert ("m.py::b", "m.py::f") not in graph.edges
+    store.close()

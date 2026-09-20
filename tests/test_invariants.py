@@ -27,7 +27,13 @@ def dump_graph(store, rev):
         "edges": sorted(
             tuple(row)
             for row in connection.execute(
-                "SELECT src, dst, kind, confidence FROM edges WHERE rev=?", (rev,)
+                # `provenance` is in the projection because a trace is an
+                # input to materialization like any other (#56): an
+                # incremental pass that kept a stale observation, or dropped
+                # a live one, is exactly the kind of divergence this net is
+                # for.
+                "SELECT src, dst, kind, confidence, provenance FROM edges WHERE rev=?",
+                (rev,),
             )
         ),
         "unresolved": sorted(

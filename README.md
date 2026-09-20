@@ -391,9 +391,10 @@ no node in this graph is its target. Each entry says which it is in a
 **An empty `unknowns` means "no hole this tool can name", never "this answer
 is complete."** A name assembled at runtime leaves nothing for any of this
 to find. What shrinks the gap is observing a run, which is what
-`bench/tracer.py` does — and whether trace data should enter the graph as a
-fourth provenance is a separate question from making today's ignorance
-addressable.
+`codegraph.tracer` records and `codegraph trace` imports — see "What a trace
+buys, and what it costs" below. An `unexplained_island` entry names the one
+hole a trace closes outright: once a run has been watched entering the
+symbol, the entry is no longer raised.
 
 `resolve`, `impact`, `effects`, `path` and `unknowns` share one exit-code
 convention for resolving `<symbol>` to a node id: `0` = a single unambiguous match, `1` =

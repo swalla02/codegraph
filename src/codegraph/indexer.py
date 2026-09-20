@@ -23,8 +23,10 @@ from codegraph.effects.catalog import Catalog
 from codegraph.effects.detect import detect_direct
 from codegraph.effects.propagate import propagate
 from codegraph.parse import MODULE_SCOPE, PARSER_VERSION, parse_blob
-from codegraph.resolve import resolve_revision
+from codegraph.resolve import RUNTIME, STATIC, resolve_revision
 from codegraph.store import WORKTREE, Store
+from codegraph.trace import project as project_trace
+from codegraph.trace import trace_identity, traced_paths
 
 #: The modules whose *source* decides what a materialized revision contains,
 #: relative to the package directory.
@@ -48,6 +50,10 @@ from codegraph.store import WORKTREE, Store
 #: - `effects/catalog.py` is in even though `Catalog.fingerprint()` is
 #:   already folded in below -- that pins the *rules*, this pins the code
 #:   that matches them (precedence, confidence derivation).
+#: - `trace.py` is in for the same reason `resolve.py` is: it decides a
+#:   subset of the `edges` rows -- every one with `runtime` provenance --
+#:   and a change to which observations it keeps, or to the tier they claim,
+#:   is a change to the stored graph that no file in the tree reflects.
 #: - `indexer.py` is in because `_materialize_nodes` writes `nodes` and
 #:   `_narrowable` decides how much of a revision a reconcile may keep. It
 #:   also means an edit to THIS LIST invalidates, which a list that exempted
@@ -76,6 +82,7 @@ RESOLVER_SOURCES: tuple[str, ...] = (
     "effects/propagate.py",
     "indexer.py",
     "resolve.py",
+    "trace.py",
 )
 
 _PACKAGE = Path(__file__).resolve().parent
@@ -136,6 +143,10 @@ class IndexStats:
     edges: int = 0
     unresolved: int = 0
     ambiguous: int = 0
+    #: `edges` rows written from an imported trace rather than deduced.
+    #: Counted apart from `edges` so that neither number changes meaning
+    #: depending on whether anybody has run the program.
+    observed_edges: int = 0
 
 
 class TreeSource(Protocol):
@@ -241,7 +252,7 @@ class Indexer:
         removed = set(stored) - set(tree)
 
         catalog = Catalog.load(self.config)
-        fingerprint = self._fingerprint(catalog)
+        fingerprint = self._fingerprint(rev, catalog)
         fingerprint_ok = self._is_current(rev, fingerprint)
         if not dirty and not removed and fingerprint_ok:
             # Nothing in the tree moved and nothing outside it did either, so
@@ -268,7 +279,7 @@ class Indexer:
 
             # `narrow` is the set of paths this reconcile may confine itself to,
             # or None to rebuild the whole revision. See `_narrowable`.
-            narrow = self._narrowable(tree, stored, dirty, removed, fingerprint_ok)
+            narrow = self._narrowable(rev, tree, stored, dirty, removed, fingerprint_ok)
             if narrow is None:
                 connection.execute("DELETE FROM nodes WHERE rev=?", (rev,))
                 shadowed = self._materialize_nodes(rev, tree)
@@ -307,6 +318,14 @@ class Indexer:
 
             resolved = resolve_revision(self.store, rev, self.config, only_paths=narrow)
 
+            # An observed run, folded in before effects are computed so that
+            # they propagate along a call a trace saw and the resolver did
+            # not -- which is the whole of what a trace buys downstream of
+            # `impact` (#56). It is a no-op, down to the rows it deletes,
+            # for a revision with no trace: this feature is additive or it
+            # is a regression.
+            observed = project_trace(self.store, rev)
+
             # Effect detection and propagation close out the same
             # transaction: a revision is never visible with edges but
             # stale (or missing) effects.
@@ -329,10 +348,12 @@ class Indexer:
             edges=resolved.edges,
             unresolved=resolved.unresolved,
             ambiguous=resolved.ambiguous,
+            observed_edges=observed.edges,
         )
 
     def _narrowable(
         self,
+        rev: str,
         tree: dict[str, str],
         stored: dict[str, str],
         dirty: set[str],
@@ -374,6 +395,14 @@ class Indexer:
             return None
         if not dirty:
             return set()
+        # An edit to a file the trace named retires the observations about
+        # it, and that retirement is not visible from the static edges a
+        # narrowed pass compares. A dropped observation of `a -> b` is filed
+        # under `a`'s path but can be caused by editing `b`'s file, which a
+        # pass narrowed to `b` would never look at -- so the effects derived
+        # from it would survive their evidence. Rare and cheap to refuse.
+        if dirty & traced_paths(self.store, rev):
+            return None
         for path in dirty:
             before, after = stored[path], tree[path]
             if self._symbol_signature(before) != self._symbol_signature(after):
@@ -482,7 +511,7 @@ class Indexer:
             (rev,),
         ).fetchone()["n"]
 
-    def _fingerprint(self, catalog: Catalog) -> str:
+    def _fingerprint(self, rev: str, catalog: Catalog) -> str:
         """Digest of everything the graph depends on that is NOT in the tree.
 
         A reconcile is allowed to skip its work when the tree is unchanged, so
@@ -510,6 +539,15 @@ class Indexer:
             resolver_fingerprint(),
             catalog.fingerprint(),
             ",".join(self.config.source_roots),
+            # The one component that is about this revision rather than
+            # about the installation: the identity of the run imported for
+            # it, or "" when there is none (#56). Importing a trace changes
+            # no file in the tree and changes edges, effects and every
+            # report derived from them -- exactly the shape of staleness
+            # this digest exists to prevent, and the reason the import
+            # itself writes no `edges` row: the next reconcile has to see
+            # work to do, and this is what tells it so.
+            trace_identity(self.store, rev),
         )
         return hashlib.blake2b("\x00".join(parts).encode(), digest_size=16).hexdigest()
 
@@ -530,8 +568,8 @@ class Indexer:
         connection = self.store.connection
         shas = set(tree.values())
 
-        def count(sql: str) -> int:
-            return connection.execute(sql, (rev,)).fetchone()["n"]
+        def count(sql: str, *extra: str) -> int:
+            return connection.execute(sql, (rev, *extra)).fetchone()["n"]
 
         return IndexStats(
             paths_total=len(tree),
@@ -548,7 +586,13 @@ class Indexer:
                 " ON t.blob_sha = b.blob_sha"
                 " WHERE t.rev=? AND b.shadow_index IS NOT NULL AND b.conditional=0"
             ),
-            edges=count("SELECT COUNT(*) AS n FROM edges WHERE rev=?"),
+            # Split by provenance for the same reason `ResolveStats` counts
+            # only the static rows: "edges" means what the resolver deduced,
+            # whether or not a run has been imported on top of it.
+            edges=count("SELECT COUNT(*) AS n FROM edges WHERE rev=? AND provenance=?", STATIC),
+            observed_edges=count(
+                "SELECT COUNT(*) AS n FROM edges WHERE rev=? AND provenance=?", RUNTIME
+            ),
             unresolved=count(
                 "SELECT COUNT(*) AS n FROM unresolved WHERE rev=? AND reason='unknown'"
             ),
