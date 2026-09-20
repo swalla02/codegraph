@@ -163,13 +163,17 @@ ENV_READ = "ENV_READ"
 _BOUNDARY_KINDS = (NETWORK, ENV_READ)
 
 
-class _Components:
+class Components:
     """Union-find over node ids, growing its node set on demand.
 
     Ids are added as they are seen rather than pre-seeded, so an edge
     endpoint with no `nodes` row (which `impact.py` also guards against)
     still joins the two sides it connects instead of being dropped and
-    silently splitting an island in two.
+    silently splitting an island in two. It follows that `find` answers for
+    an id this revision never saw as well -- a component of one, which is
+    the right answer for a symbol with no edge in either direction and the
+    reason `query/path.py` can ask about any pair of ids without checking
+    them first.
     """
 
     def __init__(self) -> None:
@@ -187,6 +191,62 @@ class _Components:
         left_root, right_root = self.find(left), self.find(right)
         if left_root != right_root:
             self._parent[left_root] = right_root
+
+
+def _partition(
+    store: Store, rev: str, ambiguity: Ambiguity
+) -> tuple[Components, set[tuple[str, str]], set[tuple[str, str]]]:
+    """The revision's connected components, plus the two edge sets the
+    report reads afterwards: distinct `(src, dst)` pairs, and the subset of
+    them that links one class to another.
+
+    Distinct pairs, never raw edge rows: the same call written twice in a
+    body, or one candidate reached through two import aliases, writes two
+    rows for one relationship and would inflate the fan-in that picks each
+    island's hubs (see `rank.fan_in` for the same care).
+
+    One pass over `edges` for all three results, because on a 2,930-file
+    repository that is ~395k rows and this is the whole cost of the command.
+    """
+    components = Components()
+    pairs: set[tuple[str, str]] = set()
+    class_links: set[tuple[str, str]] = set()
+    marks = ",".join("?" * len(DEPENDENCY_KINDS))
+    for row in store.connection.execute(
+        f"SELECT src, dst, kind FROM edges WHERE rev=? AND kind IN ({marks})",
+        (rev, *DEPENDENCY_KINDS),
+    ):
+        pairs.add((row["src"], row["dst"]))
+        if row["kind"] in (INHERITS, IMPLEMENTS):
+            class_links.add((row["src"], row["dst"]))
+    for src, dst in pairs:
+        components.union(src, dst)
+
+    # The unmaterialized bare-name fan-out, through per-name hubs. Hub pairs
+    # join components but are deliberately kept out of `pairs`, and so out of
+    # the fan-in the caller computes from it: a hub is not a caller, and
+    # letting one stand in for its whole reference set would rank a name's
+    # definitions by how ambiguous the name is rather than by how much of the
+    # graph actually reaches them.
+    for src, dst in chain(ambiguity.hub_edges(), ambiguity.base_hub_edges()):
+        components.union(src, dst)
+    return components, pairs, class_links
+
+
+def connected_components(store: Store, rev: str, ambiguity: Ambiguity | None = None) -> Components:
+    """This revision's islands, as a structure to ask membership of.
+
+    The partition `islands_report` prints, computed by the same code rather
+    than by a second implementation that could come to disagree with it --
+    `query/path.py` uses this to make the strongest negative answer it has
+    ("no walk can ever connect these two"), and that answer is only worth
+    printing while it means exactly what an `islands` row means.
+
+    Pass an `Ambiguity` a caller has already built; the fan-out has to be
+    folded in either way (see the module docstring) and building it twice
+    for one command is ~0.8s of pure waste on django.
+    """
+    return _partition(store, rev, ambiguity or Ambiguity(store, rev))[0]
 
 
 def _plural(count: int, noun: str) -> str:
@@ -337,39 +397,13 @@ def islands_report(
     connection = store.connection
     source_roots = (config or Config()).source_roots
 
-    # Distinct (src, dst) pairs, never raw edge rows: the same call written
-    # twice in a body, or one candidate reached through two import aliases,
-    # writes two rows for one relationship and would inflate the fan-in
-    # that picks each island's hubs (see rank.fan_in for the same care).
-    # INHERITS is kept as its own set as well, because `override` is
-    # computed from it alone.
-    components = _Components()
-    pairs: set[tuple[str, str]] = set()
-    # The class-to-class links the `override` pass reads: a base and its
+    # `class_links` is the class-to-class half of the edges: a base and its
     # subclass, and a Protocol and the class that satisfies it. Both mean the
     # same thing for a method declared on each end -- one declaration is what
-    # the caller names and the other is what runs.
-    class_links: set[tuple[str, str]] = set()
-    marks = ",".join("?" * len(DEPENDENCY_KINDS))
-    for row in connection.execute(
-        f"SELECT src, dst, kind FROM edges WHERE rev=? AND kind IN ({marks})",
-        (rev, *DEPENDENCY_KINDS),
-    ):
-        pairs.add((row["src"], row["dst"]))
-        if row["kind"] in (INHERITS, IMPLEMENTS):
-            class_links.add((row["src"], row["dst"]))
-    for src, dst in pairs:
-        components.union(src, dst)
+    # the caller names and the other is what runs -- and the `override` pass
+    # below is computed from them alone.
+    components, pairs, class_links = _partition(store, rev, Ambiguity(store, rev))
     fan_in = Counter(dst for _, dst in pairs)
-
-    # The unmaterialized bare-name fan-out, through per-name hubs. Hub pairs
-    # join components but are deliberately kept out of `fan_in`: a hub is not
-    # a caller, and letting one stand in for its whole reference set would
-    # rank a name's definitions by how ambiguous the name is rather than by
-    # how much of the graph actually reaches them.
-    ambiguity = Ambiguity(store, rev)
-    for src, dst in chain(ambiguity.hub_edges(), ambiguity.base_hub_edges()):
-        components.union(src, dst)
 
     imported = _imported_dotted_names(store, rev)
 
@@ -526,4 +560,4 @@ def islands_report(
     return Report(summary=summary, groups=groups, truncated=truncated)
 
 
-__all__ = ["is_test_path", "islands_report"]
+__all__ = ["Components", "connected_components", "is_test_path", "islands_report"]
