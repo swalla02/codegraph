@@ -111,9 +111,9 @@ def is_external_call(ref: ParsedRef, ctx: ResolveContext) -> bool:
     and the module it names is nowhere in the tree. Nothing in this graph can
     be the callee, because the graph never parses site-packages or the standard
     library -- so projecting `main` onto the repository's own `main` functions
-    is not a weak answer, it is a wrong one. `bench/tracer.py:112` reported
-    three such candidates; `json.dumps(x)` with a single repo `dumps` became a
-    MEDIUM edge. See #47.
+    is not a weak answer, it is a wrong one. `bench/tracer.py`'s own
+    `pytest.main(...)` call reported three such candidates; `json.dumps(x)`
+    with a single repo `dumps` became a MEDIUM edge. See #47.
 
     The test is deliberately stricter than "the lookup failed". The head's
     import target is external only when its FIRST segment names no module, no

@@ -618,8 +618,9 @@ def test_a_function_nothing_reaches_is_still_unexplained(repo, write):
     and a `__main__` guard -- plus `forgotten`, which really is dead. Every
     other symbol is explained; `forgotten` must still be reported, with the
     bucket's strongest negative claim on it. #45's own control
-    (`Ambiguity.call_sites`) was fixed by #49, so without this the change
-    would be measured only by the number it was asked to reduce.
+    (`Ambiguity.relationships`, named `call_sites` at the time) was fixed by
+    #49, so without this the change would be measured only by the number it
+    was asked to reduce.
     """
     write("a.py", "")
     write(

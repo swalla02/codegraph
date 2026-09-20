@@ -61,7 +61,7 @@ class Rule:
     kind: str
     #: Explicit override; `None` (the default, and every built-in pattern
     #: but one) means "derive from match specificity" -- see
-    #: `Catalog._confidence_for`. The one built-in exception is `open`'s
+    #: `Catalog.match_with_confidence`. The one built-in exception is `open`'s
     #: non-literal-mode fallback (`open!ambiguous` in builtin.toml): a
     #: fully literal pattern name would otherwise derive HIGH, but the
     #: *kind* assigned to it (FS_READ, the conservative default) is not
