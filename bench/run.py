@@ -90,7 +90,7 @@ TARGETS: dict[str, Target] = {
             recall_high_medium=0.74,
             conditional_precision=0.95,
             measured=(
-                "2026-09-20, codegraph 090ded0, psf/requests dae7ef6: recall 0.79"
+                "2026-09-20, codegraph 0351e8a, psf/requests dae7ef6: recall 0.79"
                 " (91/115 judgeable), at HIGH/MEDIUM 0.77, conditional precision"
                 " 0.99 (85/86). All 24 misses are dunders invoked by syntax or"
                 " calls reached through an out-of-repo frame."
@@ -111,15 +111,21 @@ TARGETS: dict[str, Target] = {
         # receiver-resolved calls to decorated methods, and a floor is written
         # under what the benchmark prints, not under what one wishes it
         # printed. #54 found the cause and fixed it, so the floor moves back
-        # up with the number rather than staying where the regression left it.
+        # up with the number rather than staying where the regression left it
+        # -- and #64, applying the same rule to `self.X` and `super().X`,
+        # moves the number and the floor again: 0.93 -> 0.98, as 27 claims the
+        # trace had always contradicted stopped being claimed at HIGH. Both
+        # recall floors stay where they are, because recall did not move:
+        # nothing was dropped, only a tier, which is the half of the graph
+        # recall cannot see.
         floor=Floor(
             recall=0.27,
             recall_high_medium=0.24,
-            conditional_precision=0.90,
+            conditional_precision=0.95,
             measured=(
-                "2026-09-20, codegraph 090ded0, pallets/flask d73fa1c: recall 0.29"
+                "2026-09-20, codegraph 0351e8a, pallets/flask d73fa1c: recall 0.29"
                 " (775/2683 judgeable), at HIGH/MEDIUM 0.26, conditional precision"
-                " 0.93 (515/551). 1637 of the 1908 misses are a view defined inside"
+                " 0.98 (515/524). 1637 of the 1908 misses are a view defined inside"
                 " a test, a decorated target, or a pair only an out-of-repo frame"
                 " connects -- dispatch a call-site graph does not model."
             ),

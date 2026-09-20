@@ -1523,6 +1523,188 @@ def test_a_decorator_that_replaces_nothing_leaves_the_claim_high(repo, write, im
     store.close()
 
 
+# The same question one step up the ladder (#64). `self.X` and `super().X`
+# reach a declaration by an attribute lookup on a class the source text names
+# exactly, which is better evidence than a receiver's type -- but it is better
+# evidence about WHICH CLASS, and the decorator takes away the other half of
+# the claim. Measured on flask, this step's HIGH claims on a decorated target
+# were 0 right and 27 wrong, every one of them `@setupmethod` again.
+
+WRAPPED_METHODS = (
+    "import functools\n\n\n"
+    "def setupmethod(f):\n"
+    "    @functools.wraps(f)\n"
+    "    def wrapper_func(self, *args, **kwargs):\n"
+    "        return f(self, *args, **kwargs)\n\n"
+    "    return wrapper_func\n\n\n"
+    "class Scaffold:\n"
+    "    @setupmethod\n"
+    "    def add_url_rule(self, rule):\n        return rule\n\n"
+    "    def make_config(self):\n        return {}\n\n"
+    "    def route(self, rule):\n"
+    "        return self.add_url_rule(rule)\n\n"
+    "    def configure(self):\n"
+    "        return self.make_config()\n"
+)
+
+
+def test_a_self_call_to_a_wrapped_method_is_medium(repo, write):
+    """`self.add_url_rule` is whatever `setupmethod` returned, so the frame
+    that opens is the wrapper and never the decorated body. The candidate is
+    still right about where an edit lands, so it stays -- one tier down."""
+    write("app.py", WRAPPED_METHODS, commit="wrapped")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = targets_of(store, "app.py::Scaffold.route")
+    assert ("app.py::Scaffold.add_url_rule", "MEDIUM") in found
+    assert ("app.py::Scaffold.add_url_rule", "HIGH") not in found
+    assert "self.add_url_rule" not in ambiguous_names(store)
+    store.close()
+
+
+def test_a_self_call_to_an_undecorated_method_stays_high(repo, write):
+    """The weakening is per declaration, not per class: the sibling that
+    carries no decorator is still reached at HIGH from the same `self`."""
+    write("app.py", WRAPPED_METHODS, commit="wrapped")
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("app.py::Scaffold.make_config", "HIGH") in targets_of(
+        store, "app.py::Scaffold.configure"
+    )
+    store.close()
+
+
+def test_a_wrapped_method_inherited_from_a_base_is_medium(repo, write):
+    """flask's own shape: the call is in `Blueprint`, the `@setupmethod` is on
+    `Scaffold`. The MRO walk is what finds it, and what the walk cannot see is
+    the same thing whichever class the declaration turns up on."""
+    write("app.py", WRAPPED_METHODS)
+    write(
+        "blueprint.py",
+        "from app import Scaffold\n\n\n"
+        "class Blueprint(Scaffold):\n"
+        "    def register(self, rule):\n"
+        "        return self.add_url_rule(rule)\n",
+        commit="inherited",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = targets_of(store, "blueprint.py::Blueprint.register")
+    assert ("app.py::Scaffold.add_url_rule", "MEDIUM") in found
+    assert ("app.py::Scaffold.add_url_rule", "HIGH") not in found
+    store.close()
+
+
+def test_a_wrapped_override_reached_through_self_is_still_a_candidate(repo, write):
+    """An override is MEDIUM already -- "runs depending on the instance" --
+    and a decorator on it does not make it less of a candidate than that.
+    Nothing is dropped and nothing falls to LOW: both tiers say the same
+    thing, that the body is where the edit lands and the frame is not
+    promised."""
+    write("app.py", WRAPPED_METHODS)
+    write(
+        "blueprint.py",
+        "from app import Scaffold, setupmethod\n\n\n"
+        "class Blueprint(Scaffold):\n"
+        "    @setupmethod\n"
+        "    def make_config(self):\n        return {'nested': True}\n",
+        commit="override",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("blueprint.py::Blueprint.make_config", "MEDIUM") in targets_of(
+        store, "app.py::Scaffold.configure"
+    )
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "imports, decorator",
+    [
+        ("", "staticmethod"),
+        ("import abc\n\n\n", "abc.abstractmethod"),
+        ("import typing as t\n\n\n", "t.final"),
+    ],
+)
+def test_a_self_call_through_a_transparent_decorator_stays_high(repo, write, imports, decorator):
+    """The language's own markers and descriptors leave the decorated body as
+    what the attribute invokes, so `self.build()` still certainly runs it."""
+    write(
+        "app.py",
+        f"{imports}class Registry:\n"
+        f"    @{decorator}\n"
+        "    def build(x):\n        return x\n\n"
+        "    def run(self):\n        return self.build(1)\n",
+        commit="transparent",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("app.py::Registry.build", "HIGH") in targets_of(store, "app.py::Registry.run")
+    store.close()
+
+
+def test_a_super_call_to_a_wrapped_method_is_medium(repo, write):
+    """`super().X()` is the same attribute lookup with a different starting
+    point, so the same decorator stands between the call and the body. The
+    benchmark repositories have no instance of this -- the rule is here
+    because the mechanism is identical, not because a number moved."""
+    write("app.py", WRAPPED_METHODS)
+    write(
+        "blueprint.py",
+        "from app import Scaffold\n\n\n"
+        "class Blueprint(Scaffold):\n"
+        "    def add_url_rule(self, rule):\n"
+        "        return super().add_url_rule(rule)\n",
+        commit="super",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    found = targets_of(store, "blueprint.py::Blueprint.add_url_rule")
+    assert ("app.py::Scaffold.add_url_rule", "MEDIUM") in found
+    assert ("app.py::Scaffold.add_url_rule", "HIGH") not in found
+    store.close()
+
+
+def test_a_super_call_to_an_undecorated_method_stays_high(repo, write):
+    """`super().X()` remains one of the most certain calls Python has when
+    nothing is wrapping the declaration it reaches."""
+    write("app.py", WRAPPED_METHODS)
+    write(
+        "blueprint.py",
+        "from app import Scaffold\n\n\n"
+        "class Blueprint(Scaffold):\n"
+        "    def make_config(self):\n"
+        "        return super().make_config()\n",
+        commit="super plain",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert ("app.py::Scaffold.make_config", "HIGH") in targets_of(
+        store, "blueprint.py::Blueprint.make_config"
+    )
+    store.close()
+
+
+def test_a_mention_of_a_wrapped_method_is_still_high(repo, write):
+    """A `REFERENCES` edge is not weakened, because its tier answers a
+    different question. `self.add_url_rule` handed to `register(...)` names
+    that definition as certainly as any name does; whether anything then
+    invokes it is what the edge KIND says, and no frame is being claimed."""
+    write(
+        "app.py",
+        WRAPPED_METHODS + "\n    def install(self):\n        return register(self.add_url_rule)\n",
+        commit="mention",
+    )
+    store, indexer = build(repo)
+    indexer.reconcile("HEAD")
+    assert (
+        "app.py::Scaffold.install",
+        "app.py::Scaffold.add_url_rule",
+        "HIGH",
+    ) in references(store)
+    store.close()
+
+
 # The Protocol question. A `typing.Protocol` is satisfied structurally: its
 # implementations need not subclass it, so the hierarchy has no link from the
 # Protocol to the code that runs. Binding a call to the stub alone would repeat

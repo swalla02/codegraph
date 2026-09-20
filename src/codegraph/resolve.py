@@ -282,7 +282,8 @@ class ResolveContext:
     #: node id -> the decorator names its definition carries, as written
     #: (`setupmethod`, `t.final`). Only decorated definitions are present.
     #: Read by `wraps_the_definition`, which is what decides whether the name
-    #: of a definition still reaches the definition; see `_through_receiver`.
+    #: of a definition still reaches the definition; see `tier_of_declaration`
+    #: and the three steps that call it.
     decorators: dict[str, tuple[str, ...]] = field(default_factory=dict)
     #: Memo for the receiver step's per-class answers (is it a Protocol, what
     #: does its MRO define, who implements it), shared across the revision like
@@ -376,6 +377,28 @@ def wraps_the_definition(node_id: str, ctx: ResolveContext) -> bool:
         name.rpartition(".")[2] not in TRANSPARENT_DECORATORS
         for name in ctx.decorators.get(node_id, ())
     )
+
+
+def tier_of_declaration(node_id: str, ref: ParsedRef, ctx: ResolveContext) -> str:
+    """The tier for a declaration found by looking a name up on a class.
+
+    HIGH, unless a decorator the language does not define stands between the
+    name and the body (`wraps_the_definition`), in which case MEDIUM: the
+    lookup found the right declaration and cannot promise the call arrives
+    inside it. Shared by the three steps that reach a method through a class
+    -- `_through_super`, `_through_self`, `_through_receiver` -- because it
+    is one fact about the attribute, not three rules about three steps.
+
+    A MENTION keeps HIGH whatever decorates it. The tier of a `REFERENCES`
+    edge answers "does this name mean that definition", which a wrapper does
+    not touch (`self.route` names `route`, and `functools.wraps` even keeps
+    the name); "and is it then invoked" is what the edge kind says. Only a
+    call claims that a frame opens on the body, so only a call can lose that
+    claim -- see the value-reference pass in `resolve_refs`.
+    """
+    if ref.ref_kind == "call" and wraps_the_definition(node_id, ctx):
+        return MEDIUM
+    return HIGH
 
 
 def methods_in_mro(class_id: str, ctx: ResolveContext) -> frozenset[str]:
@@ -641,6 +664,15 @@ class AstResolver:
         everywhere else in this module, and starts at the bases rather than the
         class itself -- `super().__init__()` inside `Child.__init__` must not
         resolve to `Child.__init__`.
+
+        A decorated declaration is MEDIUM here as it is everywhere a method is
+        reached through a class (`tier_of_declaration`). `super().X()` is an
+        attribute lookup like `self.X()`, one starting class further up, so a
+        wrapper sits between the call and the body in exactly the same way.
+        Neither benchmark repository exercises it -- flask and requests have
+        no decorated target among this step's HIGH claims at all -- so this is
+        the same fact applied where it holds, not a second measurement; see
+        `_through_self`, which is where the measurement is.
         """
         head, _, attribute = ref.raw_name.partition(".")
         if head != SUPER or not attribute or "." in attribute:
@@ -652,7 +684,7 @@ class AstResolver:
         for class_id in breadth_first(start, ctx.bases)[1:]:
             found = self._method_on(class_id, attribute, ctx)
             if found:
-                return [(found, HIGH)]
+                return [(found, tier_of_declaration(found, ref, ctx))]
         return []
 
     # -- step 3: self.X through the class, its bases, and its overrides ----
@@ -679,6 +711,58 @@ class AstResolver:
         runs depends on the instance, and that is genuinely less certain than
         a name lookup -- not LOW, which is the tier for a repo-wide guess with
         no hierarchy behind it.
+
+        The decorated declaration (#64). The MRO walk establishes which
+        declaration the name reaches. It does not establish that the class
+        attribute of that name still holds the function written under `def`:
+        `@setupmethod` returns a wrapper, so `self.add_url_rule(...)` opens
+        `setupmethod.<locals>.wrapper_func` and enters the decorated body only
+        if that wrapper chooses to call it -- which is a question about code
+        this resolver has not read. The declaration remains the right answer
+        to "where does an edit land", so nothing is dropped; what it cannot be
+        is HIGH, which is read as "this call site runs that definition". The
+        test is `wraps_the_definition`, written for `_through_receiver` by #54
+        and applied here through `tier_of_declaration`.
+
+        Whether the drop should be gentler here is the question this step
+        deserved separately, because this is the strongest rung of the ladder:
+        the class is the one the call is written in, not one inferred from an
+        annotation that Python does not enforce. The measurement answers it.
+        Split by whether the target carried a decorator, this step's HIGH
+        claims on flask were 86 right and 3 wrong undecorated, against 0 right
+        and 27 wrong decorated -- all 27 `@setupmethod` -- which is the same
+        shape the receiver step showed at 0 and 148, not a better one. Knowing
+        the class exactly is evidence about which declaration; it is no
+        evidence at all about what the attribute holds, and the second half is
+        the one HIGH's meaning rests on. So the tier is the same MEDIUM as
+        `_through_receiver`'s, and for a reason rather than by analogy: MEDIUM
+        is what this resolver already means by a candidate that is really
+        there and whose execution depends on something it cannot see -- the
+        overrides above -- and it keeps the candidate in `impact`'s default
+        report, where LOW, the tier of a repo-wide guess, would be sampled
+        away.
+
+        Where else the question applies, since the mechanism belongs to the
+        attribute rather than to `self`:
+
+        - `_through_super` does the same lookup from one class further up and
+          is weakened with it. No number moved: neither benchmark repository
+          has a decorated target among that step's HIGH claims.
+        - `_imported` and `_module_local` resolve a name in a MODULE
+          namespace, where a decorator rebinds just as freely -- and there the
+          measurement points the other way. flask and requests give those two
+          steps 13 HIGH claims on decorated targets, every one of them
+          `functools.cache` or `contextlib.contextmanager`; of the six whose
+          endpoints both ran, five were observed and the sixth is a
+          self-recursive edge the tracer drops by construction. Wrappers that
+          do delegate are the norm there, so the rule would cost right answers
+          and buy nothing. Moving them needs its own measurement, not this
+          one's symmetry.
+        - MEDIUM and LOW candidates are untouched wherever they occur. Neither
+          claims that a frame opens on the body, so neither has that claim to
+          lose, and demoting them further would be deciding a wrapped method
+          away -- the narrower, more confident, more wrong answer this step
+          exists to avoid.
         """
         head, _, attribute = ref.raw_name.partition(".")
         if head != "self" or not attribute or "." in attribute:
@@ -692,7 +776,10 @@ class AstResolver:
         for class_id in self._mro(start, ctx):
             node_id = self._method_on(class_id, attribute, ctx)
             if node_id:
-                hits.append((node_id, HIGH))
+                # The declaration the name reaches -- HIGH, unless a decorator
+                # stands between the name and the body, which is precisely the
+                # part HIGH would be promising. See the paragraph above.
+                hits.append((node_id, tier_of_declaration(node_id, ref, ctx)))
                 break
         if not hits:
             return []
@@ -895,9 +982,10 @@ class AstResolver:
                 return []
             # HIGH says the call site runs that definition. A decorated
             # definition is not what its own name holds, so that is exactly
-            # the part this cannot promise; see `wraps_the_definition` and
+            # the part this cannot promise; see `tier_of_declaration`, which
+            # is the same rule `_through_self` and `_through_super` apply, and
             # the paragraph above.
-            add(declared, MEDIUM if wraps_the_definition(declared, ctx) else HIGH)
+            add(declared, tier_of_declaration(declared, ref, ctx))
             if is_protocol(class_id, ctx):
                 structural = True
                 for node_id in self._implementers(class_id, method, ctx):
