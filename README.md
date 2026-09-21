@@ -4,7 +4,7 @@ A standalone navigation layer over a Python codebase — a sidecar index, in the
 spirit of `.git/`, that never changes how you write code and never asks the
 code to import it.
 
-It answers two questions grep structurally cannot:
+It answers two questions grep answers badly:
 
 - **`codegraph impact <symbol>`** — what transitively depends on this, ranked,
   with the blast radius summarized rather than dumped.
@@ -15,6 +15,12 @@ It answers two questions grep structurally cannot:
 Composed, they give the answer you actually want before a change: not "47 things
 call this," which is anxiety rather than information, but *"47 things call this,
 and 3 of the paths end in a database write."*
+
+"Badly" is measured rather than asserted, and the measurement is less
+flattering than the sentence above implies: on pallets/flask, a bare-name grep
+finds **every** caller a run observed, and buries them in five times as much
+output. The graph's measured advantage over grep is density and confidence, not
+recall — see [Does querying beat grepping?](#does-querying-beat-grepping-59).
 
 It follows git. The parse cache is content-addressed by git blob SHA, so a
 file's content is analysed once for the life of the repository and shared
@@ -887,6 +893,175 @@ comprehension or lambda (never a node, since `nodes` holds definitions), and a
 target `nodes` does not contain at all (a hole in codegraph's own view, shown
 with examples).
 
+## Does querying beat grepping? (#59)
+
+Everything above measures the *graph*: of the calls a run made, how many does the
+graph have. `AGENTS.md` makes a different claim — query the call graph
+**instead of** grepping for callers — and until #59 nothing here tested it. The
+two can diverge in both directions. A graph at 0.29 recall is useful if the 29%
+covers what people ask about; a perfect graph nobody's workflow reaches for is
+worth nothing at any recall.
+
+Two experiments, in ascending order of how much they cost and descending order
+of how much they can be trusted.
+
+### 1. The tool, against a run: `bench/discovery.py`
+
+Deterministic. No model, no judge, no variance: anybody with the clone, the
+trace and this file gets these numbers back.
+
+For every symbol a trace can pose a caller question about, three ways of
+answering "what calls this" are scored against the same trace:
+
+- **grep-call** — `\bname\s*\(`, the pattern somebody hunting call sites types.
+- **grep-word** — `\bname\b`, the fallback, which also finds a decorator and a
+  reference passed as a value.
+- **codegraph** — `impact --hops N`, with `codegraph-all` as the `--all`
+  variant that merges the LOW-confidence bare-name fan-out in.
+
+Both greps are modelled *at their best*: every matching line is attributed to
+its enclosing definition by parsing the file, so grep never mis-reads a hit and
+never gets bored at the fortieth match. `cost` is what the answer costs to
+read — grep's matching lines, the query's printed rows — and `yield` is true
+callers per line of that output.
+
+```sh
+uv run python -m bench.run flask                      # leaves a trace in --work
+uv run python -m bench.discovery flask --work /tmp/codegraph-bench
+```
+
+pallets/flask `d73fa1c`, 43 symbols, 2026-09-21, codegraph `ef9f22d`:
+
+| direct callers | recall | cond. precision | cost | yield |
+|---|---|---|---|---|
+| grep-call | 0.78 | 0.48 | 456 | 0.34 |
+| grep-word | **1.00** | 0.29 | 1328 | 0.15 |
+| codegraph | 0.72 | **0.61** | **257** | **0.55** |
+| codegraph `--all` | 0.79 | 0.53 | 318 | 0.49 |
+
+| within 2 hops | recall | cond. precision | cost | yield |
+|---|---|---|---|---|
+| grep-call | 0.43 | 0.14 | 2923 | 0.09 |
+| grep-word | **0.79** | 0.07 | 15383 | 0.03 |
+| codegraph | 0.58 | **0.37** | **1062** | **0.32** |
+| codegraph `--all` | 0.67 | 0.27 | 1633 | 0.24 |
+
+psf/requests `dae7ef6`, 10 symbols: every tool scores 1.00 at both depths.
+The query costs 44 rows against grep-word's 77 at one hop and 117 against 328
+at two, at conditional precision 1.00 against grep-word's 0.57 and 0.45. Ten questions on a small,
+conventional library discriminate between nothing; they are here because a
+result on one repository is an anecdote and this says so.
+
+**The honest reading: the graph does not find more callers than grep.** A
+bare-name grep found every direct caller flask's suite observed, and the query
+found 72% of them. Two hops out grep still wins on recall, 0.79 to 0.58.
+
+What the query wins is the reading: 257 rows against 1328 matching lines at one
+hop, 1062 against 15383 at two. Per line of output that is between 1.6 and 10
+times as many true callers, depending on which of the two greps it is compared
+with, at two to five times the conditional precision — and it says which edges
+it is unsure of, which a grep hit cannot.
+
+What the resolver misses on flask is one shape, and it is the same shape
+`bench/`'s 0.29 is made of: a property read as an attribute (`request.blueprint`
+has no call syntax to resolve), a decorator applied in a class body
+(`@setupmethod`), and a method reached through a context-local proxy
+(`g.setdefault`). grep-word finds all three, because all three put the name in
+the text — which is exactly why "grep misses dynamic dispatch" was the wrong
+claim to make for *direct* callers, and why this section replaced it.
+
+Where neither can win: a call whose two frames are separated by an out-of-repo
+frame. Those are excluded from the gold set here, because no text in the
+repository names the pair and grading it would reward guessing — which biases
+this comparison *against* the graph and is the direction to err in when
+grading your own tool. Only `codegraph trace` finds those at all.
+
+### 2. The agent, with and without the tool: `bench/agent.py`
+
+The A/B the issue asked for, at the smallest scale that can say anything. One
+fixed agent, two arms, held equal in model, turn cap, spend cap, prompt,
+repository and revision:
+
+- **control** — `Read`, `Glob`, `Grep`.
+- **treatment** — the same three, plus `codegraph impact` / `effects` /
+  `orphans`, served as MCP tools by `bench/agent_tools.py`.
+
+Nothing tells the treatment arm that `codegraph` exists; it sees three more tools
+in its tool list and nothing else changes. Telling one arm about the tool in
+its prompt would have made the prompt the variable under test.
+
+```sh
+uv run python -m bench.agent flask --repo ... --trace ... --runs 3 --out runs.jsonl
+```
+
+12 symbols x 2 arms x 3 runs = 72 runs, sonnet, 15-turn cap, flask `d73fa1c`,
+2026-09-21. The question has a set of symbols as its answer and is graded by
+set overlap with the trace, so there is no judge whose agreement rate has to be
+published — what has to be checked instead is the parse, below.
+
+The question is the one-hop one, "what calls this directly". A pilot at two
+hops was abandoned before it was run at scale: flask's two-hop gold sets run to
+dozens of symbols, no agent enumerates dozens of symbols inside a budget worth
+paying for, and both arms scored 0.12 on the pilot question for that reason
+rather than for any reason about tools. Enumerating is free in the
+deterministic comparison above, which is where the two-hop numbers are.
+
+| | recall (36 runs per arm) | median | turns/run | $/run |
+|---|---|---|---|---|
+| control | 0.906 | 1.00 | 5.39 | 0.033 |
+| treatment | 0.917 | 1.00 | **4.44** | **0.024** |
+
+Paired by question, treatment − control: recall **+0.010** (95% bootstrap CI
++0.000 to +0.031), turns **−0.94** (CI −1.78 to −0.14). Eleven of the twelve
+questions tie exactly; one (`stream_with_context`) goes 0.88 → 1.00.
+
+**The honest reading: the tool did not make the answers better, and it made
+them cheaper.** A one-percent recall difference on twelve questions is not a
+finding about answer quality; a quarter off the turns and the cost, consistent
+across questions, is a finding about how much reading it takes to get there —
+which is the same thing the deterministic table says, arrived at independently.
+The treatment arm used `impact` in 36 of 36 runs, so the null result is not a
+tool nobody reached for.
+
+**The grader's reliability.** There is no judge to agree with, so what can go
+wrong is the parse: an answer that names a caller in a form the regex does not
+recognise is scored as a miss the agent did not make. Sampled one run per
+question with a seeded draw (12 of the 72) and read each raw answer against
+its parsed set: 12 of 12 matched exactly, in both directions. That is the
+reliability figure, it is small, and it is the whole of it — every run is in
+`bench/results/flask-agent-2026-09-21.jsonl` and `--replay` re-scores them
+without spending anything, so the check can be repeated or widened by anyone:
+
+```sh
+uv run python -m bench.agent flask --repo ... --trace ... \
+    --out bench/results/flask-agent-2026-09-21.jsonl --replay
+```
+
+Both arms score 0.00 on `setupmethod` and drag both averages down by the same
+amount. That one is a question-framing artefact rather than a failure: the
+caller of a decorator, as `sys.monitoring` sees it, is the *class body* that
+applies it, and no agent in either arm answers "the class body" — they list the
+decorated methods. `codegraph` misses it too.
+
+### What neither experiment measures
+
+- **`effects` and `orphans` are untested.** The trace records in-repo frames,
+  so it cannot witness `open()` or `os.environ`, and a gold answer for "what
+  side effects does this reach" would have to be hand-written against the same
+  source the tool reads. That is the self-marking problem this whole section
+  exists to avoid, so it was left undone rather than done badly.
+- **One repository does the work.** django is the case where grep hurts most
+  and it has no trace here, so it has no gold answers and is not in the tables.
+  requests is in them and is too small and too well-behaved to discriminate.
+- **A trace is a lower bound.** A caller the suite never exercised is missing
+  from the gold set, and a tool that finds it is marked down for being right.
+  That falls on both sides equally, and it is why the column beside recall is
+  *conditional* precision (same argument as above).
+- **The agent arm is 72 runs of one model at one turn cap**, on questions whose
+  answers are sets of names. It says nothing about prose answers, about harder
+  questions, or about a budget tight enough for the cost difference to become a
+  quality difference.
+
 ## Why no MCP server
 
 MCP's main advantage is discoverability — the agent sees the tool without
@@ -897,11 +1072,26 @@ shell pipelines, and needs no server process. MCP is an explicit non-goal for
 this version; it could become an additive wrapper later for harnesses without
 shell access, but nothing here requires it.
 
+`bench/agent_tools.py` is an MCP server and is not a change of position: the
+A/B above needs two arms that differ in *tool availability* and in nothing
+else, and a tool list is the only place a Claude Code session can be given a
+tool without also being told about it in prose. It exists to run an experiment,
+it is not installed by anything, and it wraps the same CLI handlers.
+
 ## The anti-pattern this displaces
 
-Do not grep for callers. Grep misses dynamically dispatched calls (anything
-reached through a method resolution order, an attribute, or an alias) and
-gives you no way to know when you are done — there is no signal that you have
-found the last caller versus just the last one grep's pattern happened to
-match. `codegraph impact` walks the actual call graph and reports both the
-full set and how confident it is in each edge.
+Do not grep for callers *and then read every hit*. Grep gives you a superset
+with no way to know when you are done — no signal separates the last caller
+from the last line its pattern happened to match — and on flask that superset
+is five times the reading for the same answer (measured above: 1328 matching
+lines against 257 rows, at one hop; 15383 against 1062 at two).
+
+The claim this section used to make — that grep *misses* dynamically
+dispatched calls — did not survive being measured. For direct callers it is
+wrong: dispatch through a property, a decorator or a proxy still puts the name
+in the text, and a bare-name grep found every caller flask's suite observed,
+including the ones codegraph's resolver could not. It is right only for a call
+whose two frames are separated by an out-of-repo frame, which no static
+analysis of this repository can see either. `codegraph impact` walks the graph
+and reports the set, its ranking and its confidence per edge; it does not
+report more callers than grep does.

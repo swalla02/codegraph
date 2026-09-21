@@ -318,14 +318,20 @@ repository root, and all but `resolve` accept `--json` for machine-readable
 output instead of the default text. `impact`, `effects`, `path`, `unknowns`
 and `islands` additionally accept `--strict`.
 
-## The anti-pattern this displaces
+## What this displaces, and by how much
 
-Do not grep for callers. Grep misses dynamically dispatched calls (anything
-reached through a method resolution order, an attribute, or an alias) and
-gives you no way to know when you are done — there is no signal that you
-have found the last caller versus just the last one grep's pattern happened
-to match. `codegraph impact` walks the actual call graph and tells you both
-the full set and how confident it is in each edge.
+Grep for a name and you get a superset: the callers, the definition, the
+docs, the string literals, and no signal telling you which is which or when
+you are done. Measured against a runtime trace of pallets/flask, over the 43
+symbols a trace could pose a caller question about: a bare-name grep found
+every observed direct caller, in 1328 matching lines to hand over 197 of
+them; `codegraph impact` found 72% of the same set in 257 rows. Two hops out
+— "what breaks if I change this" — grep costs 15383 lines against 1062.
+
+So: `impact` for the ranked, deduplicated answer with a confidence per edge,
+and grep when you want the superset and can afford to read it. Neither finds
+a call whose two frames are separated by an out-of-repo frame; only
+`codegraph trace` does.
 
 ## Reading the output
 
