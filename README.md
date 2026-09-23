@@ -31,7 +31,8 @@ claimed (see "The cost guarantee, honestly" below).
 
 That also makes `codegraph diff` possible — the semantic delta of a branch:
 which symbols and edges changed, and which side effects newly became
-reachable.
+reachable. Walked over a range of commits, the same comparison becomes
+`codegraph history`: `git log -L` at the level of symbols and edges.
 
 Built agent-first: a CLI, driven through `AGENTS.md` (`codegraph init` writes
 the section, for any of the 25+ agents that read it) and through `SKILL.md`
@@ -122,6 +123,7 @@ slower on a cold cache.
 | `codegraph islands [--rev REV] [--limit N] [--json] [--strict]` | Report the connected components of the revision's `CALLS`, `INHERITS`, `IMPLEMENTS` and `REFERENCES` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
 | `codegraph orphans [--rev REV] [--limit N] [--include-public] [--include-decorated] [--json]` | Find functions whose every recorded caller is a test — defined, tested, and never invoked by the code that was supposed to invoke it. Such a function is *not* a one-symbol island, precisely because its test calls it, so `islands` structurally cannot surface it. Candidates are private by name, undecorated, defined outside the test tree, and never mentioned by name anywhere in the source text — that last filter has no off switch, because a static call graph cannot see a callback handed to a library. Not a dead-code report (see below). |
 | `codegraph diff [<base>..<head>] [--json]` | Report what changed between two revisions by content hash, never by line number: symbols added/removed/changed, plus any side effect newly reachable. Defaults to `merge-base(default branch, HEAD)..WORKTREE` — "what has this branch changed so far." |
+| `codegraph history [<symbol>] [<base>..<head>] [--limit N] [--json] [--strict]` | The graph over a range of commits, oldest first, each compared with its first parent the way `diff` compares two revisions. With a symbol: every commit that changed its body hash, its confident callees or the side effects reachable from it, followed across a move to another file or class — a pairing reported with a confidence tier, never as the same id. Without one: per commit, the symbols added, removed, moved and changed, and the edges and effects gained and lost. Defaults to `merge-base(default branch, HEAD)..HEAD`; only the named range is materialized, and nothing it materializes is kept (see below). |
 | `codegraph trace [FILE] [--rev REV] [--forget]` | Import a recorded run (see "What a trace buys" below) and bind it to a revision, so that calls the resolver cannot see — framework dispatch, `getattr`, a decorator's wrapper — become edges marked `runtime` alongside the ones it deduced. With no argument it describes the trace the revision holds, or tells you how to record one. Additive: a repository with no trace answers exactly as it did before. |
 | `codegraph gc [--keep REV]` | Prune the Layer 1 parse cache down to what `HEAD`, the worktree, and any `--keep`-named revisions still reference. Never touches the graph itself, so it can only make a future answer slower to rebuild, never wrong. |
 | `codegraph init` | Make this repository's coding agents aware of codegraph: an `AGENTS.md` section, the `@AGENTS.md` bridge into an existing `CLAUDE.md`, and a commented `codegraph.toml` stub. Idempotent; never overwrites content it did not write; never touches `.git/`. |
@@ -304,6 +306,58 @@ psf/requests, of 3,000 randomly sampled symbol pairs the 99 that are
 connected at all sit a median of 3 hops apart (mean 3.26, max 8); a budget of
 3 would find 51% of them and 6 finds 99%.
 
+### What `history` answers, and what it costs
+
+`diff` says what changed between two revisions; `history` says which commit
+did it. For a symbol, it lists the commits in the range that changed its
+*behaviour* — its body hash, the callees it reaches with confidence, or the
+side effects reachable from it — rather than every commit that touched its
+file. That last part is the one `git log -L` cannot answer: a commit that
+puts a `NETWORK` call inside `charge` shows up in the history of `checkout`,
+whose text never changed.
+
+```
+$ codegraph history checkout main~3..main
+symbol: m.py::checkout · commits: 3 · changed_in: 2 · base: 48aa84e… · head: a34af83…
+commits
+  b9e6ed2…  m.py:8  effects +NETWORK · "charge hits the network"
+  a34af83…  m.py:4  calls +pay.py::charge; calls -m.py::charge · "move charge to pay.py"
+```
+
+**A move is an inference, and says so.** A node id is `path::qualname`, so
+moving `charge` from `m.py` to `pay.py` is, in the graph, a removal and an
+addition. `history` pairs the two when their bodies hash the same, and
+grades the pairing with the resolver's own rule for a name matched by
+guesswork: MEDIUM if it is the only candidate, LOW if it is one of several.
+Never HIGH — no text states that two ids are one symbol. A MEDIUM move is
+followed (`moved from m.py::charge to pay.py::charge (MEDIUM)`); a LOW one
+names the candidates and stops, with a `lineage_ambiguous` entry in
+`unknowns`, because continuing down one of them would be a guess presented
+as history. A rename changes the definition's own name, which is part of its
+body hash, so it reads as exactly what the source shows: a removal and an
+unrelated addition.
+
+**What it compares** is what `diff` compares — body hash, and edges and
+effects without the LOW tier, which is a guess about the whole repository
+and moves whenever anyone anywhere adds a same-named symbol. Merges are one
+step each, along the first-parent line, as `git log --first-parent` reads a
+branch.
+
+**What it costs.** The walk materializes only the range it is given: the
+first commit's parent (which is `base` itself whenever `base` sits on
+`head`'s first-parent line), then each commit in turn. There is no
+backfill, nothing is checked out, and every revision the walk created is
+discarded when it ends; one it found already materialized is copied from,
+never consumed. Each commit's graph starts as a copy of its parent's and is then
+reconciled like an edit to the working tree, so a commit pays for the files
+it touched — narrowed when it did not change the symbol table — and parsing
+is proportional to the blobs the range introduces, since the parse cache is
+shared with every revision ever seen. The one cold build is the starting
+revision. The default range is `merge-base(default branch, HEAD)..HEAD`,
+matching `diff`'s base; the head is `HEAD` rather than the worktree because
+history is a list of commits, and `diff` is the command for what is not
+committed yet.
+
 ### What `unknowns` answers, and what `--strict` does with it
 
 The point of this tool is to give an agent a truthful representation of a
@@ -393,6 +447,7 @@ something the run did not examine.**
 | `islands` | its own `unexplained` count | the number it already prints, in the form a machine can act on |
 | `orphans` | none | its uncertainty is a standing `caveat` on every row — a name resolved at runtime leaves nothing for either half of the report to find — and a caveat that fires on every run is not news. A `--strict` there would refuse on every non-empty report |
 | `diff` | none | a content-hash comparison of two revisions: no walk, no budget, nothing hidden |
+| `history` | `lineage_ambiguous` | a symbol whose body matches several removed definitions in one commit: the commits before it, under whichever id it had, were not examined |
 
 Two things deliberately do **not** make a report incomplete:
 

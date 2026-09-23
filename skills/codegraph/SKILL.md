@@ -18,6 +18,8 @@ Reach for codegraph:
 - Before modifying any function or class.
 - When asked "what breaks if I change this", "what does this affect", "is
   this safe to change", or "what did this branch change".
+- When asked "when did this start doing X" or "which commit changed this" —
+  `codegraph history <symbol>`.
 
 ## Workflow
 
@@ -41,8 +43,10 @@ Reach for codegraph:
    two symbols and applies the convention to each. The convention is about
    resolving a *name* and nothing else, so a `path` report saying the two
    symbols are not connected is still exit `0`: that is an answer, not a
-   failure. The one code outside it is `3`, which only `--strict` produces
-   (see below).
+   failure. `history` applies the same convention to its optional symbol,
+   resolved at the head of the range (or, for a symbol the range deleted,
+   at its start). The one code outside it is `3`, which only `--strict`
+   produces (see below).
 
 2. Ask what depends on it and what it can reach:
 
@@ -189,8 +193,8 @@ purpose — those call for a different next move.
 
 `impact` raises it for a hop budget the walk did not exhaust; `effects` for
 calls in the body it could not follow; `path` for a negative a flag would
-turn into a path; `islands` for its own `unexplained` count; `unknowns` for
-all of the above. `orphans` and `diff` have no `--strict`: `orphans`'
+turn into a path; `islands` for its own `unexplained` count; `history` for
+a `lineage_ambiguous` move (below); `unknowns` for all of the above. `orphans` and `diff` have no `--strict`: `orphans`'
 uncertainty is the standing `caveat` on every row, and `diff` compares two
 revisions by content hash with no walk and no budget to cut short.
 
@@ -326,11 +330,33 @@ any side effect that newly became reachable. With no argument it diffs
 `merge-base(default branch, HEAD)` against the worktree, which is what you
 want when asked "what did this branch change".
 
+`codegraph history [<symbol>] [<base>..<head>]` walks the commits in a
+range, oldest first along the first-parent line, comparing each with its
+parent the way `diff` does. With a symbol, it lists only the commits that
+changed its **behaviour** — body hash, confident callees, or reachable
+effects — so a commit that adds a network call to a callee appears in the
+caller's history although the caller's text never moved. Without one, each
+commit is a group of the symbols added, removed, moved and changed and the
+edges and effects gained and lost (`--limit` rows per commit). The default
+range is `merge-base(default branch, HEAD)..HEAD`: commits only, never the
+worktree — use `diff` for uncommitted work.
+
+A node id is `path::qualname`, so a move to another file or class is a
+removal plus an addition. `history` pairs them by identical body hash and
+says how sure it is: `moved from a.py::f to b.py::f (MEDIUM)` when the
+pairing is unique, and it follows the symbol back under the old id. When
+several removed definitions share the body, the row names them with `(LOW)`,
+the walk stops there, and `unknowns` carries `lineage_ambiguous` — re-run
+`history` on the candidate id you mean. A rename changes the body hash (the
+name is part of the definition) and reads as a plain `added`. Only the range
+you name is materialized, nothing is checked out, and nothing the walk
+builds is kept.
+
 All of `resolve`, `impact`, `effects`, `path`, `unknowns`, `islands`,
-`orphans` and `diff` accept `--path <dir>` to run against a different
-repository root, and all but `resolve` accept `--json` for machine-readable
-output instead of the default text. `impact`, `effects`, `path`, `unknowns`
-and `islands` additionally accept `--strict`.
+`orphans`, `diff` and `history` accept `--path <dir>` to run against a
+different repository root, and all but `resolve` accept `--json` for
+machine-readable output instead of the default text. `impact`, `effects`,
+`path`, `unknowns`, `islands` and `history` additionally accept `--strict`.
 
 ## What this displaces, and by how much
 
