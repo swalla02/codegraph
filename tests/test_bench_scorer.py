@@ -278,3 +278,34 @@ def test_the_scorer_reads_only_what_the_resolver_wrote(tmp_path):
     assert ("m.py::a", "m.py::f") in graph.edges
     assert ("m.py::b", "m.py::f") not in graph.edges
     store.close()
+
+
+# -- a target whose suite is not pytest (#71) --------------------------------
+
+
+def test_pytests_own_flags_go_only_to_pytest():
+    """django's runner would exit on `-p no:cacheprovider`.
+
+    The failure this prevents is not a crash anyone would misread -- it is
+    argparse printing usage and the tracer writing an empty trace, which
+    looks exactly like a target with no edges.
+    """
+    from bench.run import TARGETS, suite_command
+
+    flask = TARGETS["flask"]
+    assert suite_command(flask, flask.tests)[:3] == ["-q", "-p", "no:cacheprovider"]
+
+    django = TARGETS["django"]
+    assert suite_command(django, django.tests) == list(django.tests)
+
+
+def test_djangos_suite_runs_in_one_process():
+    """`sys.monitoring` is per-interpreter, so a forked worker is unwatched.
+
+    Left to its default django forks one worker per core and the trace comes
+    back holding whatever the parent happened to do -- a quiet, plausible,
+    wrong number.
+    """
+    from bench.run import TARGETS
+
+    assert "--parallel=1" in TARGETS["django"].tests

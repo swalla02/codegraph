@@ -6,8 +6,12 @@ attributes a grep hit to the wrong function and hands grep a recall it did not
 earn; a wrong `reachers` asks a different question than the one reported.
 """
 
+import re
+
 from bench.callers import (
     PATTERNS,
+    Corpus,
+    GrepResult,
     Outcome,
     Question,
     enclosing,
@@ -121,6 +125,77 @@ def test_transitive_grep_charges_for_every_round():
     two = grep_rounds({"w.py": SOURCE}, "helper", PATTERNS["grep-word"], 2)
     assert two.hits > one.hits
     assert one.callers < two.callers
+
+
+# -- the index that makes django's two hops affordable (#71) -----------------
+
+#: Every way a name can sit next to a word character, which is what the
+#: index has to agree with `\b` about. `unsaved` and `saved` must not answer
+#: a search for `save`; `obj.save` and `save (x)` must.
+NEIGHBOURS = """
+def save(self):
+    return 1
+
+
+def unsaved():
+    return 2
+
+
+def saved():
+    return 3
+
+
+def caller(obj):
+    obj.save()
+    presave_hook = save
+    return save (obj), unsaved(), saved(), "save"
+"""
+
+
+def scan_every_file(files, name, pattern):
+    """`grep_callers` with no index: the definition the index has to match."""
+    expression = re.compile(pattern.format(name=re.escape(name)))
+    callers, hits = set(), 0
+    for path, source in files.items():
+        spans = scopes(source)
+        for index, text in enumerate(source.splitlines(), start=1):
+            if expression.search(text):
+                hits += 1
+                callers.add(f"{path}::{enclosing(spans, index)}")
+    return GrepResult(frozenset(callers), hits)
+
+
+def test_the_index_returns_exactly_what_scanning_every_file_returns():
+    """The optimisation must not move a published number by one hit.
+
+    Skipping a file is only sound because both patterns are anchored by a
+    word boundary on both sides, so every match is a whole word the index
+    knows about. If that ever stops being true the numbers change silently,
+    so it is asserted against the unindexed scan rather than reasoned about.
+    """
+    files = {"n.py": NEIGHBOURS, "w.py": SOURCE, "empty.py": "x = 1\n"}
+    for name in ("save", "unsaved", "saved", "helper", "absent"):
+        for pattern in PATTERNS.values():
+            assert grep_callers(files, name, pattern) == scan_every_file(files, name, pattern)
+
+
+def test_a_name_inside_a_longer_word_is_not_a_hit():
+    """The case the index could plausibly get wrong, spelled out."""
+    result = grep_callers({"n.py": NEIGHBOURS}, "save", PATTERNS["grep-word"])
+    # Four matching LINES: the `def`, the attribute call, the line that
+    # binds the bare name (where `presave_hook` is not a hit), and the return
+    # (where `save (obj)` and the string are, but `unsaved` and `saved` are
+    # not).
+    assert result.hits == 4
+    assert result.callers == frozenset({"n.py::save", "n.py::caller"})
+
+
+def test_a_corpus_answers_a_repeated_question_from_the_first_answer():
+    """Memoisation is the other half of the speedup, and it has to be
+    transparent: the second answer is the first one, not a new one."""
+    tree = Corpus({"w.py": SOURCE})
+    first = tree.callers("helper", PATTERNS["grep-word"])
+    assert tree.callers("helper", PATTERNS["grep-word"]) is first
 
 
 def test_reachers_walks_backwards_hop_by_hop():

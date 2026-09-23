@@ -226,7 +226,60 @@ class GrepResult:
     hits: int
 
 
-def grep_callers(files: Mapping[str, str], name: str, pattern: str) -> GrepResult:
+#: Maximal runs of word characters -- the only thing either pattern in
+#: `PATTERNS` can match. Both are anchored by `\b` on the left, and what
+#: follows the name is a word boundary too (`\b`, or the whitespace and `(`
+#: of the call form), so every match is exactly one of these runs.
+WORDS = re.compile(r"\w+")
+
+
+class Corpus:
+    """The tree grep searches, with an index from name to the files holding it.
+
+    The index changes no answer: a file whose text does not contain the name
+    as a whole word cannot match either pattern, so skipping it skips nothing.
+    It changes what the comparison costs to compute, and on django that is the
+    difference between running it and not. A two-hop grep aims its second
+    round at every name the first turned up -- 800 of them for `save` -- and
+    scanning 2,932 files per name puts one question at ten minutes.
+
+    Results are remembered per (name, pattern) because the rounds repeat
+    themselves heavily: the callers of `save` and the callers of `delete`
+    overlap almost entirely, and every question re-walks the same names.
+    """
+
+    def __init__(self, files: Mapping[str, str]) -> None:
+        self.files = files
+        self.holders: dict[str, list[str]] = {}
+        for path, source in files.items():
+            for word in set(WORDS.findall(source)):
+                self.holders.setdefault(word, []).append(path)
+        self._answers: dict[tuple[str, str], GrepResult] = {}
+
+    def callers(self, name: str, pattern: str) -> GrepResult:
+        key = (name, pattern)
+        if key not in self._answers:
+            self._answers[key] = self._search(name, pattern)
+        return self._answers[key]
+
+    def _search(self, name: str, pattern: str) -> GrepResult:
+        expression = re.compile(pattern.format(name=re.escape(name)))
+        callers: set[str] = set()
+        hits = 0
+        for path in self.holders.get(name, ()):
+            source = self.files[path]
+            lines = source.splitlines()
+            matched = [index + 1 for index, text in enumerate(lines) if expression.search(text)]
+            if not matched:
+                continue
+            hits += len(matched)
+            file_scopes = _cached_scopes(source)
+            for line in matched:
+                callers.add(f"{path}::{enclosing(file_scopes, line)}")
+        return GrepResult(frozenset(callers), hits)
+
+
+def grep_callers(files: Mapping[str, str] | Corpus, name: str, pattern: str) -> GrepResult:
     """Run one pattern over the tree and attribute each hit to its definition.
 
     This models grep at its best, not grep as used: every hit is attributed
@@ -234,19 +287,17 @@ def grep_callers(files: Mapping[str, str], name: str, pattern: str) -> GrepResul
     reading at the fortieth match. The comparison should lose to grep where
     grep can win.
     """
-    expression = re.compile(pattern.format(name=re.escape(name)))
-    callers: set[str] = set()
-    hits = 0
-    for path, source in files.items():
-        lines = source.splitlines()
-        matched = [index + 1 for index, text in enumerate(lines) if expression.search(text)]
-        if not matched:
-            continue
-        hits += len(matched)
-        file_scopes = _cached_scopes(source)
-        for line in matched:
-            callers.add(f"{path}::{enclosing(file_scopes, line)}")
-    return GrepResult(frozenset(callers), hits)
+    return corpus(files).callers(name, pattern)
+
+
+def corpus(files: Mapping[str, str] | Corpus) -> Corpus:
+    """Accept either a tree or an already-indexed one.
+
+    A caller that asks many questions of one tree should build the `Corpus`
+    once and keep it, which is what `discovery.run` does; a caller with three
+    files and one question should not have to care.
+    """
+    return files if isinstance(files, Corpus) else Corpus(files)
 
 
 @cache
@@ -256,7 +307,9 @@ def _cached_scopes(source: str) -> tuple[Scope, ...]:
     return tuple(scopes(source))
 
 
-def grep_rounds(files: Mapping[str, str], name: str, pattern: str, hops: int) -> GrepResult:
+def grep_rounds(
+    files: Mapping[str, str] | Corpus, name: str, pattern: str, hops: int
+) -> GrepResult:
     """Grep for callers, then grep for THEIR callers, `hops` times over.
 
     This is the workflow the instruction in `AGENTS.md` displaces: to answer
@@ -269,6 +322,7 @@ def grep_rounds(files: Mapping[str, str], name: str, pattern: str, hops: int) ->
     importers, and no grep for a name finds those. That dead end is a
     property of the workflow and is left in rather than papered over.
     """
+    tree = corpus(files)
     callers: set[str] = set()
     hits = 0
     searched: set[str] = set()
@@ -277,7 +331,7 @@ def grep_rounds(files: Mapping[str, str], name: str, pattern: str, hops: int) ->
         found: set[str] = set()
         for target in sorted(frontier - searched):
             searched.add(target)
-            result = grep_callers(files, target, pattern)
+            result = tree.callers(target, pattern)
             hits += result.hits
             found |= result.callers
         if not found:

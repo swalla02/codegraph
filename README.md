@@ -19,8 +19,10 @@ and 3 of the paths end in a database write."*
 "Badly" is measured rather than asserted, and the measurement is less
 flattering than the sentence above implies: on pallets/flask, a bare-name grep
 finds **every** caller a run observed, and buries them in five times as much
-output. The graph's measured advantage over grep is density and confidence, not
-recall — see [Does querying beat grepping?](#does-querying-beat-grepping-59).
+output; on django it finds 94% of them and buries those in twenty-three times
+as much. The graph's measured advantage over grep is density and confidence,
+not recall, and it widens with the size of the repository — see
+[Does querying beat grepping?](#does-querying-beat-grepping-59).
 
 It follows git. The parse cache is content-addressed by git blob SHA, so a
 file's content is analysed once for the life of the repository and shared
@@ -725,18 +727,29 @@ is unit-tested there (`tests/test_bench_scorer.py`).
 
 ### What it measures
 
-| | psf/requests | pallets/flask |
-|---|---|---|
-| suite traced | `test_utils.py`, `test_structures.py` (240 tests) | `tests/` (494 tests) |
-| traced call edges (judgeable) | 115 | 2683 |
-| **recall** | **0.79** (91/115) | **0.29** (775/2683) |
-| recall at HIGH/MEDIUM | 0.77 | 0.26 |
-| conditional precision | 0.99 (85/86) | 0.98 (515/524) |
+| | psf/requests | pallets/flask | django/django |
+|---|---|---|---|
+| suite traced | `test_utils.py`, `test_structures.py` (240 tests) | `tests/` (494 tests) | the ORM test apps (5120 tests) |
+| traced call edges (judgeable) | 115 | 2683 | 52774 |
+| **recall** | **0.79** (91/115) | **0.29** (775/2683) | **0.40** (20959/52774) |
+| recall at HIGH/MEDIUM | 0.77 | 0.26 | 0.25 |
+| conditional precision | 0.99 (85/86) | 0.98 (515/524) | 0.91 (9662/10665) |
 
-Measured 2026-09-20 at codegraph `0351e8a`, against psf/requests `dae7ef6` and
-pallets/flask `d73fa1c`. Every run prints the target's commit beside the score,
-because a clone tracks its default branch and two runs a month apart measure
-two different repositories.
+requests and flask measured 2026-09-20 at codegraph `0351e8a`, against psf/requests
+`dae7ef6` and pallets/flask `d73fa1c`; django measured 2026-09-23 at codegraph
+`5c246d5`, against django/django `951d13c`. Every run prints the target's commit
+beside the score, because a clone tracks its default branch and two runs a month
+apart measure two different repositories.
+
+django's suite is not a pytest suite — `tests/runtests.py` writes its own
+settings module, creates test databases and drives unittest itself — so
+`tracer.run_suite` runs it as `__main__` in the traced process rather than
+calling `pytest.main`. The scope is the ORM test apps, listed one by one in
+`bench/run.py`'s `TARGETS`, because the full suite wants memcached, redis, a
+browser and a dozen optional packages; `--parallel=1` is not a speed setting
+but a correctness one, since `sys.monitoring` is per-interpreter and a forked
+worker's edges would be recorded by nobody. It carries no floor: nothing has
+watched this number long enough for one to mean anything.
 
 Worth reading those rows together rather than reading the headline alone,
 because on flask the headline has now sat at 0.29 through three changes that
@@ -928,6 +941,9 @@ callers per line of that output.
 ```sh
 uv run python -m bench.run flask                      # leaves a trace in --work
 uv run python -m bench.discovery flask --work /tmp/codegraph-bench
+
+uv run python -m bench.run django                     # ~6 min of django's ORM tests
+uv run python -m bench.discovery django --work /tmp/codegraph-bench --package-root django/
 ```
 
 pallets/flask `d73fa1c`, 43 symbols, 2026-09-21, codegraph `ef9f22d`:
@@ -952,15 +968,72 @@ at two, at conditional precision 1.00 against grep-word's 0.57 and 0.45. Ten que
 conventional library discriminate between nothing; they are here because a
 result on one repository is an anecdote and this says so.
 
-**The honest reading: the graph does not find more callers than grep.** A
-bare-name grep found every direct caller flask's suite observed, and the query
-found 72% of them. Two hops out grep still wins on recall, 0.79 to 0.58.
+**The honest reading on flask: the graph does not find more callers than
+grep.** A bare-name grep found every direct caller flask's suite observed, and
+the query found 72% of them. Two hops out grep still wins on recall, 0.79 to
+0.58.
 
 What the query wins is the reading: 257 rows against 1328 matching lines at one
 hop, 1062 against 15383 at two. Per line of output that is between 1.6 and 10
 times as many true callers, depending on which of the two greps it is compared
 with, at two to five times the conditional precision — and it says which edges
 it is unsure of, which a grep hit cannot.
+
+#### The second target: django (#71)
+
+flask's result rested on one repository, and on the one where grep was least
+likely to be embarrassed. django is the opposite case — 2,932 files, 124,623
+static edges, an ORM that reaches methods through `Manager` / `QuerySet`
+indirection and `__getattr__`, and names like `save`, `get` and `delete` in
+every file in the tree. Either of grep's two advantages could have collapsed
+there. It was traced (2026-09-23) for exactly that reason: `python -m bench.run
+django` runs the ORM test apps listed in `bench/run.py`'s `TARGETS` — 5,120
+tests, all passing — and observes **57,974 distinct call edges over 14,225
+executed functions**. The question rule is the one flask was asked under,
+unchanged: every symbol the trace can pose a caller question about, 542 of
+them, none dropped.
+
+django/django `951d13c`, 542 symbols, 2026-09-23, codegraph `5c246d5`:
+
+| direct callers | recall | cond. precision | cost | yield |
+|---|---|---|---|---|
+| grep-call | 0.88 | 0.11 | 69027 | 0.031 |
+| grep-word | **0.94** | 0.08 | 118652 | 0.020 |
+| codegraph | 0.63 | **0.65** | **5173** | **0.302** |
+| codegraph `--all` | 0.87 | 0.23 | 23078 | 0.093 |
+
+| within 2 hops | recall | cond. precision | cost | yield |
+|---|---|---|---|---|
+| grep-call | 0.15 | 0.07 | 818756 | 0.014 |
+| grep-word | **0.28** | 0.05 | 2538109 | 0.008 |
+| codegraph | 0.06 | **0.65** | **15859** | **0.277** |
+| codegraph `--all` | 0.13 | 0.26 | 97129 | 0.102 |
+
+**django confirms flask on both counts, and makes one flask-specific claim
+false.** Grep still wins recall — 0.94 to 0.63, or to 0.87 with `--all` — and
+the query still wins the reading, by much more than it did on flask: 5,173 rows
+against 118,652 matching lines at one hop, 15,859 against 2,538,109 at two.
+That is 23x and 160x, where flask read 5x and 14x. The scaling the issue
+guessed at is real, and it runs the way the tool needs it to.
+
+What is new is that a bare-name grep is **no longer perfect**. On flask it
+found every observed direct caller; on django it finds 94% of them, and on 20
+of the 542 questions it finds *none*. Those twenty are the ORM's own
+indirection: a method reached through `property(...)` applied in a class body
+(`Model._set_pk_val`, `FieldFile._get_file`), a `partialmethod` attached to a
+model class by `setattr` under a name assembled at runtime
+(`Model._get_FIELD_display`, `method_set_order`), a lookup registered in a
+class-level registry (`RegisterLookupMixin.register_instance_lookup`), and a
+function handed to SQLite by name (`_sqlite_regexp`). No text in the repository
+puts the caller and the callee in the same search.
+
+It does not follow that the graph finds them. It does not: on all 139 of those
+edges `codegraph` scores zero too, and across the whole django question set
+there is **not one observed caller the query found that neither grep found**.
+Every true caller in the query's answer is in grep's. So the claim #59 corrected stays
+corrected, and gains a caveat rather than losing one: "grep finds every caller"
+was true of flask and is false of django, but what grep misses on django is
+missed by the static graph as well. Only `codegraph trace` reaches it.
 
 What the resolver misses on flask is one shape, and it is the same shape
 `bench/`'s 0.29 is made of: a property read as an attribute (`request.blueprint`
@@ -969,6 +1042,14 @@ has no call syntax to resolve), a decorator applied in a class body
 (`g.setdefault`). grep-word finds all three, because all three put the name in
 the text — which is exactly why "grep misses dynamic dispatch" was the wrong
 claim to make for *direct* callers, and why this section replaced it.
+
+Two honest caveats on the django columns. The query is asked at
+`bench/discovery.py`'s `LIMIT`, 500 rows, and django is big enough for that to
+bind: 1 of 542 questions came back at the cap at one hop and 7 at two (13 and
+96 for `--all`), so those recall figures are a floor rather than the resolver's
+ceiling. And the two-hop gold sets average 138 callers per symbol, which is a
+listing rather than an answer — every tool collapses there, and the column
+worth reading at that depth is the cost.
 
 Where neither can win: a call whose two frames are separated by an out-of-repo
 frame. Those are excluded from the gold set here, because no text in the
@@ -1050,9 +1131,11 @@ decorated methods. `codegraph` misses it too.
   side effects does this reach" would have to be hand-written against the same
   source the tool reads. That is the self-marking problem this whole section
   exists to avoid, so it was left undone rather than done badly.
-- **One repository does the work.** django is the case where grep hurts most
-  and it has no trace here, so it has no gold answers and is not in the tables.
-  requests is in them and is too small and too well-behaved to discriminate.
+- **Two repositories do the work, and only for the deterministic half.**
+  requests is in the tables and is too small and too well-behaved to
+  discriminate. django is now in them, which is what #71 was for; the agent A/B
+  below still rests on flask alone, and nothing here is a second *framework*
+  beyond django.
 - **A trace is a lower bound.** A caller the suite never exercised is missing
   from the gold set, and a tool that finds it is marked down for being right.
   That falls on both sides equally, and it is why the column beside recall is
@@ -1082,16 +1165,20 @@ it is not installed by anything, and it wraps the same CLI handlers.
 
 Do not grep for callers *and then read every hit*. Grep gives you a superset
 with no way to know when you are done — no signal separates the last caller
-from the last line its pattern happened to match — and on flask that superset
-is five times the reading for the same answer (measured above: 1328 matching
-lines against 257 rows, at one hop; 15383 against 1062 at two).
+from the last line its pattern happened to match — and that superset gets more
+expensive the bigger the repository is: on flask it is five times the reading
+for the same answer (1328 matching lines against 257 rows, at one hop; 15383
+against 1062 at two), on django twenty-three times (118652 against 5173) and at
+two hops a hundred and sixty (2538109 against 15859).
 
 The claim this section used to make — that grep *misses* dynamically
-dispatched calls — did not survive being measured. For direct callers it is
-wrong: dispatch through a property, a decorator or a proxy still puts the name
-in the text, and a bare-name grep found every caller flask's suite observed,
-including the ones codegraph's resolver could not. It is right only for a call
-whose two frames are separated by an out-of-repo frame, which no static
-analysis of this repository can see either. `codegraph impact` walks the graph
-and reports the set, its ranking and its confidence per edge; it does not
-report more callers than grep does.
+dispatched calls — did not survive being measured, and the second target did
+not rescue it. Dispatch through a property, a decorator or a proxy still puts
+the name in the text: a bare-name grep found every caller flask's suite
+observed, including the ones codegraph's resolver could not, and on django it
+found 94% of them and every single one the graph found. There are callers
+neither finds — django's ORM attaches methods to model classes under names
+assembled at runtime, and no search of the text and no static graph connects
+those two ends — but that is a case for `codegraph trace`, not for `impact`.
+`codegraph impact` walks the graph and reports the set, its ranking and its
+confidence per edge; it does not report more callers than grep does.
