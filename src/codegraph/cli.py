@@ -26,7 +26,7 @@ from codegraph.render import Report, render_json, render_text
 from codegraph.resolve import find_symbol
 from codegraph.session_hook import ENV_VAR as SESSION_ENV_VAR
 from codegraph.session_hook import HOOK_NAME, install_session_hook, uninstall_session_hook
-from codegraph.sessions import session_log
+from codegraph.sessions import session_log, sessions_by_commit
 from codegraph.store import WORKTREE, Store
 from codegraph.uncertainty import is_incomplete
 
@@ -469,12 +469,24 @@ def _cmd_history(args: argparse.Namespace) -> int:
         except MissingRevisionError as exc:
             print(f"revision not found: {exc.rev}", file=sys.stderr)
             return 1
+        # One `git` process for every step's `Session:` trailers, rather
+        # than one per commit; a commit with none maps to nothing.
+        pointers = sessions_by_commit(root, [step.sha for step in walk.steps])
+        sessions = lambda sha: pointers.get(sha, [])
         if symbol is None:
-            return _emit(range_report(walk, limit=args.limit), args.json, args.strict)
+            return _emit(
+                range_report(walk, limit=args.limit, session_pointers=sessions),
+                args.json,
+                args.strict,
+            )
         if not walk.steps:
             # An empty range has no revision to resolve the name at, and
             # nothing in it could have changed the symbol either way.
-            return _emit(history_report(walk, symbol, limit=args.limit), args.json, args.strict)
+            return _emit(
+                history_report(walk, symbol, limit=args.limit, session_pointers=sessions),
+                args.json,
+                args.strict,
+            )
         forward = not walk.head_matches
         matches = walk.start_matches if forward else walk.head_matches
         if not matches:
@@ -485,7 +497,9 @@ def _cmd_history(args: argparse.Namespace) -> int:
             for node_id in matches:
                 print(f"  {node_id}", file=sys.stderr)
             return 2
-        report = history_report(walk, matches[0], forward=forward, limit=args.limit)
+        report = history_report(
+            walk, matches[0], forward=forward, limit=args.limit, session_pointers=sessions
+        )
         return _emit(report, args.json, args.strict)
     finally:
         store.close()
@@ -938,9 +952,7 @@ def build_parser() -> argparse.ArgumentParser:
     orphans_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     orphans_parser.set_defaults(handler=_cmd_orphans)
 
-    diff_parser = subparsers.add_parser(
-        "diff", help="Report what changed between two revisions"
-    )
+    diff_parser = subparsers.add_parser("diff", help="Report what changed between two revisions")
     diff_parser.add_argument(
         "revspec",
         nargs="?",
@@ -1067,9 +1079,7 @@ def build_parser() -> argparse.ArgumentParser:
             " alone."
         ),
     )
-    session_hook_parser.add_argument(
-        "--path", default=".", help="Repository root (default: cwd)"
-    )
+    session_hook_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
     session_hook_parser.add_argument(
         "--uninstall",
         action="store_true",

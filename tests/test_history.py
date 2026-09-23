@@ -302,6 +302,22 @@ def test_session_pointers_ride_on_the_commit_row_when_a_reader_supplies_them(rep
 # -- the CLI ----------------------------------------------------------------
 
 
+def test_cli_reads_session_trailers_into_both_reports(repo, write, capsys):
+    base = sha(repo)
+    write("m.py", CHARGE, commit="add charge")
+    git(repo, "commit", "--amend", "-q", "-m", "add charge\n\nSession: s://one")
+    write("m.py", CHARGE_NETWORK, commit="network")
+    root = str(repo)
+
+    assert main(["history", "charge", f"{base}..HEAD", "--path", root]) == 0
+    out = capsys.readouterr().out
+    assert out.count("session:") == 1
+    assert "session: s://one" in out
+
+    assert main(["history", f"{base}..HEAD", "--path", root]) == 0
+    assert "session: s://one" in capsys.readouterr().out
+
+
 def test_cli_symbol_and_range_positionals(repo, write, capsys):
     base = sha(repo)
     write("m.py", CHARGE, commit="add charge")
