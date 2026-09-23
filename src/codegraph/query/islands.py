@@ -425,7 +425,7 @@ def _describe(
 
 
 @dataclass(frozen=True)
-class _Labelled:
+class Partition:
     """The whole partition, labelled: what `islands_report` prints rows
     from, and what one symbol's label is read out of.
 
@@ -503,7 +503,7 @@ def island_label(store: Store, rev: str, node_id: str, config: Config | None = N
     re-derivation would be a second implementation, and this project has
     already learned what two implementations of one graph produce.
     """
-    labelled = _labelled(store, rev, config)
+    labelled = labelled_partition(store, rev, config)
     root = labelled.components.find(node_id)
     found = tuple(name for name in MECHANISMS if name in labelled.mechanisms.get(root, set()))
     boundary = labelled.boundaries.get(root, set())
@@ -516,7 +516,7 @@ def island_label(store: Store, rev: str, node_id: str, config: Config | None = N
     )
 
 
-def _labelled(store: Store, rev: str, config: Config | None = None) -> _Labelled:
+def labelled_partition(store: Store, rev: str, config: Config | None = None) -> Partition:
     """The partition plus every label the report puts on it.
 
     Four queries and one pass over the edges, never a query per node: on a
@@ -625,14 +625,14 @@ def _labelled(store: Store, rev: str, config: Config | None = None) -> _Labelled
     ):
         boundaries.setdefault(components.find(row["node_id"]), set()).add(row["kind"])
 
-    return _Labelled(components, members, grouped, mechanisms, boundaries, fan_in, traced)
+    return Partition(components, members, grouped, mechanisms, boundaries, fan_in, traced)
 
 
 def islands_report(store: Store, rev: str, config: Config | None = None, limit: int = 20) -> Report:
     """Connected components of `rev`'s CALLS and INHERITS edges, read as
     undirected, each labelled with the implicit-invocation mechanisms and
     process boundaries found inside it."""
-    labelled = _labelled(store, rev, config)
+    labelled = labelled_partition(store, rev, config)
     members, grouped = labelled.members, labelled.grouped
     mechanisms, boundaries, fan_in = labelled.mechanisms, labelled.boundaries, labelled.fan_in
     traced = labelled.traced
@@ -751,9 +751,11 @@ __all__ = [
     "MECHANISMS",
     "Components",
     "IslandLabel",
+    "Partition",
     "connected_components",
     "is_test_path",
     "island_label",
     "island_roots",
     "islands_report",
+    "labelled_partition",
 ]

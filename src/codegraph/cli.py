@@ -29,6 +29,7 @@ from codegraph.session_hook import HOOK_NAME, install_session_hook, uninstall_se
 from codegraph.sessions import session_log, sessions_by_commit
 from codegraph.store import WORKTREE, Store
 from codegraph.uncertainty import is_incomplete
+from codegraph.viz import build_view, highlight_from_report, render_html
 
 #: Exit code for a `--strict` run whose report carries a blocking unknown.
 #:
@@ -732,6 +733,89 @@ def _no_trace_text(rev: str) -> str:
     )
 
 
+#: How many bytes of source `visualize` will embed before it stops.
+#:
+#: Source is what makes the deepest zoom level a reader can actually land
+#: on -- the acceptance criterion in #60 is getting from the whole
+#: repository to one function's body without changing view -- so the
+#: default is generous enough to cover django (19 MB of Python, which
+#: gzips into the page at about a quarter of that). It is a cap and not a
+#: promise: a repository past it renders with the source of whichever
+#: files fit and says so, rather than writing a file nobody can open.
+SOURCE_BUDGET = 48 * 1024 * 1024
+
+
+def _cmd_visualize(args: argparse.Namespace) -> int:
+    """Write the revision as one self-contained HTML file.
+
+    Global like `islands` and `orphans`, and it shares their exit
+    convention: `0` on a file written, `1` on a `--rev` that will not
+    resolve or a `--highlight` report that cannot be read. It takes no
+    symbol of its own -- a query result enters the picture as the JSON
+    another command already printed, which is what keeps this command from
+    being a second way to ask a question (#60: reads `--json` output or the
+    store, adds no extraction and changes no edge).
+    """
+    root = Path(args.path).resolve()
+    store, indexer = open_workspace(root)
+    try:
+        try:
+            indexer.reconcile(args.rev)
+        except gitio.GitError:
+            print(f"revision not found: {args.rev}", file=sys.stderr)
+            return 1
+        highlight: set[str] = set()
+        label = ""
+        if args.highlight:
+            report_path = Path(args.highlight)
+            try:
+                highlight, label = highlight_from_report(report_path.read_text())
+            except (OSError, ValueError) as exc:
+                print(
+                    f"cannot read {report_path} as a codegraph --json report: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            if not highlight:
+                print(f"warning: {report_path} names no symbols", file=sys.stderr)
+        view = build_view(
+            store,
+            args.rev,
+            repo=root.name,
+            config=indexer.config,
+            source=None if args.no_source else indexer.source,
+            source_budget=0 if args.no_source else args.source_budget,
+            highlight=highlight,
+            highlight_label=label,
+        )
+        out = Path(args.out).resolve()
+        out.write_text(render_html(view), encoding="utf-8")
+        summary = view.summary
+        print(f"{out}  {out.stat().st_size / 1_048_576:.1f} MB")
+        print(
+            f"symbols: {summary['symbols']} · files: {summary['files']} ·"
+            f" edges drawn: {summary['edges_drawn']} of {summary['edges_stored']} ·"
+            f" deferred: {summary['deferred']} · islands: {summary['islands']} ·"
+            f" unexplained: {summary['unexplained']} · observed: {summary['observed']}"
+        )
+        if not args.no_source and summary["source_files"] < summary["files"]:
+            print(
+                f"source: {summary['source_files']} of {summary['files']} files embedded"
+                f" ({summary['source_bytes'] / 1_048_576:.1f} MB); the rest hit"
+                " --source-budget or are not UTF-8",
+                file=sys.stderr,
+            )
+        if highlight and not view.highlight:
+            print(
+                "warning: none of the highlighted symbols are in this revision -- is the"
+                " report from a different --rev?",
+                file=sys.stderr,
+            )
+        return 0
+    finally:
+        store.close()
+
+
 def _cmd_guide(args: argparse.Namespace) -> int:
     """Print the agent-facing workflow. The AGENTS.md block `init` writes
     stays short by pointing here instead of inlining this."""
@@ -1043,6 +1127,36 @@ def build_parser() -> argparse.ArgumentParser:
     trace_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
     trace_parser.add_argument("--rev", default=WORKTREE, help="Revision to bind the trace to")
     trace_parser.set_defaults(handler=_cmd_trace)
+
+    visualize_parser = subparsers.add_parser(
+        "visualize",
+        help="Write the revision as one self-contained, zoomable HTML file",
+    )
+    visualize_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    visualize_parser.add_argument("--rev", default=WORKTREE, help="Revision to draw")
+    visualize_parser.add_argument(
+        "--out", default="codegraph.html", help="File to write (default: codegraph.html)"
+    )
+    visualize_parser.add_argument(
+        "--highlight",
+        metavar="REPORT.json",
+        help="A `--json` report from any other command; the symbols its rows name are"
+        " lit up inside the full view, so an answer is seen in context",
+    )
+    visualize_parser.add_argument(
+        "--no-source",
+        action="store_true",
+        help="Do not embed source text. Smaller file; the deepest zoom level then stops"
+        " at the symbol rather than at its body",
+    )
+    visualize_parser.add_argument(
+        "--source-budget",
+        type=int,
+        default=SOURCE_BUDGET,
+        metavar="BYTES",
+        help=f"Stop embedding source after this many bytes (default: {SOURCE_BUDGET})",
+    )
+    visualize_parser.set_defaults(handler=_cmd_visualize)
 
     guide_parser = subparsers.add_parser("guide", help="Print the agent-facing workflow")
     guide_parser.set_defaults(handler=_cmd_guide)
