@@ -324,6 +324,32 @@ without one are not listed, so empty output is an ordinary answer. **Do not run
 `codegraph install-session-hook` unprompted.** It writes into the user's
 commit messages, and that is their decision.
 
+`codegraph visualize` is the one command whose output is not for you. It
+writes a single self-contained HTML file -- a semantic-zoom treemap of the
+directory tree with the graph drawn over it, packages then modules then
+symbols then source, four edge kinds and three confidence tiers visually
+distinct, islands as fills, and `unexplained` as an absence rather than a
+number. Reach for it when a person asks to *see* the shape of a repository,
+or asks for something they can send somebody; do not produce one to answer a
+question you can answer with a report, and never read the HTML back yourself
+-- every fact in it came from the commands above, and they say it in fewer
+tokens.
+
+The one part that is worth knowing about: it takes any other command's
+`--json` output and lights up the symbols its rows name inside the full
+view.
+
+```
+codegraph impact <id> --json > impact.json
+codegraph visualize --highlight impact.json --out impact.html
+```
+
+That is how an answer is handed over with its surroundings intact -- "45
+dependents" spread across two packages is a different fact from 45 in one
+file. It takes no symbol of its own, so it shares `islands`' exit
+convention: `0` for a file written, `1` for a `--rev` or a `--highlight`
+file it cannot read.
+
 `codegraph diff [<base>..<head>]` reports what a branch actually changed —
 symbols added/removed/changed by content hash (never by line number) plus
 any side effect that newly became reachable. With no argument it diffs
@@ -355,9 +381,9 @@ you name is materialized, nothing is checked out, and nothing the walk
 builds is kept.
 
 All of `resolve`, `impact`, `effects`, `path`, `unknowns`, `islands`,
-`orphans`, `diff` and `history` accept `--path <dir>` to run against a
-different repository root, and all but `resolve` accept `--json` for
-machine-readable output instead of the default text. `impact`, `effects`,
+`orphans`, `diff`, `history` and `visualize` accept `--path <dir>` to run against a
+different repository root, and all but `resolve` and `visualize` accept `--json`
+for machine-readable output instead of the default text. `impact`, `effects`,
 `path`, `unknowns`, `islands` and `history` additionally accept `--strict`.
 
 ## What this displaces, and by how much

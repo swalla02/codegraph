@@ -124,6 +124,7 @@ slower on a cold cache.
 | `codegraph path <A> <B> [--hops N] [--all] [--json] [--strict]` | Report how two symbols are connected: the shortest chain of edges between them, in whichever direction it runs, with each hop's kind, confidence and call site, and the path's own confidence — its weakest hop. Both directions are always checked and the one found is named. When there is none, the report distinguishes three answers that are not the same: no chain within `--hops` (and how many it would take), no directed chain in either direction, and the two being on different islands, which means no walk can ever connect them. |
 | `codegraph islands [--rev REV] [--limit N] [--json] [--strict]` | Report the connected components of the revision's `CALLS`, `INHERITS`, `IMPLEMENTS` and `REFERENCES` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
 | `codegraph orphans [--rev REV] [--limit N] [--include-public] [--include-decorated] [--json]` | Find functions whose every recorded caller is a test — defined, tested, and never invoked by the code that was supposed to invoke it. Such a function is *not* a one-symbol island, precisely because its test calls it, so `islands` structurally cannot surface it. Candidates are private by name, undecorated, defined outside the test tree, and never mentioned by name anywhere in the source text — that last filter has no off switch, because a static call graph cannot see a callback handed to a library. Not a dead-code report (see below). |
+| `codegraph visualize [--rev REV] [--out FILE] [--highlight REPORT.json] [--no-source] [--source-budget BYTES]` | Write the revision as one self-contained, zoomable HTML file: a semantic-zoom treemap of the directory tree with the graph drawn over it, four edge kinds and three confidence tiers visually distinct, islands as fills and `unexplained` as an absence. `--highlight` takes any other command's `--json` output and lights up the symbols its rows name, so an `impact` or `effects` answer is seen in its surroundings. No server, no network, no dependencies (see below). |
 | `codegraph diff [<base>..<head>] [--json]` | Report what changed between two revisions by content hash, never by line number: symbols added/removed/changed, plus any side effect newly reachable. Defaults to `merge-base(default branch, HEAD)..WORKTREE` — "what has this branch changed so far." |
 | `codegraph history [<symbol>] [<base>..<head>] [--islands] [--limit N] [--json] [--strict]` | The graph over a range of commits, oldest first, each compared with its first parent the way `diff` compares two revisions. With a symbol: every commit that changed its body hash, its confident callees, its direct dependents or the side effects reachable from it, followed across a move to another file or class — a pairing reported with a confidence tier, never as the same id. Without one: per commit, the symbols added, removed, moved and changed, and the edges and effects gained and lost; with `--islands`, also the islands that merged or split. Defaults to `merge-base(default branch, HEAD)..HEAD`; only the named range is materialized, and nothing it materializes is kept (see below). |
 | `codegraph trace [FILE] [--rev REV] [--forget]` | Import a recorded run (see "What a trace buys" below) and bind it to a revision, so that calls the resolver cannot see — framework dispatch, `getattr`, a decorator's wrapper — become edges marked `runtime` alongside the ones it deduced. With no argument it describes the trace the revision holds, or tells you how to record one. Additive: a repository with no trace answers exactly as it did before. |
@@ -505,13 +506,206 @@ does not know about a symbol. `3` is the one code outside the convention,
 and only under `--strict`: the name resolved, the report was produced, and
 it has a hole in it.
 
-`islands` and `orphans` take no symbol, so that convention does not apply
-to either: they exit `0` for a report — an empty one included, since "nothing
-matched" is a real answer — and `1` only for a revision they cannot
-resolve.
+`islands`, `orphans` and `visualize` take no symbol, so that convention does
+not apply to any of them: they exit `0` for a report — an empty one included,
+since "nothing matched" is a real answer — and `1` only for a revision they
+cannot resolve.
 
 All commands accept `--path <dir>` to run against a different repository
 root (default: the current directory).
+
+## The picture: `codegraph visualize`
+
+Every other command here produces a ranked list. That is the right shape for
+an agent and a poor one for a person: `islands: 1071 · singletons: 1044 ·
+unexplained: 507` is a fact about django's structure that a reader can count
+and cannot see.
+
+```
+codegraph visualize --out django.html
+```
+
+writes one self-contained HTML file — no server, no account, no network
+fetch, the way `islands` is a command and not a service — and everything in
+it is read back out of the store. It adds no extraction and changes no edge.
+
+### Semantic zoom, over the tree you already know
+
+The obvious objection to drawing this graph is scale, and the obvious answer
+— a force-directed blob — does not survive 124,623 edges. The answer here is
+**semantic zoom**: one view in which the level of zoom decides what is
+legible.
+
+The base layout is a squarified treemap of the directory tree, nested:
+directory, then file, then the symbols inside it with methods inside their
+class. Box area is source lines. The tree is the base layout on purpose —
+a reader already knows their own directory structure, so putting edges over
+it costs them no new mental model, where a force-directed placement asks
+them to learn one that changes every time the graph does. (Mammutmap does
+the nested-boxes half of this; CBRV does the edges-over-a-known-layout half.)
+
+Zooming does not switch between modes. A box is **drawn** once it is a
+couple of pixels across and **opened** once it is about 26 pixels across, so
+what you see is:
+
+| zoom | boxes | edges | labels |
+|---|---|---|---|
+| the whole repository | top-level packages | package against package | package names |
+| a package | its modules | module against module | file names |
+| a module | its classes and functions, methods inside their class | symbol against symbol | symbol names |
+| one symbol | that symbol, filling the view | its own edges | its source, in the panel |
+
+Edges have their own, coarser threshold than boxes, and that is deliberate:
+boxes become legible one at a time, a hundred thousand lines between them do
+not. A file has to be wide enough to read before its symbols carry their own
+lines.
+
+### Four kinds, three tiers, and who says so
+
+A view where every edge looks the same would be a step backwards from the
+text it replaces, so nothing is flattened:
+
+- **Kind** is hue *and* dash pattern, two channels rather than one, so the
+  four survive both a colour-blind reader and a greyscale print: `CALLS`
+  solid blue, `INHERITS` dashed amber, `IMPLEMENTS` dotted green,
+  `REFERENCES` finely dotted violet.
+- **Confidence** is width *and* opacity: HIGH is the heaviest and most
+  opaque line on screen, MEDIUM is thinner and half as opaque, LOW is
+  thinner and fainter again. A LOW edge and a HIGH edge reading identically
+  is the failure mode the text reports go out of their way to avoid, and it
+  is the one thing a picture of this graph must not get wrong.
+- **Provenance** is a halo. An edge a run was observed taking is drawn with
+  a wide translucent underlay in its own colour and then at full opacity, so
+  it is the brightest thing in the picture — which is what "observed" is
+  worth. A symbol the run entered carries a small mark of its own. On a
+  revision with no trace, neither ever appears.
+
+The legend says all of that, and doubles as the control: clicking a kind or
+a tier turns it off, so "show me only what `INHERITS`" is one click inside
+the thing that explained what `INHERITS` looks like.
+
+### Islands, drawn as islands
+
+Island membership is `codegraph islands`' own partition — the same
+`connected_components`, labelled by the same pass — so the picture and the
+report can never disagree about one island.
+
+The largest island is the mainland and gets the one neutral fill. Every
+other island gets a hue of its own, and a container is tinted by the share
+of its symbols that are off the mainland, so an archipelago shows up as
+colour in a grey continent before you can read a single symbol name.
+
+**`unexplained` is drawn as an absence.** The bottom band of every box —
+the share of its symbols sitting on an island no recognised mechanism
+explains — is left unpainted. A wholly unexplained symbol is a hole; a
+package is as hollow as its unexplained fraction; django's 507 unexplained
+islands are visible as gaps rather than as a number in a summary line. An
+unexplained island is still a statement about the tool and not about the
+code, and selecting one says so.
+
+### Seeing an answer in its surroundings
+
+Any other command's `--json` output can be dropped into the full view:
+
+```
+codegraph impact Session.send --json > impact.json
+codegraph visualize --highlight impact.json --out requests.html
+```
+
+Every symbol the report's rows name is ringed, everything else is dimmed,
+and a bar across the top says what is being shown with a **frame** button
+that fits the whole answer on screen. The point is that the answer keeps its
+surroundings: 45 dependents spread across two packages is a different fact
+from 45 dependents in one file, and a ranked list cannot tell you which you
+have. `impact`, `effects`, `path`, `islands`, `unknowns` and `diff` all work,
+because all of them print rows with an `id`.
+
+Selecting a box opens a panel with the symbol's node id, its island label
+(mechanisms found and mechanisms looked for and not found), its recorded
+callers and callees with each edge's kind, tier and provenance, how many
+references in its body produced no edge and why — and its source, read from
+the same revision the graph was built from.
+
+### The bare-name fan-out is not drawn, and is not hidden either
+
+`ambiguity.py` defers 33,329 relationships on django, which stand for up to
+2.07M pairs. Drawing them would be a claim about density that the graph does
+not make. Dropping them would leave a reader wondering why two symbols share
+an island with no edge between them.
+
+So the per-name index the expansion is computed from — one entry per name,
+one per ambiguous reference, linear where the pairs are quadratic — is
+shipped whole, and selecting a symbol expands *its* fan-out on demand and
+draws it as what it is: LOW, derived, and not in the stored graph. That is
+the same pointwise/whole-graph split `Ambiguity.callers` and
+`Ambiguity.hub_edges` already make.
+
+### What it costs
+
+| repository | symbols | edges drawn | file, with source | without |
+|---|---|---|---|---|
+| psf/requests | 807 | 1,444 of 1,671 | 223 KB | 96 KB |
+| pallets/flask | 1,622 | 1,841 of 2,112 | 305 KB | 130 KB |
+| django/django | 43,843 | 94,831 of 124,623 | 6.6 MB | 2.2 MB |
+
+django is the scale test, and it stays interactive: the page opens in about
+0.5 s, redraws in about 12 ms while panning at the whole-repository view and
+under 10 ms once zoomed in — 60 fps with room to spare. (Measured in
+headless Chromium at 1500×900, three runs each: requests 117–174 ms,
+flask ~125 ms, django 400 ms without source and 495–560 ms with it.)
+Three things buy that, and each is a decision rather than a tuning knob:
+
+- **The layout is computed in Python and shipped as rectangles.** A layout
+  recomputed on load is a layout the reader waits for, and it would also
+  make the picture a property of the browser rather than of the revision.
+- **Canvas, not SVG.** 47,451 boxes and 94,831 edges as DOM nodes is
+  142,000 elements the browser restyles on every pan. The canvas draws only
+  what passes the level of detail — a few thousand rectangles — and a
+  symbol's representative at the current zoom is found by a typed-array
+  fill over a preorder range, not by a walk.
+- **The payload is gzipped inside the page** and decompressed with the
+  browser's own `DecompressionStream`; source text is a second blob, read
+  only when somebody first asks to see a body. django's 19 MB of Python
+  costs 4.4 MB in the file and nothing at all on load.
+
+What is capped is capped out loud. At most 120 edge bundles per (kind,
+tier) combination are drawn at once — a quota each rather than a global
+top-N, because django's top-level directories are nearly completely
+connected by `CALLS` and a global top-N would be entirely `CALLS` at HIGH,
+losing the three other kinds at exactly the zoom where the picture is about
+structure. Whatever the quota leaves out is counted on screen, never dropped
+silently.
+
+### Why this ships inside codegraph
+
+The issue that asked for this (#60) deliberately left open whether a
+renderer belongs beside the CLI rather than in it, on the grounds that the
+two have different dependency profiles and release cadences. It ships here,
+for three reasons, and the first is the only one that would be hard to undo.
+
+*The picture and the text must not be able to disagree.* The view's islands
+are `query/islands.py`'s partition, called once. A separate package could
+not import a private module of this one, so it would reimplement the
+partition — and this repository has already learned what two implementations
+of one graph produce.
+
+*The store's schema is not a public API.* The view reads `nodes`, `edges`
+and `unresolved` directly, and `SCHEMA_VERSION` moves whenever the indexer
+needs it to. Shipping the reader separately would freeze that into a
+contract between two independently versioned packages, paid on every future
+index change, for a renderer with no independent reason to release.
+
+*The dependency argument does not apply to this renderer.* It was the
+strongest reason to split, and it dissolves once the output is a generated
+file: the renderer emits HTML, CSS and vanilla JavaScript, and adds exactly
+nothing to `pyproject.toml`'s empty `dependencies`.
+
+The seam is where the split would be made if that ever changes.
+`viz/model.py` is pure data shaping — store rows in, one JSON-ready value
+out, no HTML, no browser, tested offline in `tests/test_viz.py`. `render.py`
+is a template, and is not unit-tested, because what it produces is only
+correct when a browser draws it. A renderer that one day needs a real
+layout or charting dependency moves out of the tree at that line.
 
 ## Confidence, and what earns it
 
