@@ -87,11 +87,23 @@ HOP_LIMIT = "hop_limit"
 #: different thing and deliberately not an entry (see the module docstring).
 LOW_CONFIDENCE = "low_confidence"
 
-#: Every reason an entry can carry: the resolver's four, plus the three a
+#: A symbol's history reached a commit where its body matches more than one
+#: removed definition, so which one it came from is a guess `history` will
+#: not make. The commits before that point, under the earlier id, were not
+#: examined for this symbol.
+LINEAGE_AMBIGUOUS = "lineage_ambiguous"
+
+#: Every reason an entry can carry: the resolver's four, plus the four a
 #: query makes for itself. `NEXT_ACTION` is keyed by exactly this tuple, and
 #: the test that says so is what stops a fifth resolver reason from shipping
 #: without an action.
-REASONS: tuple[str, ...] = (*UNRESOLVED_REASONS, UNEXPLAINED_ISLAND, HOP_LIMIT, LOW_CONFIDENCE)
+REASONS: tuple[str, ...] = (
+    *UNRESOLVED_REASONS,
+    UNEXPLAINED_ISLAND,
+    HOP_LIMIT,
+    LOW_CONFIDENCE,
+    LINEAGE_AMBIGUOUS,
+)
 
 #: The reasons that are answers rather than gaps. See the module docstring.
 SETTLED: tuple[str, ...] = (EXTERNAL, BUILTIN)
@@ -116,6 +128,10 @@ NEXT_ACTION: dict[str, str] = {
     ),
     HOP_LIMIT: "the walk stopped at its budget; re-run with a larger --hops",
     LOW_CONFIDENCE: "an answer exists over LOW-confidence edges; re-run with --all",
+    LINEAGE_AMBIGUOUS: (
+        "the symbol's body matches several removed definitions, so its earlier id is"
+        " a guess; re-run `history` on each candidate id to follow the one you mean"
+    ),
 }
 
 
@@ -147,6 +163,7 @@ def is_incomplete(report: Report) -> bool:
 
 __all__ = [
     "HOP_LIMIT",
+    "LINEAGE_AMBIGUOUS",
     "LOW_CONFIDENCE",
     "NEXT_ACTION",
     "REASONS",

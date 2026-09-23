@@ -260,6 +260,21 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_src ON unresolved(rev, src);
 
 _IGNORE_TEXT = "*\n"
 
+#: Every Layer 2 table, each keyed by `rev`. What `seed_revision` and
+#: `drop_revision` treat as "one revision's graph". The trace tables are
+#: deliberately absent: they are evidence about one revision, not something
+#: derived from its tree, so they are never carried to another revision or
+#: discarded along with one.
+LAYER2_TABLES: tuple[str, ...] = (
+    "revisions",
+    "tree",
+    "nodes",
+    "edges",
+    "effects",
+    "imports",
+    "unresolved",
+)
+
 
 class Store:
     """Owns the SQLite connection for one repository."""
@@ -315,6 +330,48 @@ class Store:
             (key, value),
         )
         self.connection.commit()
+
+    def seed_revision(self, src: str, dst: str, *, move: bool) -> None:
+        """Make `dst`'s Layer 2 rows a copy of `src`'s -- or, with `move`,
+        rekey `src`'s rows to `dst` and leave nothing under `src`.
+
+        Not a materialization. The rows are `src`'s graph filed under
+        another name, and the next `Indexer.reconcile(dst)` treats them as
+        `dst`'s previous state: it diffs `dst`'s real tree against them and
+        rewrites what moved, narrowed exactly as an edit to the working tree
+        would be. That is how `history` pays per commit for the files the
+        commit touched rather than for a cold build of every revision.
+        Whatever `dst` held before is discarded first.
+        """
+        connection = self.connection
+        with connection:
+            for table in LAYER2_TABLES:
+                connection.execute(f"DELETE FROM {table} WHERE rev=?", (dst,))
+                if move:
+                    connection.execute(f"UPDATE {table} SET rev=? WHERE rev=?", (dst, src))
+                    continue
+                columns = [
+                    row["name"]
+                    for row in connection.execute(f"PRAGMA table_info({table})")
+                    if row["name"] != "rev"
+                ]
+                listed = ", ".join(columns)
+                connection.execute(
+                    f"INSERT INTO {table}(rev, {listed}) SELECT ?, {listed} FROM {table}"
+                    " WHERE rev=?",
+                    (dst, src),
+                )
+
+    def drop_revision(self, rev: str) -> None:
+        """Discard `rev`'s Layer 2 rows. Layer 1 is untouched, so the blobs
+        it parsed stay cached for whichever revision sees them next."""
+        with self.connection:
+            for table in LAYER2_TABLES:
+                self.connection.execute(f"DELETE FROM {table} WHERE rev=?", (rev,))
+
+    def revisions(self) -> set[str]:
+        """Every revision with a materialized graph."""
+        return {row["rev"] for row in self.connection.execute("SELECT rev FROM revisions")}
 
     def close(self) -> None:
         self.connection.close()

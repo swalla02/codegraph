@@ -15,6 +15,7 @@ from codegraph.init import SKIPPED, plan_init
 from codegraph.maintenance import gc, plan_hooks
 from codegraph.query.diff import MissingRevisionError, diff_report
 from codegraph.query.effects import effects_report
+from codegraph.query.history import history_range, history_report, range_report, walk_history
 from codegraph.query.impact import impact_report
 from codegraph.query.islands import islands_report
 from codegraph.query.orphans import orphans_report
@@ -441,6 +442,51 @@ def _cmd_diff(args: argparse.Namespace) -> int:
             print(f"revision not found: {exc.rev}", file=sys.stderr)
             return 1
         return _emit(report, args.json)
+    finally:
+        store.close()
+
+
+def _cmd_history(args: argparse.Namespace) -> int:
+    """Report the graph over a range of commits: for one symbol, the commits
+    that changed its body, callees or reachable effects; with no symbol, what
+    every commit added and removed.
+
+    Two optional positionals, told apart by `..`: a symbol never contains
+    one and a range always does, so `history X`, `history A..B` and
+    `history X A..B` each mean the one thing. The exit convention is the
+    symbol-taking commands' `0`/`1`/`2`, applied to the symbol as it stands
+    at the head -- or, for one the range deleted, at the start.
+    """
+    root = Path(args.path).resolve()
+    symbol, revspec = args.symbol, args.revspec
+    if revspec is None and symbol and ".." in symbol:
+        symbol, revspec = None, symbol
+    store, indexer = open_workspace(root)
+    try:
+        try:
+            base, head = history_range(root, revspec)
+            walk = walk_history(store, indexer, base, head, symbol)
+        except MissingRevisionError as exc:
+            print(f"revision not found: {exc.rev}", file=sys.stderr)
+            return 1
+        if symbol is None:
+            return _emit(range_report(walk, limit=args.limit), args.json, args.strict)
+        if not walk.steps:
+            # An empty range has no revision to resolve the name at, and
+            # nothing in it could have changed the symbol either way.
+            return _emit(history_report(walk, symbol, limit=args.limit), args.json, args.strict)
+        forward = not walk.head_matches
+        matches = walk.start_matches if forward else walk.head_matches
+        if not matches:
+            print(f"no symbol matching {symbol!r} at {head} or {base}", file=sys.stderr)
+            return 1
+        if len(matches) > 1:
+            print(f"ambiguous symbol {symbol!r}:", file=sys.stderr)
+            for node_id in matches:
+                print(f"  {node_id}", file=sys.stderr)
+            return 2
+        report = history_report(walk, matches[0], forward=forward, limit=args.limit)
+        return _emit(report, args.json, args.strict)
     finally:
         store.close()
 
@@ -904,6 +950,43 @@ def build_parser() -> argparse.ArgumentParser:
     diff_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
     diff_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     diff_parser.set_defaults(handler=_cmd_diff)
+
+    history_parser = subparsers.add_parser(
+        "history",
+        help="Report how a symbol, or the graph, changed commit by commit",
+        description=(
+            "Walk the commits in <base>..<head> along the first-parent line, oldest"
+            " first, comparing each with its parent the way `diff` compares two"
+            " revisions. With a symbol: every commit that changed its body hash,"
+            " its confident callees or the side effects reachable from it,"
+            " following it across a move to another file or class -- a pairing by"
+            " identical body that is reported with a confidence tier, MEDIUM if"
+            " unique and LOW if not, and never presented as the same id. Without"
+            " one: per commit, the symbols added, removed, moved and changed, and"
+            " the edges and effects gained and lost. Only the named range is"
+            " materialized, nothing is checked out, and every revision the walk"
+            " created is discarded when it ends."
+        ),
+    )
+    history_parser.add_argument(
+        "symbol", nargs="?", default=None, help="Node id, qualname, or trailing name"
+    )
+    history_parser.add_argument(
+        "revspec",
+        nargs="?",
+        default=None,
+        help="<base>..<head> (default: merge-base(default branch, HEAD)..HEAD)",
+    )
+    history_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    history_parser.add_argument(
+        "--limit",
+        type=int,
+        default=40,
+        help="Maximum rows to keep per group -- per commit without a symbol (default: 40)",
+    )
+    history_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    history_parser.add_argument("--strict", action="store_true", help=_STRICT_HELP)
+    history_parser.set_defaults(handler=_cmd_history)
 
     gc_parser = subparsers.add_parser(
         "gc", help="Prune Layer 1 cache entries unreachable from retained revisions"
