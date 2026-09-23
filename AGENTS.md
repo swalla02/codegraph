@@ -29,8 +29,9 @@ query the call graph instead of grepping for callers:
   a witness path to the exact `file:line` that causes it.
 - `codegraph diff` -- what this branch changed, by content hash.
 
-Grep misses dynamic dispatch and never tells you when you have found the last
-caller. Run `codegraph guide` for the full workflow, exit codes, and how to
-read the output. If the command is missing, install it:
+Grep returns a superset you then have to read: on flask, five times the
+output for the same callers (README, "Does querying beat grepping?"). Run
+`codegraph guide` for the full workflow, exit codes, and how to read the
+output. If the command is missing, install it:
 `uv tool install --python 3.12 git+https://github.com/swalla02/codegraph`
 <!-- codegraph:end -->

@@ -110,7 +110,9 @@ PACKAGE_RELATIVE = ("effects/", "query/")
 
 _CODE_SPAN = re.compile(r"`([^`\n]+)`")
 _DOTTED = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
-_PATH = re.compile(r"[\w./-]+\.(?:py|md|toml|json|sql|txt)(?::\d+)?")
+# `jsonl` before `json`, or the alternation matches the shorter one and leaves
+# a trailing `l` behind, turning a file that exists into one that does not.
+_PATH = re.compile(r"[\w./-]+\.(?:py|md|toml|jsonl|json|sql|txt)(?::\d+)?")
 
 _MISSING = object()
 
