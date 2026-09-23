@@ -61,13 +61,18 @@ HERE = Path(__file__).resolve().parent
 class Target:
     name: str
     url: str
-    #: What to hand pytest. A subset, where the full suite needs network or
-    #: services -- the benchmark measures the resolver, and a flaky suite
+    #: What to hand the runner. A subset, where the full suite needs network
+    #: or services -- the benchmark measures the resolver, and a flaky suite
     #: measures the weather.
     tests: tuple[str, ...]
     #: Test-only dependencies the editable install does not pull in.
     extra_deps: tuple[str, ...] = ()
     note: str = ""
+    #: The suite's own entry point, repo-relative, for a target pytest cannot
+    #: run. django is one: `tests/runtests.py` writes a settings module,
+    #: builds test databases and drives unittest itself. `tracer.run_suite`
+    #: executes it as `__main__` in the traced process.
+    script: str | None = None
     #: What `--check-floors` enforces for this target, or None for a target
     #: nobody has measured yet. A floor belongs to the `tests` above and to
     #: no other scope: recall is a property of the suite you trace as much as
@@ -131,6 +136,134 @@ TARGETS: dict[str, Target] = {
                 " connects -- dispatch a call-site graph does not model."
             ),
         ),
+    ),
+    # The target the caller-discovery comparison was missing (#71): the case
+    # where grep should hurt most. 2,932 Python files, an ORM that reaches
+    # methods through `Manager` / `QuerySet` indirection and `__getattr__`,
+    # and method names -- `save`, `get`, `delete` -- that appear in every
+    # file in the tree.
+    #
+    # The scope is django's ORM test apps, named one by one below rather than
+    # `tests/`: the full suite wants memcached, redis, a browser and a dozen
+    # optional packages, and a subset chosen by "what installs" would be a
+    # scope nobody could write down. These are the apps whose subject is the
+    # model and query layer, and they are the ones that exercise the
+    # indirection the comparison is here to test. No floor: this target is
+    # scored by `bench/discovery.py`, not by `score.py`, and a floor is a
+    # promise about a number somebody is watching.
+    "django": Target(
+        name="django",
+        url="https://github.com/django/django",
+        script="tests/runtests.py",
+        tests=(
+            # `--parallel=1` is not a speed setting. django's runner forks
+            # worker processes by default, and `sys.monitoring` is
+            # per-interpreter: every edge made in a worker would be recorded
+            # by nobody and the trace would come back nearly empty.
+            "--parallel=1",
+            "aggregation",
+            "aggregation_regress",
+            "annotations",
+            "basic",
+            "bulk_create",
+            "composite_pk",
+            "constraints",
+            "custom_columns",
+            "custom_lookups",
+            "custom_managers",
+            "custom_methods",
+            "custom_pk",
+            "datatypes",
+            "dates",
+            "datetimes",
+            "db_functions",
+            "db_typecasts",
+            "db_utils",
+            "defer",
+            "defer_regress",
+            "delete",
+            "delete_regress",
+            "distinct_on_fields",
+            "empty",
+            "expressions",
+            "expressions_case",
+            "expressions_window",
+            "extra_regress",
+            "field_defaults",
+            "field_subclassing",
+            "filtered_relation",
+            "force_insert_update",
+            "foreign_object",
+            "from_db_value",
+            "generic_relations",
+            "generic_relations_regress",
+            "get_earliest_or_latest",
+            "get_or_create",
+            "indexes",
+            "introspection",
+            "known_related_objects",
+            "lookup",
+            "m2m_and_m2o",
+            "m2m_intermediary",
+            "m2m_multiple",
+            "m2m_recursive",
+            "m2m_regress",
+            "m2m_signals",
+            "m2m_through",
+            "m2m_through_regress",
+            "m2o_recursive",
+            "managers_regress",
+            "many_to_many",
+            "many_to_one",
+            "many_to_one_null",
+            "max_lengths",
+            "model_enums",
+            "model_fields",
+            "model_indexes",
+            "model_inheritance",
+            "model_inheritance_regress",
+            "model_meta",
+            "model_options",
+            "model_regress",
+            "model_utils",
+            "multiple_database",
+            "mutually_referential",
+            "nested_foreign_keys",
+            "null_fk",
+            "null_fk_ordering",
+            "null_queries",
+            "one_to_one",
+            "or_lookups",
+            "order_with_respect_to",
+            "ordering",
+            "prefetch_related",
+            "properties",
+            "proxy_model_inheritance",
+            "proxy_models",
+            "queries",
+            "queryset_pickle",
+            "raw_query",
+            "reserved_names",
+            "reverse_lookup",
+            "save_delete_hooks",
+            "schema",
+            "select_for_update",
+            "select_related",
+            "select_related_onetoone",
+            "select_related_regress",
+            "string_lookup",
+            "swappable_models",
+            "timezones",
+            "transaction_hooks",
+            "transactions",
+            "unmanaged_models",
+            "update",
+            "update_only_fields",
+            "validation",
+            "xor_lookups",
+        ),
+        extra_deps=("tzdata",),
+        note="the ORM test apps, on the default sqlite settings; see --tests to narrow",
     ),
 }
 
@@ -204,7 +337,19 @@ def make_venv(target: Target, repo: Path, work: Path) -> Path:
     return python
 
 
-def trace(python: Path, repo: Path, out: Path, tests: tuple[str, ...]) -> dict:
+def suite_command(target: Target, tests: tuple[str, ...]) -> list[str]:
+    """The runner half of the tracer's argv, after `--`.
+
+    pytest's two quieting flags are pytest's, so a `script` target gets its
+    own arguments and nothing else: handing `-p no:cacheprovider` to django's
+    runner would only make it exit on an unknown option.
+    """
+    if target.script is not None:
+        return list(tests)
+    return ["-q", "-p", "no:cacheprovider", *tests]
+
+
+def trace(python: Path, repo: Path, out: Path, tests: tuple[str, ...], target: Target) -> dict:
     started = time.perf_counter()
     _run(
         [
@@ -217,11 +362,9 @@ def trace(python: Path, repo: Path, out: Path, tests: tuple[str, ...]) -> dict:
             str(repo),
             "--out",
             str(out),
+            *(() if target.script is None else ("--script", str(repo / target.script))),
             "--",
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            *tests,
+            *suite_command(target, tests),
         ],
         cwd=repo,
         check=False,  # a suite with failures still produced a real trace
@@ -366,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"reusing {trace_path}")
         traced = json.loads(trace_path.read_text())
     else:
-        traced = trace(make_venv(target, repo, work), repo, trace_path, tests)
+        traced = trace(make_venv(target, repo, work), repo, trace_path, tests, target)
 
     store = index(repo, rebuild=args.rebuild)
     graph = read_static_graph(store, WORKTREE)

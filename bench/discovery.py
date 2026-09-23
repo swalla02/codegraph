@@ -2,6 +2,7 @@
 
     uv run python -m bench.discovery flask --work /tmp/codegraph-bench
     uv run python -m bench.discovery flask --json /tmp/discovery.json
+    uv run python -m bench.discovery django --work ... --package-root django/
 
 This is the deterministic half of #59. It compares the two ways of answering
 "who calls this" against the same runtime trace `bench/run.py` already
@@ -34,6 +35,7 @@ from pathlib import Path
 
 from bench.callers import (
     PATTERNS,
+    Corpus,
     GrepResult,
     Outcome,
     Question,
@@ -125,7 +127,7 @@ def ask_codegraph(
 
 def run(repo: Path, trace: Trace, package_root: str) -> tuple[dict[int, list], dict[int, list]]:
     """Ask every question at every depth, of every tool."""
-    sources = read_sources(repo)
+    sources = Corpus(read_sources(repo))
     store = index(repo)
     by_depth: dict[int, list] = {}
     asked_by_depth: dict[int, list[Question]] = {}
@@ -139,7 +141,12 @@ def run(repo: Path, trace: Trace, package_root: str) -> tuple[dict[int, list], d
             outcomes: dict[str, list[Outcome]] = {
                 tool: [] for tool in (*PATTERNS, *CODEGRAPH_MODES)
             }
-            for question in asked:
+            for number, question in enumerate(asked, start=1):
+                # Progress, because django asks 542 questions twice over and
+                # a silent process running that long is indistinguishable
+                # from a hung one. stderr, so `--json` and the tables stay
+                # clean.
+                print(f"{hops} hop(s) {number}/{len(asked)} {question.symbol}", file=sys.stderr)
                 for tool, pattern in PATTERNS.items():
                     result: GrepResult = grep_rounds(sources, question.name, pattern, hops)
                     outcomes[tool].append(Outcome(question, tool, result.callers, result.hits))

@@ -333,9 +333,16 @@ every observed direct caller, in 1328 matching lines to hand over 197 of
 them; `codegraph impact` found 72% of the same set in 257 rows. Two hops out
 — "what breaks if I change this" — grep costs 15383 lines against 1062.
 
+The same measurement on django/django, over the 542 symbols its ORM suite
+could pose: grep finds 94% of the observed direct callers in 118652 matching
+lines, `impact` 63% in 5173 rows. The gap in reading is the part that scales
+with the repository — 5x on flask, 23x on django, 160x at two hops — and the
+gap in recall does not close.
+
 So: `impact` for the ranked, deduplicated answer with a confidence per edge,
 and grep when you want the superset and can afford to read it. Neither finds
-a call whose two frames are separated by an out-of-repo frame; only
+a call whose two frames are separated by an out-of-repo frame, nor a method
+django's ORM attaches to a class under a name assembled at runtime; only
 `codegraph trace` does.
 
 ## Reading the output
