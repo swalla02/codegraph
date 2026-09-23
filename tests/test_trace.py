@@ -663,3 +663,84 @@ def test_the_tracer_is_inside_the_installed_package():
     from codegraph import tracer
 
     assert Path(tracer.__file__).parent == Path(codegraph.__file__).parent
+
+
+# -- a suite that is not a pytest suite (#71) --------------------------------
+
+
+def _write_runner(directory, body):
+    """A standalone script, plus a sibling module only importable from beside it."""
+    (directory / "sibling.py").write_text("MARK = 'imported from the script directory'\n")
+    script = directory / "runner.py"
+    script.write_text(body)
+    return script
+
+
+def run_suite_in_a_subprocess(script, arguments):
+    """`tracer.run_suite` in a process of its own.
+
+    It mutates `sys.path` and `sys.argv` and runs somebody else's `__main__`
+    -- all three of which leak into whatever runs next. In-process that would
+    be this test session.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from codegraph import tracer
+
+    helper = (
+        "import json, sys;"
+        f" sys.path.insert(0, {str(Path(tracer.__file__).parent.parent)!r});"
+        " from codegraph.tracer import run_suite;"
+        " print(json.dumps(run_suite(sys.argv[1], sys.argv[2:])))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", helper, str(script), *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed
+
+
+def test_a_script_runs_as_main_with_its_own_argv_and_directory(tmp_path):
+    """The three things a runner like django's reads.
+
+    `tests/runtests.py` does all of it: it guards its work behind
+    `__name__ == "__main__"`, parses `sys.argv`, and imports its settings
+    module from its own directory. Run it any other way and it either does
+    nothing at all or fails on an import, both silently enough to be mistaken
+    for an empty suite.
+    """
+    script = _write_runner(
+        tmp_path,
+        "import sys\n"
+        "if __name__ == '__main__':\n"
+        "    import sibling\n"
+        "    print('argv', sys.argv[1:], sibling.MARK)\n",
+    )
+    completed = run_suite_in_a_subprocess(script, ["--parallel=1", "basic"])
+    assert completed.returncode == 0, completed.stderr
+    assert "argv ['--parallel=1', 'basic'] imported from the script directory" in completed.stdout
+
+
+def test_a_failing_script_reports_its_status_instead_of_propagating(tmp_path):
+    """A suite with failures still produced a real trace.
+
+    `main` writes the trace in a `finally`, so a `SystemExit` escaping here
+    would not lose it -- but it would make the tracer exit non-zero and
+    `bench/run.py` treat a perfectly good trace as a failed run.
+    """
+    script = _write_runner(tmp_path, "import sys\nsys.exit(1)\n")
+    completed = run_suite_in_a_subprocess(script, [])
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip().endswith("1")
+
+
+def test_a_script_that_falls_off_the_end_is_a_pass(tmp_path):
+    """No `SystemExit` is success, the way a shell reads it."""
+    script = _write_runner(tmp_path, "pass\n")
+    completed = run_suite_in_a_subprocess(script, [])
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip().endswith("0")
