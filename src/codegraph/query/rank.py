@@ -44,10 +44,19 @@ def fan_in(store: Store, rev: str, node_id: str, ambiguity: Ambiguity | None = N
     one caller. Without one this counts materialized edges only, which is
     what a caller holding no expansion for the revision can honestly say.
     """
+    # The set comprehension does the de-duplicating, so `SELECT DISTINCT`
+    # would be asking for it twice -- and asking twice costs more than it
+    # sounds. With `DISTINCT src` in the query SQLite prefers `idx_edges_src`,
+    # which it can read in src order and which knows nothing about `dst`, so
+    # it walks every edge in the revision to answer a question about one
+    # node. Without it, it uses `idx_edges_dst` and seeks. On a repository
+    # the size of django that is 87ms against 0.06ms, per dependent, on a
+    # report that calls this once per dependent -- which is why `impact`
+    # there took minutes. `tests/test_perf.py` pins the plan.
     sources = {
         row["src"]
         for row in store.connection.execute(
-            "SELECT DISTINCT src FROM edges WHERE rev=? AND dst=?", (rev, node_id)
+            "SELECT src FROM edges WHERE rev=? AND dst=?", (rev, node_id)
         )
     }
     if ambiguity is None:
