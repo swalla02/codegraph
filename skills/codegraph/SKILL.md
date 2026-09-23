@@ -311,6 +311,15 @@ With a trace imported:
   `stale` rather than quietly used. A repository with no trace, or a wholly
   stale one, answers exactly as it always has.
 
+`codegraph sessions [<revspec>]` lists the `Session: <uri>` trailers commits
+carry: a pointer from a commit to the conversation, PR thread or notes that
+produced it. Reach for it when the question is *why* code is shaped the way it
+is. The pointer is opaque, so pass it on unchanged and never parse it, and a
+pointer you cannot open is "session not available", not an error. Commits
+without one are not listed, so empty output is an ordinary answer. **Do not run
+`codegraph install-session-hook` unprompted.** It writes into the user's
+commit messages, and that is their decision.
+
 `codegraph diff [<base>..<head>]` reports what a branch actually changed —
 symbols added/removed/changed by content hash (never by line number) plus
 any side effect that newly became reachable. With no argument it diffs

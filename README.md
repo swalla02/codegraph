@@ -81,7 +81,8 @@ did not write. It:
   never touches one there is.
 
 It does not install git hooks. That stays behind `install-hooks`, which you ask
-for by name.
+for by name — and the one hook that writes into commits stays behind
+`install-session-hook`, which `install-hooks` does not install either.
 
 `AGENTS.md` is the cross-agent convention — Codex, Cursor, Gemini CLI, Copilot's
 coding agent, Aider, goose, opencode, Zed, Windsurf, Amp, Warp, Junie, Jules,
@@ -126,6 +127,8 @@ slower on a cold cache.
 | `codegraph init` | Make this repository's coding agents aware of codegraph: an `AGENTS.md` section, the `@AGENTS.md` bridge into an existing `CLAUDE.md`, and a commented `codegraph.toml` stub. Idempotent; never overwrites content it did not write; never touches `.git/`. |
 | `codegraph guide` | Print the agent-facing workflow to stdout — the same text the plugin ships as `SKILL.md`, so the short `AGENTS.md` section can defer to it rather than inline it. |
 | `codegraph install-hooks` | Install `post-commit`/`post-checkout`/`post-merge` git hooks that warm the cache in the background. Purely an optimization — every query reconciles the working tree itself regardless (see below), so results are identical whether or not a hook ever fires. |
+| `codegraph sessions [<revspec>] [--json]` | List the `Session:` trailers commits carry — the pointer from a commit to the session that produced it (see "Sessions: which conversation wrote a commit" below) — as `<commit>  <pointer>`, newest first. `<revspec>` is a revision or range as `git log` takes it, default `HEAD`. Commits without a pointer are not listed, so a repository with none prints nothing. Reads git only. |
+| `codegraph install-session-hook [--uninstall]` | **Opt-in, and it writes into your commit messages.** Installs a `prepare-commit-msg` hook that appends `Session: $CODEGRAPH_SESSION` when that variable is set. Nothing else installs it, `install-hooks` included; `--uninstall` takes it back out. |
 
 ### What an island is, and is not
 
@@ -556,6 +559,85 @@ What it does **not** buy: a better benchmark number. `bench/` scores the
 resolver, so it reads `static` rows only — importing a trace into a target
 repository leaves every figure in the table below unchanged, which is
 checked rather than asserted (`tests/test_bench_scorer.py`).
+
+## Sessions: which conversation wrote a commit
+
+A trace says *that* an edge is real. A session says *why* the code is shaped
+the way it is. Most code is now written in a conversation with an agent, and
+that conversation — the alternatives rejected, the constraint that forced the
+odd shape — is thrown away, leaving a sentence of it in the commit message.
+A commit can keep a pointer to it instead, as a git trailer:
+
+```
+Fix the retry loop
+
+Co-Authored-By: ...
+Session: <uri>
+```
+
+`codegraph sessions` lists them:
+
+```sh
+codegraph sessions                  # every commit reachable from HEAD that has one
+codegraph sessions main..HEAD       # just this branch
+codegraph sessions --json
+```
+
+The contract is small on purpose:
+
+- **The pointer is opaque.** Whatever follows `Session:` is returned as a
+  string — a Claude Code session id, a Codex rollout path, a PR thread, a
+  design doc, your own notes. It is never parsed, and there is no field
+  for which agent wrote it. It works the same for a human.
+- **The link lives in git, not in the index.** It travels with push and
+  clone, and git reads it: `git log`'s own trailer parsing decides what
+  counts (the last paragraph, `key: value` lines, the key matched
+  case-insensitively), so a `Session:` line in the middle of a message body
+  is not one.
+- **Absence is not an error.** A commit without a pointer, and a directory
+  that is not a git repository, answer with nothing. A repository with no
+  pointers answers every other command exactly as it did before; like a
+  trace, the link is additive.
+
+### Opening a session is an adapter's job
+
+Turning a pointer into "open this session", or better, "fork it and ask the
+agent that wrote this code why", depends entirely on the agent, so none of
+it is in codegraph. An adapter lives beside the core, takes the opaque
+pointer `codegraph sessions --json` hands it, and either opens the session or
+reports **session not available**. That is an answer, not a failure:
+transcripts can hold secrets and are often local-only, so a pointer that
+resolves on one machine will not on another. Where an agent cannot fork a
+session, the fallback is to hand the transcript to a new one as context.
+
+### Writing the pointer (opt-in)
+
+Writing the pointer is the agent's or your job, and a hand-written trailer
+is read exactly like any other. For convenience, and only if you ask for it:
+
+```sh
+codegraph install-session-hook               # add the prepare-commit-msg hook
+export CODEGRAPH_SESSION="<uri>"             # the agent exports its session
+codegraph install-session-hook --uninstall   # take it out again
+```
+
+**This hook writes into your commit messages**, which is why it is its own
+command and why neither `install-hooks` nor `init` ever installs it:
+`install-hooks` stays a pure warming optimization, and `init` never touches
+`.git/`. The hook:
+
+- does nothing unless `CODEGRAPH_SESSION` is set and non-empty;
+- appends through `git interpret-trailers`, so the pointer lands in the
+  trailer block beside `Co-Authored-By:` and is never duplicated — an
+  `--amend` in the same session adds nothing, one from another session adds
+  a second pointer;
+- writes only into a message that exists before the editor opens (`-m`,
+  `-F`, `--amend`, `-c`/`-C`). A draft you have yet to write in the editor
+  is left alone, because a trailer in it would stop git from aborting when
+  you quit without a message. Merge and squash messages are left alone too:
+  the commits they are drafted from carry their own pointers;
+- can never fail a commit, and keeps an existing `prepare-commit-msg` hook
+  intact, under the same rules as `install-hooks`.
 
 ## `codegraph.toml`
 
