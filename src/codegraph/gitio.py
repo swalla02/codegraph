@@ -192,6 +192,26 @@ def merge_base(root: Path, a: str, b: str) -> str:
     return _run(root, "merge-base", "--end-of-options", a, b).decode().strip()
 
 
+def log_format(root: Path, fmt: str, revspec: str) -> bytes:
+    """`git log --format=<fmt> <revspec>`, raw. `revspec` is one argument:
+    a revision or a range. Guarded by `--end-of-options` as `ls_tree` is,
+    since it can come straight from the command line."""
+    return _run(root, "log", f"--format={fmt}", "--end-of-options", revspec)
+
+
+def log_format_commits(root: Path, fmt: str, commits: list[str]) -> bytes:
+    """`git log --format=<fmt>` over exactly `commits` -- none of their
+    ancestors -- in the order given.
+
+    The commits go through `--stdin` rather than argv, so the list has no
+    length limit. `--stdin` still reads a line starting with `-` as an
+    option, so this is for commit ids the caller already holds, not for
+    text from the command line; `log_format` is that.
+    """
+    stdin = ("\n".join(commits) + "\n").encode()
+    return _run(root, "log", "--no-walk=unsorted", f"--format={fmt}", "--stdin", stdin=stdin)
+
+
 def default_branch(root: Path) -> str:
     for candidate in ("origin/HEAD", "main", "master"):
         try:

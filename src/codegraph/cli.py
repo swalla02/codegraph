@@ -23,6 +23,9 @@ from codegraph.query.unknowns import DEFAULT_HOPS as UNKNOWNS_HOPS
 from codegraph.query.unknowns import unknowns_report
 from codegraph.render import Report, render_json, render_text
 from codegraph.resolve import find_symbol
+from codegraph.session_hook import ENV_VAR as SESSION_ENV_VAR
+from codegraph.session_hook import HOOK_NAME, install_session_hook, uninstall_session_hook
+from codegraph.sessions import session_log
 from codegraph.store import WORKTREE, Store
 from codegraph.uncertainty import is_incomplete
 
@@ -481,6 +484,74 @@ def _cmd_install_hooks(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_install_session_hook(args: argparse.Namespace) -> int:
+    """Install, or with `--uninstall` remove, the opt-in `prepare-commit-msg`
+    hook that writes `Session: $CODEGRAPH_SESSION` into commit messages.
+
+    Its own command rather than a flag on `install-hooks`, because it is the
+    one thing codegraph can install that changes what a user commits: see
+    `session_hook.py`. Skips are loud on stderr for the reason
+    `_cmd_install_hooks` gives.
+    """
+    root = Path(args.path).resolve()
+    try:
+        if args.uninstall:
+            removal = uninstall_session_hook(root)
+            if removal.reason:
+                print(f"skipped {HOOK_NAME}: {removal.reason}", file=sys.stderr)
+                return 1
+            if removal.removed:
+                print(f"removed the session trailer from {removal.path}")
+            else:
+                print(f"no session trailer installed in {removal.path}")
+            return 0
+        result = install_session_hook(root)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if not result.installed:
+        print(f"skipped {result.name}: {result.reason}", file=sys.stderr)
+        return 1
+    print(result.path)
+    print(
+        f"commits made with {SESSION_ENV_VAR} set will carry a `Session:` trailer"
+        " -- this hook writes into commit messages",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _cmd_sessions(args: argparse.Namespace) -> int:
+    """List the session pointers commits carry as `Session:` trailers.
+
+    Reads git and nothing else -- no reconcile, no store -- because the link
+    lives in the history, not in the index (see `sessions.py`). Only commits
+    that carry a pointer are listed, so a repository with none prints
+    nothing (or `[]`) and exits `0`: an absence is an answer. A directory
+    that is not a git repository has no history to read, and says so on
+    stderr the way `init` does, without failing. `1` is kept for a revspec
+    that does not resolve, matching every other command's bad `--rev`.
+    """
+    root = Path(args.path).resolve()
+    if not gitio.is_repo(root):
+        print(f"note: {root} is not a git repository", file=sys.stderr)
+        records = []
+    else:
+        try:
+            records = [r for r in session_log(root, args.revspec) if r.sessions]
+        except gitio.GitError:
+            print(f"revision not found: {args.revspec}", file=sys.stderr)
+            return 1
+    if args.json:
+        payload = [{"commit": r.commit, "sessions": r.sessions} for r in records]
+        print(json.dumps(payload, indent=2))
+        return 0
+    for record in records:
+        for pointer in record.sessions:
+            print(f"{record.commit}  {pointer}")
+    return 0
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     """Make this repository's coding agents aware of codegraph: an AGENTS.md
     section, the CLAUDE.md bridge if there is a CLAUDE.md, and an inert
@@ -875,6 +946,53 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hooks_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
     hooks_parser.set_defaults(handler=_cmd_install_hooks)
+
+    sessions_parser = subparsers.add_parser(
+        "sessions",
+        help="List the session pointers commits carry as `Session:` trailers",
+        description=(
+            "Read the `Session: <uri>` trailers in commit messages -- the pointer"
+            " from a commit to the session (an agent conversation, a PR thread,"
+            " notes) that produced it -- and list them as `<commit>  <pointer>`,"
+            " newest first. The pointer is opaque: codegraph does not parse it or"
+            " know which agent wrote it. Commits without one are not listed."
+        ),
+    )
+    sessions_parser.add_argument(
+        "revspec",
+        nargs="?",
+        default="HEAD",
+        help="A revision or range, as `git log` takes it (default: HEAD)",
+    )
+    sessions_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    sessions_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    sessions_parser.set_defaults(handler=_cmd_sessions)
+
+    session_hook_parser = subparsers.add_parser(
+        "install-session-hook",
+        help=(
+            "Opt in: a prepare-commit-msg hook that WRITES a `Session:` trailer"
+            f" into commit messages when {SESSION_ENV_VAR} is set"
+        ),
+        description=(
+            "Install a prepare-commit-msg hook that appends"
+            f" `Session: ${SESSION_ENV_VAR}` to the commit message, through"
+            f" `git interpret-trailers`, whenever {SESSION_ENV_VAR} is set and"
+            " non-empty. Unlike `install-hooks` this changes what you commit, which"
+            " is why it is its own command and nothing else installs it. An existing"
+            " prepare-commit-msg hook is kept; merge and squash messages are left"
+            " alone."
+        ),
+    )
+    session_hook_parser.add_argument(
+        "--path", default=".", help="Repository root (default: cwd)"
+    )
+    session_hook_parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Remove the block again, leaving the rest of the hook as it was",
+    )
+    session_hook_parser.set_defaults(handler=_cmd_install_session_hook)
 
     return parser
 
