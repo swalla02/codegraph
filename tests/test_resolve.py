@@ -867,7 +867,7 @@ def test_an_ambiguous_constructor_still_reaches_the_init_it_would_run(repo, writ
     """A LOW guess at which class a bare name means stays a LOW guess about
     which `__init__` runs -- but it must still be reachable.
 
-    `box.Widget()` is an all-LOW fan-out made entirely of classes, so since #25
+    `factory.Widget()` is an all-LOW fan-out made entirely of classes, so since #25
     it is not materialized at all. Merging #25 with the constructor edge lost
     this link on both paths at once: deferred at index time, and missing from
     the query-time expansion, which only knew about name matches. Query-time
@@ -879,7 +879,7 @@ def test_an_ambiguous_constructor_still_reaches_the_init_it_would_run(repo, writ
     """
     write("one.py", "class Widget:\n    def __init__(self):\n        pass\n")
     write("two.py", "class Widget:\n    def __init__(self):\n        pass\n")
-    write("use.py", "def build(box):\n    return box.Widget()\n", commit="ambiguous")
+    write("use.py", "def build(factory):\n    return factory.Widget()\n", commit="ambiguous")
     store, indexer = build(repo)
     indexer.reconcile("HEAD")
 
@@ -888,7 +888,7 @@ def test_an_ambiguous_constructor_still_reaches_the_init_it_would_run(repo, writ
     ).fetchone()["n"]
     assert stored == 0, "the fixture stopped exercising the unmaterialized path"
 
-    offered = set(Ambiguity(store, "HEAD").candidates("box.Widget"))
+    offered = set(Ambiguity(store, "HEAD").candidates("factory.Widget"))
     assert offered == {
         "one.py::Widget",
         "two.py::Widget",
