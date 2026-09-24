@@ -94,8 +94,31 @@ PROSE_FILES = ("README.md", "AGENTS.md")
 INDEX_PACKAGES = ("codegraph", "bench")
 
 #: A dotted name ending in one of these is a filename, not a symbol.
+#:
+#: `css` and `js` are here for the same reason the rest are, and they
+#: earned their place the hard way: `view.css` and `view.js` are the two
+#: files `viz/render.py` inlines into a generated page, and `view` is also
+#: the lower-cased form of a class this package defines, so without this
+#: the scanner read two filenames as attribute accesses that do not exist.
 FILE_SUFFIXES = frozenset(
-    {"py", "md", "toml", "json", "txt", "cfg", "ini", "yaml", "yml", "lock", "db", "sh", "sql"}
+    {
+        "py",
+        "md",
+        "toml",
+        "json",
+        "txt",
+        "cfg",
+        "ini",
+        "yaml",
+        "yml",
+        "lock",
+        "db",
+        "sh",
+        "sql",
+        "css",
+        "js",
+        "html",
+    }
 )
 
 #: Path prefixes a citation can be checked against. A path under `tests/` is
@@ -106,13 +129,16 @@ PATH_PREFIXES = ("src/codegraph/", "bench/", "skills/", ".claude-plugin/")
 
 #: Directories inside the package that prose names package-relatively, as in
 #: `effects/propagate.py` or `query/islands.py`.
-PACKAGE_RELATIVE = ("effects/", "query/")
+PACKAGE_RELATIVE = ("effects/", "query/", "viz/")
 
 _CODE_SPAN = re.compile(r"`([^`\n]+)`")
 _DOTTED = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 # `jsonl` before `json`, or the alternation matches the shorter one and leaves
 # a trailing `l` behind, turning a file that exists into one that does not.
-_PATH = re.compile(r"[\w./-]+\.(?:py|md|toml|jsonl|json|sql|txt)(?::\d+)?")
+# `jsonl` before `json` before `js`, for the same reason: the alternation
+# takes the first branch that matches, and a shorter one first would cut a
+# real filename in half.
+_PATH = re.compile(r"[\w./-]+\.(?:py|md|toml|jsonl|json|js|css|html|sql|txt)(?::\d+)?")
 
 _MISSING = object()
 

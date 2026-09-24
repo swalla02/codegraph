@@ -108,7 +108,7 @@ class Ambiguity:
         #: `resolve.with_constructors` adds this edge for every class the
         #: resolver actually distinguished, but an all-LOW fan-out is not
         #: materialized at all now, and a fan-out CAN be entirely classes --
-        #: `box.Widget()` with two `Widget` classes in the repo. Without this,
+        #: `factory.Widget()` with two `Widget` classes in the repo. Without this,
         #: merging query-time expansion with the constructor edge lost that
         #: `__init__` link on both paths at once: deferred at index time, and
         #: absent from the expansion. Query-time expansion has to produce
@@ -173,7 +173,7 @@ class Ambiguity:
         """Every name an ambiguous reference could use to reach `node_id`.
 
         Usually just the node's own last segment. A constructor is the
-        exception and the reason this exists: `box.Widget()` reaches
+        exception and the reason this exists: `factory.Widget()` reaches
         `Widget.__init__`, but the reference's name is `Widget`, so looking
         `__init__` up finds nothing.
 

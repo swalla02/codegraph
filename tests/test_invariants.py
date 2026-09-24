@@ -789,7 +789,7 @@ def test_path_never_calls_a_pair_unconnectable_that_it_can_itself_connect(repo, 
     """
     write("a.py", "class Widget:\n    def __init__(self):\n        self.x = 1\n")
     write("pkg/b.py", "class Widget:\n    def __init__(self):\n        self.y = 2\n")
-    write("c.py", "def build(box):\n    return box.Widget()\n", commit="fanout")
+    write("c.py", "def build(factory):\n    return factory.Widget()\n", commit="fanout")
     store = Store.open(repo)
     Indexer(repo, store, GitTreeSource(repo)).reconcile("HEAD")
 
