@@ -45,7 +45,7 @@ def ls_tree(root: Path, rev: str) -> dict[str, str]:
     # named branch/tag, or a bad `--rev` value threaded through from the
     # CLI) would otherwise be parsed as an `ls-tree` OPTION rather than the
     # tree-ish it is. Inert today -- callers only ever pass `HEAD`,
-    # `WORKTREE`, or a value already validated by `_resolve`/`rev_parse` --
+    # `WORKTREE`, or a value already validated by `resolve_commit`/`rev_parse` --
     # but live the moment that stops being true.
     out = _run(root, "ls-tree", "-r", "-z", "--end-of-options", rev)
     tree: dict[str, str] = {}
@@ -190,6 +190,57 @@ def merge_base(root: Path, a: str, b: str) -> str:
     # Same `--end-of-options` guard as `ls_tree`/`rev_parse`, for the same
     # reason: `a`/`b` can be user-controlled revs.
     return _run(root, "merge-base", "--end-of-options", a, b).decode().strip()
+
+
+def log_format(root: Path, fmt: str, revspec: str) -> bytes:
+    """`git log --format=<fmt> <revspec>`, raw. `revspec` is one argument:
+    a revision or a range. Guarded by `--end-of-options` as `ls_tree` is,
+    since it can come straight from the command line."""
+    return _run(root, "log", f"--format={fmt}", "--end-of-options", revspec)
+
+
+def log_format_commits(root: Path, fmt: str, commits: list[str]) -> bytes:
+    """`git log --format=<fmt>` over exactly `commits` -- none of their
+    ancestors -- in the order given.
+
+    The commits go through `--stdin` rather than argv, so the list has no
+    length limit. `--stdin` still reads a line starting with `-` as an
+    option, so this is for commit ids the caller already holds, not for
+    text from the command line; `log_format` is that.
+    """
+    stdin = ("\n".join(commits) + "\n").encode()
+    return _run(root, "log", "--no-walk=unsorted", f"--format={fmt}", "--stdin", stdin=stdin)
+
+
+def first_parent_log(root: Path, base: str, head: str) -> list[tuple[str, str, str]]:
+    """`(sha, first_parent, subject)` for every commit in `base..head` along
+    `head`'s first-parent line, oldest first. `first_parent` is `""` for a
+    root commit.
+
+    First-parent only, as `git log --first-parent` reads a branch: a merge
+    is one step, and what it brought in is its change against the line it
+    was merged into. Walking the merged branch's own commits too would pair
+    each with a parent that may sit outside the range, which is exactly the
+    revision `history` promises not to materialize.
+    """
+    # NUL-separated fields, so a subject can hold any character but a
+    # newline -- which `%s` never contains, since it is the first line.
+    out = _run(
+        root,
+        "log",
+        "--first-parent",
+        "--reverse",
+        "--format=%H%x00%P%x00%s",
+        "--end-of-options",
+        f"{base}..{head}",
+    )
+    commits: list[tuple[str, str, str]] = []
+    for line in out.decode(errors="replace").splitlines():
+        if not line:
+            continue
+        sha, parents, subject = line.split("\0", 2)
+        commits.append((sha, parents.split(" ")[0] if parents else "", subject))
+    return commits
 
 
 def default_branch(root: Path) -> str:

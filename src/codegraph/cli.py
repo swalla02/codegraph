@@ -15,6 +15,7 @@ from codegraph.init import SKIPPED, plan_init
 from codegraph.maintenance import gc, plan_hooks
 from codegraph.query.diff import MissingRevisionError, diff_report
 from codegraph.query.effects import effects_report
+from codegraph.query.history import history_range, history_report, range_report, walk_history
 from codegraph.query.impact import impact_report
 from codegraph.query.islands import islands_report
 from codegraph.query.orphans import orphans_report
@@ -23,6 +24,9 @@ from codegraph.query.unknowns import DEFAULT_HOPS as UNKNOWNS_HOPS
 from codegraph.query.unknowns import unknowns_report
 from codegraph.render import Report, render_json, render_text
 from codegraph.resolve import find_symbol
+from codegraph.session_hook import ENV_VAR as SESSION_ENV_VAR
+from codegraph.session_hook import HOOK_NAME, install_session_hook, uninstall_session_hook
+from codegraph.sessions import session_log, sessions_by_commit
 from codegraph.store import WORKTREE, Store
 from codegraph.uncertainty import is_incomplete
 
@@ -442,6 +446,65 @@ def _cmd_diff(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _cmd_history(args: argparse.Namespace) -> int:
+    """Report the graph over a range of commits: for one symbol, the commits
+    that changed its body, callees or reachable effects; with no symbol, what
+    every commit added and removed.
+
+    Two optional positionals, told apart by `..`: a symbol never contains
+    one and a range always does, so `history X`, `history A..B` and
+    `history X A..B` each mean the one thing. The exit convention is the
+    symbol-taking commands' `0`/`1`/`2`, applied to the symbol as it stands
+    at the head -- or, for one the range deleted, at the start.
+    """
+    root = Path(args.path).resolve()
+    symbol, revspec = args.symbol, args.revspec
+    if revspec is None and symbol and ".." in symbol:
+        symbol, revspec = None, symbol
+    store, indexer = open_workspace(root)
+    try:
+        try:
+            base, head = history_range(root, revspec)
+            walk = walk_history(store, indexer, base, head, symbol)
+        except MissingRevisionError as exc:
+            print(f"revision not found: {exc.rev}", file=sys.stderr)
+            return 1
+        # One `git` process for every step's `Session:` trailers, rather
+        # than one per commit; a commit with none maps to nothing.
+        pointers = sessions_by_commit(root, [step.sha for step in walk.steps])
+        sessions = lambda sha: pointers.get(sha, [])
+        if symbol is None:
+            return _emit(
+                range_report(walk, limit=args.limit, session_pointers=sessions),
+                args.json,
+                args.strict,
+            )
+        if not walk.steps:
+            # An empty range has no revision to resolve the name at, and
+            # nothing in it could have changed the symbol either way.
+            return _emit(
+                history_report(walk, symbol, limit=args.limit, session_pointers=sessions),
+                args.json,
+                args.strict,
+            )
+        forward = not walk.head_matches
+        matches = walk.start_matches if forward else walk.head_matches
+        if not matches:
+            print(f"no symbol matching {symbol!r} at {head} or {base}", file=sys.stderr)
+            return 1
+        if len(matches) > 1:
+            print(f"ambiguous symbol {symbol!r}:", file=sys.stderr)
+            for node_id in matches:
+                print(f"  {node_id}", file=sys.stderr)
+            return 2
+        report = history_report(
+            walk, matches[0], forward=forward, limit=args.limit, session_pointers=sessions
+        )
+        return _emit(report, args.json, args.strict)
+    finally:
+        store.close()
+
+
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Prune Layer 1 (the blob parse cache) down to what HEAD, the worktree,
     and any `--keep`-named revisions still reference. Never touches Layer 2,
@@ -478,6 +541,74 @@ def _cmd_install_hooks(args: argparse.Namespace) -> int:
             print(result.path)
         else:
             print(f"skipped {result.name}: {result.reason}", file=sys.stderr)
+    return 0
+
+
+def _cmd_install_session_hook(args: argparse.Namespace) -> int:
+    """Install, or with `--uninstall` remove, the opt-in `prepare-commit-msg`
+    hook that writes `Session: $CODEGRAPH_SESSION` into commit messages.
+
+    Its own command rather than a flag on `install-hooks`, because it is the
+    one thing codegraph can install that changes what a user commits: see
+    `session_hook.py`. Skips are loud on stderr for the reason
+    `_cmd_install_hooks` gives.
+    """
+    root = Path(args.path).resolve()
+    try:
+        if args.uninstall:
+            removal = uninstall_session_hook(root)
+            if removal.reason:
+                print(f"skipped {HOOK_NAME}: {removal.reason}", file=sys.stderr)
+                return 1
+            if removal.removed:
+                print(f"removed the session trailer from {removal.path}")
+            else:
+                print(f"no session trailer installed in {removal.path}")
+            return 0
+        result = install_session_hook(root)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if not result.installed:
+        print(f"skipped {result.name}: {result.reason}", file=sys.stderr)
+        return 1
+    print(result.path)
+    print(
+        f"commits made with {SESSION_ENV_VAR} set will carry a `Session:` trailer"
+        " -- this hook writes into commit messages",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _cmd_sessions(args: argparse.Namespace) -> int:
+    """List the session pointers commits carry as `Session:` trailers.
+
+    Reads git and nothing else -- no reconcile, no store -- because the link
+    lives in the history, not in the index (see `sessions.py`). Only commits
+    that carry a pointer are listed, so a repository with none prints
+    nothing (or `[]`) and exits `0`: an absence is an answer. A directory
+    that is not a git repository has no history to read, and says so on
+    stderr the way `init` does, without failing. `1` is kept for a revspec
+    that does not resolve, matching every other command's bad `--rev`.
+    """
+    root = Path(args.path).resolve()
+    if not gitio.is_repo(root):
+        print(f"note: {root} is not a git repository", file=sys.stderr)
+        records = []
+    else:
+        try:
+            records = [r for r in session_log(root, args.revspec) if r.sessions]
+        except gitio.GitError:
+            print(f"revision not found: {args.revspec}", file=sys.stderr)
+            return 1
+    if args.json:
+        payload = [{"commit": r.commit, "sessions": r.sessions} for r in records]
+        print(json.dumps(payload, indent=2))
+        return 0
+    for record in records:
+        for pointer in record.sessions:
+            print(f"{record.commit}  {pointer}")
     return 0
 
 
@@ -821,9 +952,7 @@ def build_parser() -> argparse.ArgumentParser:
     orphans_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     orphans_parser.set_defaults(handler=_cmd_orphans)
 
-    diff_parser = subparsers.add_parser(
-        "diff", help="Report what changed between two revisions"
-    )
+    diff_parser = subparsers.add_parser("diff", help="Report what changed between two revisions")
     diff_parser.add_argument(
         "revspec",
         nargs="?",
@@ -833,6 +962,43 @@ def build_parser() -> argparse.ArgumentParser:
     diff_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
     diff_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     diff_parser.set_defaults(handler=_cmd_diff)
+
+    history_parser = subparsers.add_parser(
+        "history",
+        help="Report how a symbol, or the graph, changed commit by commit",
+        description=(
+            "Walk the commits in <base>..<head> along the first-parent line, oldest"
+            " first, comparing each with its parent the way `diff` compares two"
+            " revisions. With a symbol: every commit that changed its body hash,"
+            " its confident callees or the side effects reachable from it,"
+            " following it across a move to another file or class -- a pairing by"
+            " identical body that is reported with a confidence tier, MEDIUM if"
+            " unique and LOW if not, and never presented as the same id. Without"
+            " one: per commit, the symbols added, removed, moved and changed, and"
+            " the edges and effects gained and lost. Only the named range is"
+            " materialized, nothing is checked out, and every revision the walk"
+            " created is discarded when it ends."
+        ),
+    )
+    history_parser.add_argument(
+        "symbol", nargs="?", default=None, help="Node id, qualname, or trailing name"
+    )
+    history_parser.add_argument(
+        "revspec",
+        nargs="?",
+        default=None,
+        help="<base>..<head> (default: merge-base(default branch, HEAD)..HEAD)",
+    )
+    history_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    history_parser.add_argument(
+        "--limit",
+        type=int,
+        default=40,
+        help="Maximum rows to keep per group -- per commit without a symbol (default: 40)",
+    )
+    history_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    history_parser.add_argument("--strict", action="store_true", help=_STRICT_HELP)
+    history_parser.set_defaults(handler=_cmd_history)
 
     gc_parser = subparsers.add_parser(
         "gc", help="Prune Layer 1 cache entries unreachable from retained revisions"
@@ -875,6 +1041,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hooks_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
     hooks_parser.set_defaults(handler=_cmd_install_hooks)
+
+    sessions_parser = subparsers.add_parser(
+        "sessions",
+        help="List the session pointers commits carry as `Session:` trailers",
+        description=(
+            "Read the `Session: <uri>` trailers in commit messages -- the pointer"
+            " from a commit to the session (an agent conversation, a PR thread,"
+            " notes) that produced it -- and list them as `<commit>  <pointer>`,"
+            " newest first. The pointer is opaque: codegraph does not parse it or"
+            " know which agent wrote it. Commits without one are not listed."
+        ),
+    )
+    sessions_parser.add_argument(
+        "revspec",
+        nargs="?",
+        default="HEAD",
+        help="A revision or range, as `git log` takes it (default: HEAD)",
+    )
+    sessions_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    sessions_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    sessions_parser.set_defaults(handler=_cmd_sessions)
+
+    session_hook_parser = subparsers.add_parser(
+        "install-session-hook",
+        help=(
+            "Opt in: a prepare-commit-msg hook that WRITES a `Session:` trailer"
+            f" into commit messages when {SESSION_ENV_VAR} is set"
+        ),
+        description=(
+            "Install a prepare-commit-msg hook that appends"
+            f" `Session: ${SESSION_ENV_VAR}` to the commit message, through"
+            f" `git interpret-trailers`, whenever {SESSION_ENV_VAR} is set and"
+            " non-empty. Unlike `install-hooks` this changes what you commit, which"
+            " is why it is its own command and nothing else installs it. An existing"
+            " prepare-commit-msg hook is kept; merge and squash messages are left"
+            " alone."
+        ),
+    )
+    session_hook_parser.add_argument("--path", default=".", help="Repository root (default: cwd)")
+    session_hook_parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Remove the block again, leaving the rest of the hook as it was",
+    )
+    session_hook_parser.set_defaults(handler=_cmd_install_session_hook)
 
     return parser
 

@@ -38,6 +38,7 @@ def test_skill_documents_every_shipped_command():
         "codegraph unknowns",
         "codegraph orphans",
         "codegraph diff",
+        "codegraph history",
     ]:
         assert command in text
 

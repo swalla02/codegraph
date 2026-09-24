@@ -155,10 +155,11 @@ def _is_shell_shebang(shebang_line: str) -> bool:
     return _shebang_interpreter(shebang_line) in _SHELL_INTERPRETERS
 
 
-def _insert_after_shebang(existing: str) -> str:
-    """Splice `_HOOK_BLOCK` in as the first statement of the script, right
-    after its shebang line so it always runs -- before any pre-existing
-    `exit`, `exec`, or `if`-guarded early return could skip it.
+def _insert_after_shebang(existing: str, block: str = _HOOK_BLOCK) -> str:
+    """Splice `block` (the warming block unless told otherwise) in as the
+    first statement of the script, right after its shebang line so it
+    always runs -- before any pre-existing `exit`, `exec`, or `if`-guarded
+    early return could skip it.
 
     A file with no shebang gets one (`#!/bin/sh`) prepended; git hooks with
     no shebang already run under the shell's default anyway, so this changes
@@ -166,8 +167,8 @@ def _insert_after_shebang(existing: str) -> str:
     """
     lines = existing.splitlines(keepends=True)
     if lines and lines[0].startswith("#!"):
-        return lines[0] + _HOOK_BLOCK + "".join(lines[1:])
-    return "#!/bin/sh\n" + _HOOK_BLOCK + existing
+        return lines[0] + block + "".join(lines[1:])
+    return "#!/bin/sh\n" + block + existing
 
 
 @dataclass(frozen=True)
@@ -181,11 +182,33 @@ class HookResult:
     reason: str | None = None
 
 
-def _plan_one_hook(name: str, path: Path) -> HookResult:
-    """Decide and apply the outcome for a single hook. Never raises for an
-    ordinary "can't safely touch this file" case -- those come back as a
-    skipped `HookResult` -- so any exception that does escape is a genuinely
-    unexpected failure, which `plan_hooks` isolates per-hook."""
+@dataclass(frozen=True)
+class HookBlock:
+    """A marker-delimited block codegraph splices into a user's hook: the
+    text, the two markers that fence it, and the word a skip reason uses
+    for what did not get installed.
+
+    `WARMING` is the only one `plan_hooks` installs. The opt-in session
+    trailer in `session_hook.py` is a second one, installed only by its own
+    command and fenced by its own markers, so neither installer can ever
+    strip or repair the other's block.
+    """
+
+    text: str
+    begin_marker: str
+    end_marker: str
+    purpose: str
+
+
+WARMING = HookBlock(_HOOK_BLOCK, _BEGIN_MARKER, _END_MARKER, "warming")
+
+
+def _read_hook(name: str, path: Path, block: HookBlock) -> str | HookResult:
+    """The hook's current text ("" if there is none), or the skipped
+    `HookResult` for a file whose shape rules out touching it at all: not
+    text, or a script for an interpreter outside `_SHELL_INTERPRETERS`.
+    Installing and removing share this, because they have to refuse the
+    same files for the same reasons."""
     if path.exists():
         try:
             existing = path.read_text()
@@ -200,7 +223,7 @@ def _plan_one_hook(name: str, path: Path) -> HookResult:
                 installed=False,
                 reason=(
                     "existing hook is not valid UTF-8 (binary or non-text hook); "
-                    "warming not installed"
+                    f"{block.purpose} not installed"
                 ),
             )
     else:
@@ -214,25 +237,40 @@ def _plan_one_hook(name: str, path: Path) -> HookResult:
             installed=False,
             reason=(
                 f"existing hook uses a non-shell interpreter ({lines[0].strip()}); "
-                "warming not installed"
+                f"{block.purpose} not installed"
             ),
         )
+    return existing
+
+
+def _malformed_marker(name: str, path: Path, block: HookBlock) -> HookResult:
+    return HookResult(
+        name=name,
+        path=path,
+        installed=False,
+        reason=(
+            "existing hook has a malformed codegraph marker (a begin marker with "
+            "no matching end, or vice versa); please repair or remove it by hand -- "
+            f"{block.purpose} not installed"
+        ),
+    )
+
+
+def _plan_one_hook(name: str, path: Path, block: HookBlock = WARMING) -> HookResult:
+    """Decide and apply the outcome for a single hook. Never raises for an
+    ordinary "can't safely touch this file" case -- those come back as a
+    skipped `HookResult` -- so any exception that does escape is a genuinely
+    unexpected failure, which `plan_hooks` isolates per-hook."""
+    existing = _read_hook(name, path, block)
+    if isinstance(existing, HookResult):
+        return existing
 
     try:
-        stripped = strip_marker_blocks(existing, _BEGIN_MARKER, _END_MARKER)
+        stripped = strip_marker_blocks(existing, block.begin_marker, block.end_marker)
     except MalformedMarkerError:
-        return HookResult(
-            name=name,
-            path=path,
-            installed=False,
-            reason=(
-                "existing hook has a malformed codegraph marker (a begin marker with "
-                "no matching end, or vice versa); please repair or remove it by hand -- "
-                "warming not installed"
-            ),
-        )
+        return _malformed_marker(name, path, block)
 
-    content = _insert_after_shebang(stripped)
+    content = _insert_after_shebang(stripped, block.text)
     path.write_text(content)
     mode = path.stat().st_mode
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)

@@ -38,7 +38,7 @@ class MissingRevisionError(Exception):
         self.rev = rev
 
 
-def _resolve(indexer: Indexer, rev: str) -> str:
+def resolve_commit(indexer: Indexer, rev: str) -> str:
     """Resolve `rev` to a commit sha, verifying the commit actually exists.
 
     `git rev-parse <40-hex-chars>` alone echoes back a well-formed-looking
@@ -56,7 +56,7 @@ def _resolve(indexer: Indexer, rev: str) -> str:
         raise MissingRevisionError(rev) from exc
 
 
-def _nodes(store: Store, rev: str) -> dict[str, sqlite3.Row]:
+def nodes_at(store: Store, rev: str) -> dict[str, sqlite3.Row]:
     """Every node at `rev`, including the synthetic per-path module-scope
     node (`path::<module>`, `kind="module"`). It is not special-cased out:
     `parse.py` gives it a `body_hash` over the module's top-level
@@ -74,7 +74,7 @@ def _nodes(store: Store, rev: str) -> dict[str, sqlite3.Row]:
     }
 
 
-def _edges_by_src(store: Store, rev: str) -> dict[str, set[tuple[str, str]]]:
+def confident_edges(store: Store, rev: str) -> dict[str, set[tuple[str, str]]]:
     """Outgoing edges per symbol, EXCLUDING the low-confidence fan-out.
 
     A symbol whose body hash is unchanged is still reported as `changed` when
@@ -127,15 +127,15 @@ def diff_report(store: Store, indexer: Indexer, base: str, head: str, limit: int
     present in both revisions is whether its `body_hash` or its outgoing
     edge set (`(src, dst, kind)`) changed -- never where its lines sit.
     """
-    resolved_base = _resolve(indexer, base)
+    resolved_base = resolve_commit(indexer, base)
 
     indexer.reconcile(resolved_base)
     indexer.reconcile(head)
 
-    base_nodes = _nodes(store, resolved_base)
-    head_nodes = _nodes(store, head)
-    base_edges = _edges_by_src(store, resolved_base)
-    head_edges = _edges_by_src(store, head)
+    base_nodes = nodes_at(store, resolved_base)
+    head_nodes = nodes_at(store, head)
+    base_edges = confident_edges(store, resolved_base)
+    head_edges = confident_edges(store, head)
 
     added_ids = set(head_nodes) - set(base_nodes)
     removed_ids = set(base_nodes) - set(head_nodes)
@@ -220,4 +220,10 @@ def diff_report(store: Store, indexer: Indexer, base: str, head: str, limit: int
     return Report(summary=summary, groups=groups, truncated=truncated)
 
 
-__all__ = ["MissingRevisionError", "diff_report"]
+__all__ = [
+    "MissingRevisionError",
+    "confident_edges",
+    "diff_report",
+    "nodes_at",
+    "resolve_commit",
+]

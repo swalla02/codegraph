@@ -33,7 +33,8 @@ claimed (see "The cost guarantee, honestly" below).
 
 That also makes `codegraph diff` possible — the semantic delta of a branch:
 which symbols and edges changed, and which side effects newly became
-reachable.
+reachable. Walked over a range of commits, the same comparison becomes
+`codegraph history`: `git log -L` at the level of symbols and edges.
 
 Built agent-first: a CLI, driven through `AGENTS.md` (`codegraph init` writes
 the section, for any of the 25+ agents that read it) and through `SKILL.md`
@@ -83,7 +84,8 @@ did not write. It:
   never touches one there is.
 
 It does not install git hooks. That stays behind `install-hooks`, which you ask
-for by name.
+for by name — and the one hook that writes into commits stays behind
+`install-session-hook`, which `install-hooks` does not install either.
 
 `AGENTS.md` is the cross-agent convention — Codex, Cursor, Gemini CLI, Copilot's
 coding agent, Aider, goose, opencode, Zed, Windsurf, Amp, Warp, Junie, Jules,
@@ -123,11 +125,14 @@ slower on a cold cache.
 | `codegraph islands [--rev REV] [--limit N] [--json] [--strict]` | Report the connected components of the revision's `CALLS`, `INHERITS`, `IMPLEMENTS` and `REFERENCES` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
 | `codegraph orphans [--rev REV] [--limit N] [--include-public] [--include-decorated] [--json]` | Find functions whose every recorded caller is a test — defined, tested, and never invoked by the code that was supposed to invoke it. Such a function is *not* a one-symbol island, precisely because its test calls it, so `islands` structurally cannot surface it. Candidates are private by name, undecorated, defined outside the test tree, and never mentioned by name anywhere in the source text — that last filter has no off switch, because a static call graph cannot see a callback handed to a library. Not a dead-code report (see below). |
 | `codegraph diff [<base>..<head>] [--json]` | Report what changed between two revisions by content hash, never by line number: symbols added/removed/changed, plus any side effect newly reachable. Defaults to `merge-base(default branch, HEAD)..WORKTREE` — "what has this branch changed so far." |
+| `codegraph history [<symbol>] [<base>..<head>] [--limit N] [--json] [--strict]` | The graph over a range of commits, oldest first, each compared with its first parent the way `diff` compares two revisions. With a symbol: every commit that changed its body hash, its confident callees or the side effects reachable from it, followed across a move to another file or class — a pairing reported with a confidence tier, never as the same id. Without one: per commit, the symbols added, removed, moved and changed, and the edges and effects gained and lost. Defaults to `merge-base(default branch, HEAD)..HEAD`; only the named range is materialized, and nothing it materializes is kept (see below). |
 | `codegraph trace [FILE] [--rev REV] [--forget]` | Import a recorded run (see "What a trace buys" below) and bind it to a revision, so that calls the resolver cannot see — framework dispatch, `getattr`, a decorator's wrapper — become edges marked `runtime` alongside the ones it deduced. With no argument it describes the trace the revision holds, or tells you how to record one. Additive: a repository with no trace answers exactly as it did before. |
 | `codegraph gc [--keep REV]` | Prune the Layer 1 parse cache down to what `HEAD`, the worktree, and any `--keep`-named revisions still reference. Never touches the graph itself, so it can only make a future answer slower to rebuild, never wrong. |
 | `codegraph init` | Make this repository's coding agents aware of codegraph: an `AGENTS.md` section, the `@AGENTS.md` bridge into an existing `CLAUDE.md`, and a commented `codegraph.toml` stub. Idempotent; never overwrites content it did not write; never touches `.git/`. |
 | `codegraph guide` | Print the agent-facing workflow to stdout — the same text the plugin ships as `SKILL.md`, so the short `AGENTS.md` section can defer to it rather than inline it. |
 | `codegraph install-hooks` | Install `post-commit`/`post-checkout`/`post-merge` git hooks that warm the cache in the background. Purely an optimization — every query reconciles the working tree itself regardless (see below), so results are identical whether or not a hook ever fires. |
+| `codegraph sessions [<revspec>] [--json]` | List the `Session:` trailers commits carry — the pointer from a commit to the session that produced it (see "Sessions: which conversation wrote a commit" below) — as `<commit>  <pointer>`, newest first. `<revspec>` is a revision or range as `git log` takes it, default `HEAD`. Commits without a pointer are not listed, so a repository with none prints nothing. Reads git only. |
+| `codegraph install-session-hook [--uninstall]` | **Opt-in, and it writes into your commit messages.** Installs a `prepare-commit-msg` hook that appends `Session: $CODEGRAPH_SESSION` when that variable is set. Nothing else installs it, `install-hooks` included; `--uninstall` takes it back out. |
 
 ### What an island is, and is not
 
@@ -303,6 +308,58 @@ psf/requests, of 3,000 randomly sampled symbol pairs the 99 that are
 connected at all sit a median of 3 hops apart (mean 3.26, max 8); a budget of
 3 would find 51% of them and 6 finds 99%.
 
+### What `history` answers, and what it costs
+
+`diff` says what changed between two revisions; `history` says which commit
+did it. For a symbol, it lists the commits in the range that changed its
+*behaviour* — its body hash, the callees it reaches with confidence, or the
+side effects reachable from it — rather than every commit that touched its
+file. That last part is the one `git log -L` cannot answer: a commit that
+puts a `NETWORK` call inside `charge` shows up in the history of `checkout`,
+whose text never changed.
+
+```
+$ codegraph history checkout main~3..main
+symbol: m.py::checkout · commits: 3 · changed_in: 2 · base: 48aa84e… · head: a34af83…
+commits
+  b9e6ed2…  m.py:8  effects +NETWORK · "charge hits the network"
+  a34af83…  m.py:4  calls +pay.py::charge; calls -m.py::charge · "move charge to pay.py"
+```
+
+**A move is an inference, and says so.** A node id is `path::qualname`, so
+moving `charge` from `m.py` to `pay.py` is, in the graph, a removal and an
+addition. `history` pairs the two when their bodies hash the same, and
+grades the pairing with the resolver's own rule for a name matched by
+guesswork: MEDIUM if it is the only candidate, LOW if it is one of several.
+Never HIGH — no text states that two ids are one symbol. A MEDIUM move is
+followed (`moved from m.py::charge to pay.py::charge (MEDIUM)`); a LOW one
+names the candidates and stops, with a `lineage_ambiguous` entry in
+`unknowns`, because continuing down one of them would be a guess presented
+as history. A rename changes the definition's own name, which is part of its
+body hash, so it reads as exactly what the source shows: a removal and an
+unrelated addition.
+
+**What it compares** is what `diff` compares — body hash, and edges and
+effects without the LOW tier, which is a guess about the whole repository
+and moves whenever anyone anywhere adds a same-named symbol. Merges are one
+step each, along the first-parent line, as `git log --first-parent` reads a
+branch.
+
+**What it costs.** The walk materializes only the range it is given: the
+first commit's parent (which is `base` itself whenever `base` sits on
+`head`'s first-parent line), then each commit in turn. There is no
+backfill, nothing is checked out, and every revision the walk created is
+discarded when it ends; one it found already materialized is copied from,
+never consumed. Each commit's graph starts as a copy of its parent's and is then
+reconciled like an edit to the working tree, so a commit pays for the files
+it touched — narrowed when it did not change the symbol table — and parsing
+is proportional to the blobs the range introduces, since the parse cache is
+shared with every revision ever seen. The one cold build is the starting
+revision. The default range is `merge-base(default branch, HEAD)..HEAD`,
+matching `diff`'s base; the head is `HEAD` rather than the worktree because
+history is a list of commits, and `diff` is the command for what is not
+committed yet.
+
 ### What `unknowns` answers, and what `--strict` does with it
 
 The point of this tool is to give an agent a truthful representation of a
@@ -392,6 +449,7 @@ something the run did not examine.**
 | `islands` | its own `unexplained` count | the number it already prints, in the form a machine can act on |
 | `orphans` | none | its uncertainty is a standing `caveat` on every row — a name resolved at runtime leaves nothing for either half of the report to find — and a caveat that fires on every run is not news. A `--strict` there would refuse on every non-empty report |
 | `diff` | none | a content-hash comparison of two revisions: no walk, no budget, nothing hidden |
+| `history` | `lineage_ambiguous` | a symbol whose body matches several removed definitions in one commit: the commits before it, under whichever id it had, were not examined |
 
 Two things deliberately do **not** make a report incomplete:
 
@@ -558,6 +616,85 @@ What it does **not** buy: a better benchmark number. `bench/` scores the
 resolver, so it reads `static` rows only — importing a trace into a target
 repository leaves every figure in the table below unchanged, which is
 checked rather than asserted (`tests/test_bench_scorer.py`).
+
+## Sessions: which conversation wrote a commit
+
+A trace says *that* an edge is real. A session says *why* the code is shaped
+the way it is. Most code is now written in a conversation with an agent, and
+that conversation — the alternatives rejected, the constraint that forced the
+odd shape — is thrown away, leaving a sentence of it in the commit message.
+A commit can keep a pointer to it instead, as a git trailer:
+
+```
+Fix the retry loop
+
+Co-Authored-By: ...
+Session: <uri>
+```
+
+`codegraph sessions` lists them:
+
+```sh
+codegraph sessions                  # every commit reachable from HEAD that has one
+codegraph sessions main..HEAD       # just this branch
+codegraph sessions --json
+```
+
+The contract is small on purpose:
+
+- **The pointer is opaque.** Whatever follows `Session:` is returned as a
+  string — a Claude Code session id, a Codex rollout path, a PR thread, a
+  design doc, your own notes. It is never parsed, and there is no field
+  for which agent wrote it. It works the same for a human.
+- **The link lives in git, not in the index.** It travels with push and
+  clone, and git reads it: `git log`'s own trailer parsing decides what
+  counts (the last paragraph, `key: value` lines, the key matched
+  case-insensitively), so a `Session:` line in the middle of a message body
+  is not one.
+- **Absence is not an error.** A commit without a pointer, and a directory
+  that is not a git repository, answer with nothing. A repository with no
+  pointers answers every other command exactly as it did before; like a
+  trace, the link is additive.
+
+### Opening a session is an adapter's job
+
+Turning a pointer into "open this session", or better, "fork it and ask the
+agent that wrote this code why", depends entirely on the agent, so none of
+it is in codegraph. An adapter lives beside the core, takes the opaque
+pointer `codegraph sessions --json` hands it, and either opens the session or
+reports **session not available**. That is an answer, not a failure:
+transcripts can hold secrets and are often local-only, so a pointer that
+resolves on one machine will not on another. Where an agent cannot fork a
+session, the fallback is to hand the transcript to a new one as context.
+
+### Writing the pointer (opt-in)
+
+Writing the pointer is the agent's or your job, and a hand-written trailer
+is read exactly like any other. For convenience, and only if you ask for it:
+
+```sh
+codegraph install-session-hook               # add the prepare-commit-msg hook
+export CODEGRAPH_SESSION="<uri>"             # the agent exports its session
+codegraph install-session-hook --uninstall   # take it out again
+```
+
+**This hook writes into your commit messages**, which is why it is its own
+command and why neither `install-hooks` nor `init` ever installs it:
+`install-hooks` stays a pure warming optimization, and `init` never touches
+`.git/`. The hook:
+
+- does nothing unless `CODEGRAPH_SESSION` is set and non-empty;
+- appends through `git interpret-trailers`, so the pointer lands in the
+  trailer block beside `Co-Authored-By:` and is never duplicated — an
+  `--amend` in the same session adds nothing, one from another session adds
+  a second pointer;
+- writes only into a message that exists before the editor opens (`-m`,
+  `-F`, `--amend`, `-c`/`-C`). A draft you have yet to write in the editor
+  is left alone, because a trailer in it would stop git from aborting when
+  you quit without a message. Merge and squash messages are left alone too:
+  the commits they are drafted from carry their own pointers;
+- can never fail a commit, and keeps an existing `prepare-commit-msg` hook
+  intact, under the same rules as `install-hooks`.
 
 ## `codegraph.toml`
 
