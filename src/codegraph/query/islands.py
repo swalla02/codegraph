@@ -270,6 +270,21 @@ def connected_components(store: Store, rev: str, ambiguity: Ambiguity | None = N
     return _partition(store, rev, ambiguity or Ambiguity(store, rev))[0]
 
 
+def island_roots(store: Store, rev: str, ambiguity: Ambiguity | None = None) -> dict[str, str]:
+    """Every non-module symbol of `rev`, mapped to the root of the island
+    it belongs to -- the grouping `islands_report` counts, from the same
+    partition, so `history` can compare two revisions' islands without a
+    second definition of what an island is. Two symbols share an island
+    exactly when they map to the same root."""
+    components = connected_components(store, rev, ambiguity)
+    return {
+        row["id"]: components.find(row["id"])
+        for row in store.connection.execute(
+            "SELECT id FROM nodes WHERE rev=? AND kind != 'module'", (rev,)
+        )
+    }
+
+
 def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
@@ -613,9 +628,7 @@ def _labelled(store: Store, rev: str, config: Config | None = None) -> _Labelled
     return _Labelled(components, members, grouped, mechanisms, boundaries, fan_in, traced)
 
 
-def islands_report(
-    store: Store, rev: str, config: Config | None = None, limit: int = 20
-) -> Report:
+def islands_report(store: Store, rev: str, config: Config | None = None, limit: int = 20) -> Report:
     """Connected components of `rev`'s CALLS and INHERITS edges, read as
     undirected, each labelled with the implicit-invocation mechanisms and
     process boundaries found inside it."""
@@ -741,5 +754,6 @@ __all__ = [
     "connected_components",
     "is_test_path",
     "island_label",
+    "island_roots",
     "islands_report",
 ]
