@@ -333,11 +333,13 @@ want when asked "what did this branch change".
 `codegraph history [<symbol>] [<base>..<head>]` walks the commits in a
 range, oldest first along the first-parent line, comparing each with its
 parent the way `diff` does. With a symbol, it lists only the commits that
-changed its **behaviour** — body hash, confident callees, or reachable
-effects — so a commit that adds a network call to a callee appears in the
+changed its **behaviour** — body hash, confident callees, direct
+dependents (`dependents +x`), or reachable effects — so a commit that adds a network call to a callee appears in the
 caller's history although the caller's text never moved. Without one, each
 commit is a group of the symbols added, removed, moved and changed and the
-edges and effects gained and lost (`--limit` rows per commit). The default
+edges and effects gained and lost (`--limit` rows per commit); add
+`--islands` to also see islands merging and splitting, counted exactly as
+`islands` counts them (slower: it partitions every changed commit). The default
 range is `merge-base(default branch, HEAD)..HEAD`: commits only, never the
 worktree — use `diff` for uncommitted work.
 

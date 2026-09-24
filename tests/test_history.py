@@ -6,6 +6,7 @@ from codegraph.cli import main
 from codegraph.indexer import GitTreeSource, Indexer
 from codegraph.query.diff import MissingRevisionError, confident_edges, nodes_at
 from codegraph.query.history import history_report, range_report, walk_history
+from codegraph.query.islands import islands_report
 from codegraph.store import Store
 from codegraph.uncertainty import LINEAGE_AMBIGUOUS, is_incomplete
 from tests.conftest import git
@@ -277,6 +278,121 @@ def test_range_report_lists_edges_and_effects_gained_and_lost_per_commit(repo, w
     assert "m.py::checkout -> m.py::charge" in lost_edges
     lost_effects = {(r.id, r.location) for r in decouple.rows if r.detail == "effect lost"}
     assert ("m.py::checkout", "NETWORK") in lost_effects
+
+
+# -- dependents -------------------------------------------------------------
+
+
+def test_a_new_dependent_is_a_change_to_the_symbol_it_depends_on(repo, write):
+    base = sha(repo)
+    write("m.py", "def charge():\n    pass\n", commit="add charge")
+    write("m.py", CHARGE, commit="checkout calls charge")
+    write("m.py", CHARGE + "\n\ndef refund():\n    charge()\n", commit="refund calls charge")
+
+    report = history(repo, "charge", base)
+
+    details = [row.detail for row in rows(report)]
+    assert details[1].startswith("dependents +m.py::checkout")
+    assert details[2].startswith("dependents +m.py::refund")
+    assert report.summary["dependents"] == 2
+
+
+def test_a_dependent_moving_files_is_not_a_dependent_lost_and_gained(repo, write):
+    base = sha(repo)
+    write("a.py", "def charge():\n    pass\n")
+    write("b.py", "from a import charge\n\n\ndef checkout():\n    charge()\n", commit="add")
+    (repo / "b.py").unlink()
+    write("c.py", "from a import charge\n\n\ndef checkout():\n    charge()\n", commit="move")
+
+    report = history(repo, "charge", base)
+
+    assert [row.detail.split(" · ")[-1] for row in rows(report)] == ['"add"']
+    assert report.summary["dependents"] == 1
+
+
+# -- islands ----------------------------------------------------------------
+
+APART = "def charge():\n    pass\n\n\ndef refund():\n    charge()\n"
+APART_TOO = "def ship():\n    pass\n\n\ndef track():\n    ship()\n"
+BRIDGED = (
+    "from m import charge\n\n\ndef ship():\n    pass\n\n\ndef track():\n    ship()\n    charge()\n"
+)
+
+
+def islands_walk(repo, base):
+    store, indexer = build(repo)
+    try:
+        return range_report(walk_history(store, indexer, base, "HEAD", islands=True))
+    finally:
+        store.close()
+
+
+def test_islands_merging_and_splitting_are_reported_per_commit(repo, write):
+    write("m.py", APART)
+    write("n.py", APART_TOO, commit="two islands")
+    base = sha(repo)
+    write(
+        "n.py",
+        BRIDGED,
+        commit="bridge",
+    )
+    write("n.py", APART_TOO, commit="unbridge")
+
+    report = islands_walk(repo, base)
+
+    bridge, unbridge = report.groups
+    merged = [row for row in bridge.rows if row.detail.startswith("islands merged")]
+    assert len(merged) == 1
+    assert merged[0].location == "2 islands"
+    assert "m.py::charge (2)" in merged[0].detail and "n.py::ship (2)" in merged[0].detail
+    assert merged[0].detail.endswith("into one of 4")
+    split = [row for row in unbridge.rows if row.detail.startswith("islands split")]
+    assert len(split) == 1
+    # Three: the two above, and the fixture's own `a.py::alpha`.
+    assert report.summary["islands_start"] == 3
+    assert report.summary["islands_head"] == 3
+    assert (report.summary["merges"], report.summary["splits"]) == (1, 1)
+
+
+def test_island_counts_are_the_ones_islands_itself_prints(repo, write):
+    write("m.py", APART)
+    write("n.py", APART_TOO, commit="two islands")
+    base = sha(repo)
+    write(
+        "n.py",
+        BRIDGED,
+        commit="bridge",
+    )
+    write("o.py", "def alone():\n    pass\n", commit="a singleton")
+
+    report = islands_walk(repo, base)
+
+    store, indexer = build(repo)
+    try:
+        head = sha(repo)
+        indexer.reconcile(head)
+        assert report.summary["islands_head"] == islands_report(store, head).summary["islands"]
+    finally:
+        store.close()
+
+
+def test_islands_are_off_unless_asked_for(repo, write):
+    base = sha(repo)
+    write("m.py", APART, commit="m")
+    store, indexer = build(repo)
+    report = range_report(walk_history(store, indexer, base, "HEAD"))
+    store.close()
+    assert "islands_start" not in report.summary
+
+
+def test_cli_islands_is_a_range_flag(repo, write, capsys):
+    base = sha(repo)
+    write("m.py", APART, commit="m")
+    root = str(repo)
+
+    assert main(["history", "charge", f"{base}..HEAD", "--islands", "--path", root]) == 1
+    assert main(["history", f"{base}..HEAD", "--islands", "--path", root, "--json"]) == 0
+    assert "islands_head" in json.loads(capsys.readouterr().out)["summary"]
 
 
 # -- the session seam -------------------------------------------------------

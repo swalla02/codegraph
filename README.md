@@ -125,7 +125,7 @@ slower on a cold cache.
 | `codegraph islands [--rev REV] [--limit N] [--json] [--strict]` | Report the connected components of the revision's `CALLS`, `INHERITS`, `IMPLEMENTS` and `REFERENCES` edges, read as undirected: how many separate regions the codebase is in, how big each is, and which symbols anchor them, plus what the tool can say about why each one stands apart (implicit invocation, a `NETWORK` boundary, or nothing it recognises). An island of one is *not* a dead-code finding (see below). |
 | `codegraph orphans [--rev REV] [--limit N] [--include-public] [--include-decorated] [--json]` | Find functions whose every recorded caller is a test — defined, tested, and never invoked by the code that was supposed to invoke it. Such a function is *not* a one-symbol island, precisely because its test calls it, so `islands` structurally cannot surface it. Candidates are private by name, undecorated, defined outside the test tree, and never mentioned by name anywhere in the source text — that last filter has no off switch, because a static call graph cannot see a callback handed to a library. Not a dead-code report (see below). |
 | `codegraph diff [<base>..<head>] [--json]` | Report what changed between two revisions by content hash, never by line number: symbols added/removed/changed, plus any side effect newly reachable. Defaults to `merge-base(default branch, HEAD)..WORKTREE` — "what has this branch changed so far." |
-| `codegraph history [<symbol>] [<base>..<head>] [--limit N] [--json] [--strict]` | The graph over a range of commits, oldest first, each compared with its first parent the way `diff` compares two revisions. With a symbol: every commit that changed its body hash, its confident callees or the side effects reachable from it, followed across a move to another file or class — a pairing reported with a confidence tier, never as the same id. Without one: per commit, the symbols added, removed, moved and changed, and the edges and effects gained and lost. Defaults to `merge-base(default branch, HEAD)..HEAD`; only the named range is materialized, and nothing it materializes is kept (see below). |
+| `codegraph history [<symbol>] [<base>..<head>] [--islands] [--limit N] [--json] [--strict]` | The graph over a range of commits, oldest first, each compared with its first parent the way `diff` compares two revisions. With a symbol: every commit that changed its body hash, its confident callees, its direct dependents or the side effects reachable from it, followed across a move to another file or class — a pairing reported with a confidence tier, never as the same id. Without one: per commit, the symbols added, removed, moved and changed, and the edges and effects gained and lost; with `--islands`, also the islands that merged or split. Defaults to `merge-base(default branch, HEAD)..HEAD`; only the named range is materialized, and nothing it materializes is kept (see below). |
 | `codegraph trace [FILE] [--rev REV] [--forget]` | Import a recorded run (see "What a trace buys" below) and bind it to a revision, so that calls the resolver cannot see — framework dispatch, `getattr`, a decorator's wrapper — become edges marked `runtime` alongside the ones it deduced. With no argument it describes the trace the revision holds, or tells you how to record one. Additive: a repository with no trace answers exactly as it did before. |
 | `codegraph gc [--keep REV]` | Prune the Layer 1 parse cache down to what `HEAD`, the worktree, and any `--keep`-named revisions still reference. Never touches the graph itself, so it can only make a future answer slower to rebuild, never wrong. |
 | `codegraph init` | Make this repository's coding agents aware of codegraph: an `AGENTS.md` section, the `@AGENTS.md` bridge into an existing `CLAUDE.md`, and a commented `codegraph.toml` stub. Idempotent; never overwrites content it did not write; never touches `.git/`. |
@@ -338,6 +338,25 @@ names the candidates and stops, with a `lineage_ambiguous` entry in
 as history. A rename changes the definition's own name, which is part of its
 body hash, so it reads as exactly what the source shows: a removal and an
 unrelated addition.
+
+**Who depends on it, over time.** A symbol's history also names the
+commits that changed its direct dependents — the distinct symbols with a
+confident edge into it (`dependents +m.py::refund`) — and the summary gives
+the count at the end of the walk. A dependent that moved files in the same
+commit is mapped through that commit's MEDIUM moves first, so it is not
+reported as one dependent lost and another gained. This is one hop of
+fan-in; the transitive `impact` set over time would cost a reverse walk of
+every changed revision and is not computed.
+
+**Islands merging, with `--islands`.** The range report can also partition
+every changed revision into islands and report each merge and split against
+the parent: `islands merged: m.py::charge (2) + n.py::ship (2) into one of
+4`, each part named by its most-depended-on symbol. The partition is the one
+`islands` prints, not a second implementation, so `islands_head` in the
+summary is what `codegraph islands --rev <head>` counts — including its
+reading of the bare-name fan-out, which means a new same-named definition
+can bridge two islands here exactly as it would there. It is off by default:
+it costs a pass over every edge of every changed revision.
 
 **What it compares** is what `diff` compares — body hash, and edges and
 effects without the LOW tier, which is a guess about the whole repository

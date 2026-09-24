@@ -58,6 +58,34 @@ therefore changes it, and is reported as exactly what the source shows: a
 removal and an unrelated addition. What pairs is a move -- the same
 definition under another path or class.
 
+## Who depends on a symbol, and how that grows
+
+A symbol's row also names the commits that changed its direct dependents:
+the distinct symbols with a confident edge into it, of any kind. They come
+from the same snapshots and the same LOW filter as its callees, so a bare
+name someone added on the far side of the repository does not show up as
+a new dependent. A dependent that moved in the same commit is mapped
+through the commit's MEDIUM moves first, so a caller changing files reads
+as nothing rather than as one dependent lost and another gained. The
+summary gives the count at the end of the walk the symbol was named at.
+
+This is fan-in, one hop. The transitive `impact` set over time would cost
+a reverse walk of every changed revision, and is not computed.
+
+## Islands, when asked for
+
+With `islands`, the walk also partitions each changed revision into
+islands with `island_roots` -- the partition `islands` itself prints, never
+a second one that could come to disagree with it -- and reports every
+merge and split between a commit and its parent: an island whose symbols
+sat in two or more islands the commit before, and the reverse. It is off
+by default, because the partition folds in the bare-name fan-out and
+costs a pass over every edge of every changed revision.
+
+Because it is that partition, it inherits that partition's reading of the
+fan-out: two islands a new same-named definition bridged through a
+bare-name hub are merged here exactly as `islands` would call them one.
+
 ## What is compared
 
 The same filters `diff` uses, for the same reasons. Edges exclude LOW:
@@ -70,6 +98,7 @@ unrelated commit as the one that changed a symbol's behaviour.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -77,6 +106,7 @@ from pathlib import Path
 from codegraph import gitio
 from codegraph.indexer import Indexer
 from codegraph.query.diff import MissingRevisionError, confident_edges, nodes_at, resolve_commit
+from codegraph.query.islands import island_roots
 from codegraph.render import Group, Report, Row, Unknown, budget
 from codegraph.resolve import LOW, MEDIUM, find_symbol
 from codegraph.store import Store
@@ -110,6 +140,17 @@ class Move:
 
 
 @dataclass(frozen=True)
+class IslandChange:
+    """Islands that became one (a merge) or one that became several (a
+    split). `parts` is each smaller island as `(representative, size)`,
+    the representative being its most-depended-on symbol; `whole` is the
+    size of the single island on the other side."""
+
+    parts: tuple[tuple[str, int], ...]
+    whole: int
+
+
+@dataclass(frozen=True)
 class Step:
     """One commit, compared against its first parent."""
 
@@ -135,6 +176,12 @@ class Step:
     #: absent. `history_report` and `range_report` fill it through their
     #: `session_pointers` argument, the one seam a session reader plugs into.
     sessions: tuple[str, ...] = ()
+    #: With `walk_history(..., islands=True)`: the island count after the
+    #: commit, and the merges and splits against its parent. `None` and
+    #: empty otherwise.
+    islands: int | None = None
+    merges: tuple[IslandChange, ...] = ()
+    splits: tuple[IslandChange, ...] = ()
 
     def touched(self) -> bool:
         return bool(
@@ -145,6 +192,8 @@ class Step:
             or self.edges_lost
             or self.effects_gained
             or self.effects_lost
+            or self.merges
+            or self.splits
         )
 
 
@@ -158,6 +207,12 @@ class Walk:
     steps: list[Step]
     head_matches: list[str] = field(default_factory=list)
     start_matches: list[str] = field(default_factory=list)
+    #: Direct confident dependents of each match, counted at the revision
+    #: it was matched at.
+    head_dependents: dict[str, int] = field(default_factory=dict)
+    start_dependents: dict[str, int] = field(default_factory=dict)
+    #: The starting revision's island count, with `islands=True`.
+    start_islands: int | None = None
 
 
 def history_range(root: Path, revspec: str | None) -> tuple[str, str]:
@@ -182,7 +237,13 @@ def history_range(root: Path, revspec: str | None) -> tuple[str, str]:
 
 
 def walk_history(
-    store: Store, indexer: Indexer, base: str, head: str, symbol: str | None = None
+    store: Store,
+    indexer: Indexer,
+    base: str,
+    head: str,
+    symbol: str | None = None,
+    *,
+    islands: bool = False,
 ) -> Walk:
     """Materialize `base..head` one commit at a time, compare each commit
     with its first parent, and release every revision the walk created.
@@ -190,6 +251,9 @@ def walk_history(
     `symbol`, when given, is looked up with `find_symbol` at the head and
     at the starting revision while each is materialized, so the caller can
     resolve it without keeping either one.
+
+    `islands` partitions every changed revision as `islands` does and
+    records the merges and splits; see the module docstring for the cost.
     """
     root = indexer.root
     base_sha = resolve_commit(indexer, base)
@@ -207,9 +271,13 @@ def walk_history(
     steps: list[Step] = []
     head_matches: list[str] = []
     start_matches: list[str] = []
+    head_dependents: dict[str, int] = {}
+    start_dependents: dict[str, int] = {}
+    start_islands: int | None = None
     try:
         previous_rev: str | None = None
         previous = _EMPTY
+        previous_roots: dict[str, str] = {}
         if start:
             if start not in retained:
                 created.add(start)
@@ -217,6 +285,11 @@ def walk_history(
             previous_rev, previous = start, _snapshot(store, start)
             if symbol is not None:
                 start_matches = [row["id"] for row in find_symbol(store, start, symbol)]
+                start_dependents = _dependent_counts(previous, start_matches)
+            if islands:
+                previous_roots = island_roots(store, start)
+        if islands:
+            start_islands = len(set(previous_roots.values()))
 
         for sha, parent, subject in commits:
             inherited = None
@@ -241,7 +314,17 @@ def walk_history(
                 and _fingerprint(store, sha) == inherited
             )
             current = previous if unchanged else _snapshot(store, sha)
-            steps.append(_step(sha, parent, subject, previous, current))
+            step = _step(sha, parent, subject, previous, current)
+            if islands:
+                roots = previous_roots if unchanged else island_roots(store, sha)
+                step = replace(
+                    step,
+                    islands=len(set(roots.values())),
+                    merges=_island_changes(previous_roots, roots, previous),
+                    splits=_island_changes(roots, previous_roots, current),
+                )
+                previous_roots = roots
+            steps.append(step)
             if previous_rev in created:
                 store.drop_revision(previous_rev)
                 created.discard(previous_rev)
@@ -249,6 +332,7 @@ def walk_history(
 
         if symbol is not None:
             head_matches = [row["id"] for row in find_symbol(store, head_sha, symbol)]
+            head_dependents = _dependent_counts(previous, head_matches)
     finally:
         for rev in created:
             store.drop_revision(rev)
@@ -259,7 +343,56 @@ def walk_history(
         steps=steps,
         head_matches=head_matches,
         start_matches=start_matches,
+        head_dependents=head_dependents,
+        start_dependents=start_dependents,
+        start_islands=start_islands,
     )
+
+
+def _dependent_counts(snapshot: _Snapshot, node_ids: list[str]) -> dict[str, int]:
+    wanted = set(node_ids)
+    sources: dict[str, set[str]] = {node_id: set() for node_id in node_ids}
+    for src, dst, _ in snapshot.edges:
+        if dst in wanted:
+            sources[dst].add(src)
+    return {node_id: len(found) for node_id, found in sources.items()}
+
+
+def _island_changes(
+    before: dict[str, str], after: dict[str, str], parts_snapshot: _Snapshot
+) -> tuple[IslandChange, ...]:
+    """The islands of `after` whose symbols sat in two or more islands of
+    `before`: merges when called as (parent, commit), splits as (commit,
+    parent). Only symbols present on both sides count, so a symbol the
+    commit added is growth, not a merge. `parts_snapshot` is the revision
+    the parts belong to, used to pick each part's representative."""
+    spans: dict[str, set[str]] = {}
+    for node_id, root in after.items():
+        if node_id in before:
+            spans.setdefault(root, set()).add(before[node_id])
+    joined = {root: parts for root, parts in spans.items() if len(parts) > 1}
+    if not joined:
+        return ()
+    part_roots = set().union(*joined.values())
+    members: dict[str, list[str]] = {}
+    for node_id, root in before.items():
+        if root in part_roots:
+            members.setdefault(root, []).append(node_id)
+    fan_in = Counter(dst for _, dst in {(src, dst) for src, dst, _ in parts_snapshot.edges})
+    whole_size = Counter(after.values())
+    changes = []
+    for root, parts in joined.items():
+        described = [
+            (
+                min(members[part], key=lambda node_id: (-fan_in[node_id], node_id)),
+                len(members[part]),
+            )
+            for part in parts
+        ]
+        described.sort(key=lambda part: (-part[1], part[0]))
+        changes.append(IslandChange(tuple(described), whole_size[root]))
+    changes.sort(key=lambda change: (-change.whole, change.parts))
+    return tuple(changes)
 
 
 def _fingerprint(store: Store, rev: str) -> str | None:
@@ -301,7 +434,7 @@ def _step(sha: str, parent: str, subject: str, before: _Snapshot, after: _Snapsh
     edges_lost = before.edges - after.edges
     effects_gained = after.effects - before.effects
     effects_lost = before.effects - after.effects
-    named = {src for src, _, _ in edges_gained | edges_lost}
+    named = {node for src, dst, _ in edges_gained | edges_lost for node in (src, dst)}
     named |= {node for node, _ in effects_gained | effects_lost}
     context = {
         i: after.nodes.get(i) or before.nodes[i]
@@ -411,9 +544,10 @@ def symbol_history(
 
 
 def _behaviour(step: Step, old: str, new: str) -> list[str]:
-    """What changed about what `old` (before) / `new` (after) reaches: its
-    confident callees and its reachable effect kinds. For an unmoved symbol
-    the two ids are the same."""
+    """What changed about what `old` (before) / `new` (after) reaches and
+    what reaches it: its confident callees, its direct dependents and its
+    reachable effect kinds. For an unmoved symbol the two ids are the
+    same."""
     reasons = []
     gained = sorted(dst for src, dst, _ in step.edges_gained if src == new)
     lost = sorted(dst for src, dst, _ in step.edges_lost if src == old)
@@ -425,6 +559,19 @@ def _behaviour(step: Step, old: str, new: str) -> list[str]:
         reasons.append(f"calls +{', +'.join(gained)}")
     if lost:
         reasons.append(f"calls -{', -'.join(lost)}")
+    moved = {move.removed: move.added for move in step.moves if move.confidence == MEDIUM}
+    dependents_gained = {src for src, dst, _ in step.edges_gained if dst == new}
+    dependents_lost = {moved.get(src, src) for src, dst, _ in step.edges_lost if dst == old}
+    # Always a difference: a dependent that moved files re-points its edge,
+    # which is one lost and one gained under the id `moved` already maps.
+    dependents_gained, dependents_lost = (
+        dependents_gained - dependents_lost,
+        dependents_lost - dependents_gained,
+    )
+    if dependents_gained:
+        reasons.append(f"dependents +{', +'.join(sorted(dependents_gained))}")
+    if dependents_lost:
+        reasons.append(f"dependents -{', -'.join(sorted(dependents_lost))}")
     effects_gained = {kind for node, kind in step.effects_gained if node == new}
     effects_lost = {kind for node, kind in step.effects_lost if node == old}
     if old != new:
@@ -487,6 +634,7 @@ def history_report(
         "symbol": node_id,
         "commits": len(walk.steps),
         "changed_in": len(rows),
+        "dependents": (walk.start_dependents if forward else walk.head_dependents).get(node_id, 0),
         "base": walk.start,
         "head": walk.head,
     }
@@ -505,7 +653,8 @@ def range_report(
 ) -> Report:
     """Per commit, oldest first: the symbols added, removed, moved and
     changed, the confident edges gained and lost, and the effects gained and
-    lost. A commit that changed none of those gets no group; `commits` in
+    lost -- and, for a walk made with `islands`, the islands that merged or
+    split. A commit that changed none of those gets no group; `commits` in
     the summary still counts it."""
     walk = _attach_sessions(walk, session_pointers)
     groups: list[Group] = []
@@ -519,6 +668,15 @@ def range_report(
         groups.append(Group(f"{step.sha} {_commit_label(step)}", kept))
 
     steps = walk.steps
+    island_summary: dict[str, int | None] = {}
+    if walk.start_islands is not None:
+        counted = [step.islands for step in steps if step.islands is not None]
+        island_summary = {
+            "islands_start": walk.start_islands,
+            "islands_head": counted[-1] if counted else walk.start_islands,
+            "merges": sum(len(step.merges) for step in steps),
+            "splits": sum(len(step.splits) for step in steps),
+        }
     summary = {
         "commits": len(steps),
         "changed": sum(1 for step in steps if step.touched()),
@@ -526,6 +684,7 @@ def range_report(
         "edges_lost": sum(len(step.edges_lost) for step in steps),
         "effects_gained": sum(len(step.effects_gained) for step in steps),
         "effects_lost": sum(len(step.effects_lost) for step in steps),
+        **island_summary,
         "base": walk.start,
         "head": walk.head,
     }
@@ -552,6 +711,12 @@ def _range_rows(step: Step) -> list[Row]:
         rows.append(Row(node_id, _location(step.removed[node_id]), "removed", 3.0))
     for node_id in sorted(step.changed):
         rows.append(Row(node_id, _location(step.changed[node_id]), "body changed", 3.0))
+    for verb, changes in (("merged", step.merges), ("split", step.splits)):
+        for change in changes:
+            parts = " + ".join(f"{node_id} ({size})" for node_id, size in change.parts)
+            detail = f"islands {verb}: {parts}" + (" into " if verb == "merged" else " from ")
+            detail += f"one of {change.whole}"
+            rows.append(Row(change.parts[0][0], f"{len(change.parts)} islands", detail, 2.5))
     for node_id, kind in sorted(step.effects_gained):
         rows.append(Row(node_id, kind, "effect gained", 2.0))
     for node_id, kind in sorted(step.effects_lost):
@@ -564,6 +729,7 @@ def _range_rows(step: Step) -> list[Row]:
 
 
 __all__ = [
+    "IslandChange",
     "Move",
     "Step",
     "Walk",

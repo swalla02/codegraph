@@ -461,11 +461,16 @@ def _cmd_history(args: argparse.Namespace) -> int:
     symbol, revspec = args.symbol, args.revspec
     if revspec is None and symbol and ".." in symbol:
         symbol, revspec = None, symbol
+    if args.islands and symbol is not None:
+        # Islands are a property of the whole graph, so they belong to the
+        # range report; a symbol's row already says what reaches it.
+        print("--islands reports the whole range; drop the symbol", file=sys.stderr)
+        return 1
     store, indexer = open_workspace(root)
     try:
         try:
             base, head = history_range(root, revspec)
-            walk = walk_history(store, indexer, base, head, symbol)
+            walk = walk_history(store, indexer, base, head, symbol, islands=args.islands)
         except MissingRevisionError as exc:
             print(f"revision not found: {exc.rev}", file=sys.stderr)
             return 1
@@ -995,6 +1000,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=40,
         help="Maximum rows to keep per group -- per commit without a symbol (default: 40)",
+    )
+    history_parser.add_argument(
+        "--islands",
+        action="store_true",
+        help="Also report islands merging and splitting, per commit (range only; "
+        "partitions every changed revision)",
     )
     history_parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     history_parser.add_argument("--strict", action="store_true", help=_STRICT_HELP)
