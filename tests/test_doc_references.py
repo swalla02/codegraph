@@ -129,7 +129,7 @@ PATH_PREFIXES = ("src/codegraph/", "bench/", "skills/", ".claude-plugin/")
 
 #: Directories inside the package that prose names package-relatively, as in
 #: `effects/propagate.py` or `query/islands.py`.
-PACKAGE_RELATIVE = ("effects/", "query/")
+PACKAGE_RELATIVE = ("effects/", "query/", "viz/")
 
 _CODE_SPAN = re.compile(r"`([^`\n]+)`")
 _DOTTED = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
